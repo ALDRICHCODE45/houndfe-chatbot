@@ -352,6 +352,25 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     'Cuando hagas la transferencia, envía aquí',
   ],
   ['¿Cómo desea pagar?', '¿Cómo deseas pagar?'],
+  // Pay in store S3: the hold answer, its failure and the feed notices.
+  // Phrase-level: folio, dates and the store sit between the phrases.
+  ['Listo, le apartamos su pedido', 'Listo, te apartamos tu pedido'],
+  ['Páselo a recoger y pagar en ', 'Pásalo a recoger y pagar en '],
+  [
+    'Si no pasa antes de esa fecha, el pedido se cancela.',
+    'Si no pasas antes de esa fecha, el pedido se cancela.',
+  ],
+  [
+    'No pude apartar su pedido en este momento; puede pagar por transferencia o intentarlo de nuevo en unos minutos.',
+    'No pude apartar tu pedido en este momento; puedes pagar por transferencia o intentarlo de nuevo en unos minutos.',
+  ],
+  ['Le recordamos que su pedido', 'Te recordamos que tu pedido'],
+  [
+    'Si todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.',
+    'Si todavía lo quieres, con gusto te ayudo a pedirlo de nuevo.',
+  ],
+  ['Le ampliamos el plazo de su pedido', 'Te ampliamos el plazo de tu pedido'],
+  [': ahora puede recogerlo y pagarlo', ': ahora puedes recogerlo y pagarlo'],
   [
     'ya le avisé al equipo y se los comparto',
     'ya te avisé al equipo y te los comparto',

@@ -188,6 +188,8 @@ const pickupLocation = z
   })
   .strict();
 export type CheckoutPickupLocation = z.infer<typeof pickupLocation>;
+/** The same strict shape, for state that remembers the store (pay in store). */
+export const CheckoutPickupLocationSchema = pickupLocation;
 
 const customerResponse = z
   .object({
@@ -227,9 +229,26 @@ const checkoutResponse = z.union([
 ]);
 export type CheckoutResponse = z.infer<typeof checkoutResponse>;
 
+/** Pay in store: the sale's CURRENT hold, read live next to the immutable
+ * creation receipt (`null` when no intent was declared). `stage`: 0 nothing
+ * sent, 1 reminded, 2 expired (cancelled); `version` grows on every change. */
+const saleHold = z.object({
+  paymentIntent: z.string().min(1),
+  expiresAt: instant.nullable(),
+  reminderAt: instant.nullable(),
+  stage: z.number().int().min(0),
+  version: z.number().int().min(0),
+});
+export type CheckoutSaleHold = z.infer<typeof saleHold>;
+
 const checkoutStatus = z.discriminatedUnion('status', [
   z
-    .object({ status: z.literal('succeeded'), checkout: checkoutResponse })
+    .object({
+      status: z.literal('succeeded'),
+      checkout: checkoutResponse,
+      // Absent before the backend's pay-in-store deploy.
+      hold: saleHold.nullable().optional(),
+    })
     .strict(),
   z.object({ status: z.literal('not_observed'), checkout: z.null() }).strict(),
 ]);

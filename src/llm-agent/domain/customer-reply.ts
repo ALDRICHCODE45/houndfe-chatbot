@@ -1,4 +1,8 @@
-import { PAYMENT_METHODS, paymentMethodById } from './payment-methods';
+import {
+  PAYMENT_METHODS,
+  paymentMethodById,
+  type PaymentMethod,
+} from './payment-methods';
 
 /**
  * S3: the structured reply the customer route returns. `reply` is the text
@@ -253,21 +257,21 @@ export function checkoutConfirmationButtons(
 }
 
 /**
- * Buttons under the payment offer: one per payment method, bound to the
- * placed sale. Titles are the same in usted and tú.
+ * Buttons under the payment offer: one per offered payment method (default:
+ * today's list; «Pagar en tienda» only for a pickup order with pay in store
+ * on), bound to the placed sale. Titles are the same in usted and tú.
  */
 export function paymentMethodButtons(
   saleId: string,
   prompt: string,
+  methods: readonly PaymentMethod[] = PAYMENT_METHODS,
 ): CustomerReplyInteractive {
   return {
     type: 'buttons',
-    buttons: PAYMENT_METHODS.slice(0, INTERACTIVE_LIMITS.buttons).map(
-      (method) => ({
-        id: `${PAYMENT_METHOD}:${method.id}:${saleId}`,
-        title: method.title,
-      }),
-    ),
+    buttons: methods.slice(0, INTERACTIVE_LIMITS.buttons).map((method) => ({
+      id: `${PAYMENT_METHOD}:${method.id}:${saleId}`,
+      title: method.title,
+    })),
     prompt,
   };
 }

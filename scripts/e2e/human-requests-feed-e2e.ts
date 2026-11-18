@@ -488,6 +488,8 @@ async function recovery(
 ): Promise<void> {
   const requests: OpenHumanRequest[] = [];
   const nextCursors = new Set<string>();
+  // Pay in store: the smallest sale resume position seen on any page.
+  let saleResume: string | null = null;
   let page: string | undefined;
   let pages = 0;
   for (;;) {
@@ -510,6 +512,9 @@ async function recovery(
     }
     pages += 1;
     nextCursors.add(result.nextCursor);
+    const sale = result.saleUndeliveredResumeAfter ?? null;
+    if (sale !== null && (saleResume === null || sale < saleResume))
+      saleResume = sale;
     requests.push(...result.items);
     if (result.nextPage === null) break;
     page = result.nextPage;
@@ -517,7 +522,7 @@ async function recovery(
   const byStatus: Record<string, number> = {};
   const byDeferral: Record<string, number> = {};
   let pending = 0;
-  let resume: string | null = null;
+  let resume: string | null = saleResume;
   for (const request of requests) {
     byStatus[request.status] = (byStatus[request.status] ?? 0) + 1;
     pending += request.pendingDeliveries.length;
@@ -558,6 +563,7 @@ async function recovery(
       .length,
     nextCursor: nextCursor ?? null,
     nextCursorStableAcrossPages: nextCursors.size <= 1,
+    saleUndeliveredResumeAfter: saleResume,
     resumeFrom:
       resume !== null && nextCursor !== undefined && resume < nextCursor
         ? resume
@@ -969,7 +975,11 @@ async function runClarification(args: Args, serviceKey: string): Promise<void> {
   }> = [];
   const observed = {
     accept: async (item: FeedItem) => {
-      if (item.type !== 'unknown' && watched.has(item.requestId)) {
+      if (
+        item.type !== 'unknown' &&
+        item.requestId !== null &&
+        watched.has(item.requestId)
+      ) {
         const payload = item.payload as unknown as Record<string, unknown>;
         seen.push({
           deliveryId: item.deliveryId,
@@ -1684,7 +1694,9 @@ async function runLive(args: Args, serviceKey: string): Promise<void> {
   const isWatched = (item: FeedItem): boolean =>
     item.type !== 'unknown' &&
     (item.conversationRef === conversationRef ||
-      (item.conversationRef === null && watched.has(item.requestId)));
+      (item.conversationRef === null &&
+        item.requestId !== null &&
+        watched.has(item.requestId)));
   const observed = {
     accept: async (item: FeedItem) => {
       const type =

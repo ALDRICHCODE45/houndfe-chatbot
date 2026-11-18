@@ -18,9 +18,16 @@ import {
 import { RoutingBackendOutboxDelivery } from '../backend-outbox/infrastructure/routing-backend-outbox.delivery';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
 import {
+  CHATBOT_API_CLIENT,
   HUMAN_REQUESTS_CLIENT,
+  type ChatbotApiClient,
   type HumanRequestsClient,
 } from '../chatbot-api/domain/chatbot-api.client';
+import {
+  CONVERSATION_STORE,
+  type ConversationStore,
+} from '../conversation/domain/conversation-store';
+import { readPayInStoreSale } from '../llm-agent/application/minimal-pay-in-store-sale';
 import { LIVE_CONVERSATION_CLIENT } from '../chatbot-api/domain/live-conversation.port';
 import type { LiveConversationClient } from '../chatbot-api/domain/live-conversation.port';
 import { HandoffModeService } from '../conversation/application/handoff-mode.service';
@@ -63,6 +70,7 @@ import { SchedulingStateService } from '../scheduling/application/scheduling-sta
 import { StoredAppointmentReader } from '../scheduling/application/stored-appointment.reader';
 import { SchedulingStateModule } from '../scheduling/scheduling-state.module';
 import { HumanRequestMaintenanceWorker } from './application/human-request-maintenance.worker';
+import { SalePickupNoticeService } from './application/sale-pickup-notice.service';
 import {
   HUMAN_REQUEST_FEED_STORE,
   type HumanRequestFeedStore,
@@ -282,13 +290,34 @@ const CUSTOMER_PORT_TOKENS = [
         appointments?: ScheduledAppointmentReader,
         appointmentWriter?: ScheduledAppointmentWriter,
         scheduling?: SchedulingStateService,
+        api?: ChatbotApiClient,
+        conversations?: ConversationStore,
       ) => {
         const ports = customerPorts(handoff, config, pool, profiles);
+        // Pay in store S3: the sale.pickup_* notices only with
+        // PAY_IN_STORE_ENABLED (exactly true); off → STALE as in T1.
+        const payInStore =
+          config.get<unknown>('payInStore.enabled') === true &&
+          api !== undefined &&
+          conversations !== undefined;
         return new HumanRequestDeliveryService({
           store,
           client,
           sender,
           ...ports,
+          ...(payInStore
+            ? {
+                salePickup: new SalePickupNoticeService({
+                  placedSale: (senderId: string) =>
+                    readPayInStoreSale(conversations, senderId),
+                  api,
+                  isWindowOpen: ports.isWindowOpen,
+                  ...(ports.customerStyle === undefined
+                    ? {}
+                    : { customerStyle: ports.customerStyle }),
+                }),
+              }
+            : {}),
           // Scheduled conversations (unit 14): reminder / reschedule
           // notices. The stored-appointment reader is optional (parent
           // wires it): without it the version check is skipped.
@@ -337,6 +366,8 @@ const CUSTOMER_PORT_TOKENS = [
         { token: SCHEDULED_APPOINTMENT_READER, optional: true },
         { token: SCHEDULED_APPOINTMENT_WRITER, optional: true },
         { token: SchedulingStateService, optional: true },
+        { token: CHATBOT_API_CLIENT, optional: true },
+        { token: CONVERSATION_STORE, optional: true },
       ],
     },
     {

@@ -41,6 +41,7 @@ Writes are merge-only, so a known value is never erased by a later turn. The bot
 | `OPENAI_API_KEY`, `LLM_MODEL`          | OpenAI key and model                                                                                                  |
 | `DATABASE_URL`                         | The chatbot's own Postgres                                                                                            |
 | `CONVERSATION_MIRROR_DELIVERY_ENABLED` | Default `false` (off unless exactly `true`). See "Conversation mirror delivery flag" below                            |
+| `PAY_IN_STORE_ENABLED`                 | Default `false` (on for `true`, `TRUE` or `True`). «Pagar en tienda» for pickup orders and the `sale.pickup_*` notices; turn on only after the backend's pay-in-store deploy and chatbot migration 5200 (docs/minimal-order-placement.md, "Pay in store") |
 
 ### Conversation mirror delivery flag
 

@@ -173,19 +173,92 @@ describe('sale feed items (pay in store S2)', () => {
     };
   };
 
+  it('sale.pickup_reminder / _expired / _extended parse as typed sale items (T2: requestId null, saleId, holdVersion)', async () => {
+    const { client, feedPages } = setup();
+    feedPages.push({
+      items: [
+        saleWire('1', 'sale.pickup_reminder'),
+        saleWire('2', 'sale.pickup_expired', {}, { folio: null }),
+        saleWire(
+          '3',
+          'sale.pickup_extended',
+          { conversationRef: null },
+          { conversationRef: null },
+        ),
+      ],
+      nextCursor: '000000000009',
+    });
+    const envelope = (deliveryId: string) => ({
+      cursor: `00000000${deliveryId.padStart(4, '0')}`,
+      deliveryId,
+      requestId: null,
+      saleId: SALE,
+      notBefore: null,
+      expiresAt: null,
+    });
+    await expect(client.readFeed({ after: 'c' })).resolves.toEqual({
+      kind: 'ok',
+      nextCursor: '000000000009',
+      items: [
+        {
+          ...envelope('1'),
+          type: 'sale.pickup_reminder',
+          conversationRef: REF,
+          payload: {
+            saleId: SALE,
+            folio: 'V-000123',
+            holdUntil: HOLD_UNTIL,
+            holdVersion: 2,
+          },
+        },
+        {
+          ...envelope('2'),
+          type: 'sale.pickup_expired',
+          conversationRef: REF,
+          payload: { saleId: SALE, folio: null, holdVersion: 2 },
+        },
+        {
+          ...envelope('3'),
+          type: 'sale.pickup_extended',
+          conversationRef: null,
+          payload: {
+            saleId: SALE,
+            folio: 'V-000123',
+            holdUntil: HOLD_UNTIL,
+            holdVersion: 2,
+          },
+        },
+      ],
+    });
+  });
+
+  it('a sale item whose top-level conversationRef is missing takes the payload one', async () => {
+    const { client, feedPages } = setup();
+    feedPages.push({
+      items: [saleWire('1', 'sale.pickup_reminder', { conversationRef: null })],
+      nextCursor: '000000000009',
+    });
+    const page = await client.readFeed({ after: 'c' });
+    expect(page).toMatchObject({
+      kind: 'ok',
+      items: [{ type: 'sale.pickup_reminder', conversationRef: REF }],
+    });
+  });
+
   it.each<[string, Record<string, unknown>]>([
-    ['sale.pickup_reminder', saleWire('1', 'sale.pickup_reminder')],
-    ['sale.pickup_expired', saleWire('2', 'sale.pickup_expired')],
-    [
-      'sale.pickup_extended (conversationRef null)',
-      saleWire(
-        '3',
-        'sale.pickup_extended',
-        { conversationRef: null },
-        { conversationRef: null },
-      ),
-    ],
     ['an unknown sale.* type', saleWire('4', 'sale.something_new')],
+    [
+      'a reminder without holdUntil',
+      saleWire('7', 'sale.pickup_reminder', {}, { holdUntil: undefined }),
+    ],
+    [
+      'a holdVersion of 0',
+      saleWire('8', 'sale.pickup_extended', {}, { holdVersion: 0 }),
+    ],
+    [
+      'a payload saleId that is not the envelope one',
+      saleWire('9', 'sale.pickup_expired', {}, { saleId: 'other' }),
+    ],
     [
       'a sale item without payload',
       saleWire('5', 'sale.pickup_reminder', { payload: null }),
@@ -195,7 +268,7 @@ describe('sale feed items (pay in store S2)', () => {
       saleWire('6', 'sale.pickup_expired', { saleId: undefined }),
     ],
   ])(
-    '%s is surfaced as unknown (requestId null accepted), never a rejected page',
+    '%s is surfaced as unknown (STALE), never a rejected page',
     async (_name, raw) => {
       const { client, feedPages } = setup();
       feedPages.push({ items: [raw], nextCursor: '000000000009' });
@@ -314,20 +387,33 @@ describe('sale feed items (pay in store S2)', () => {
     await expect(store.readCursor()).resolves.toBe('000000000002');
   });
 
-  it('a recovery answer with saleUndeliveredResumeAfter is accepted and the walk completes', async () => {
-    const { client, consumer, store, feedPages, recoveryPages } = setup();
-    await store.saveCursor('000000000001', '2026-11-01T00:00:00.000Z');
-    feedPages.push(410);
-    recoveryPages.push({
+  it('the recovery page parser exposes saleUndeliveredResumeAfter (string, null; absent stays absent)', async () => {
+    const { client, recoveryPages } = setup();
+    const page = (sale?: string | null) => ({
       items: [],
       nextCursor: '000000000900',
       nextPage: null,
-      saleUndeliveredResumeAfter: '000000000100',
+      ...(sale === undefined ? {} : { saleUndeliveredResumeAfter: sale }),
     });
-    await expect(client.listOpenRequests()).resolves.toMatchObject({
+    recoveryPages.push(page('000000000100'), page(null), page());
+    for (const expected of ['000000000100', null])
+      await expect(client.listOpenRequests()).resolves.toMatchObject({
+        kind: 'ok',
+        nextCursor: '000000000900',
+        saleUndeliveredResumeAfter: expected,
+      });
+    await expect(client.listOpenRequests()).resolves.toEqual({
       kind: 'ok',
+      items: [],
       nextCursor: '000000000900',
+      nextPage: null,
     });
+  });
+
+  it('T2: the recovery resumes from saleUndeliveredResumeAfter when it is the smallest position', async () => {
+    const { consumer, store, feedPages, recoveryPages } = setup();
+    await store.saveCursor('000000000001', '2026-11-01T00:00:00.000Z');
+    feedPages.push(410);
     recoveryPages.push({
       items: [],
       nextCursor: '000000000900',
@@ -337,6 +423,120 @@ describe('sale feed items (pay in store S2)', () => {
     await expect(consumer.runOnce()).resolves.toMatchObject({
       kind: 'recovered',
     });
+    await expect(store.readCursor()).resolves.toBe('000000000100');
+  });
+
+  it('T2: the MINIMUM saleUndeliveredResumeAfter seen across the pages wins (a later page may carry a larger one)', async () => {
+    const { consumer, store, feedPages, recoveryPages } = setup();
+    await store.saveCursor('000000000001', '2026-11-01T00:00:00.000Z');
+    feedPages.push(410);
+    recoveryPages.push(
+      {
+        items: [],
+        nextCursor: '000000000900',
+        nextPage: 'p2',
+        saleUndeliveredResumeAfter: '000000000300',
+      },
+      {
+        items: [],
+        nextCursor: '000000000950',
+        nextPage: 'p3',
+        saleUndeliveredResumeAfter: '000000000200',
+      },
+      {
+        items: [],
+        nextCursor: '000000000990',
+        nextPage: null,
+        saleUndeliveredResumeAfter: '000000000500',
+      },
+    );
+    await consumer.runOnce();
+    await expect(store.readCursor()).resolves.toBe('000000000200');
+  });
+
+  it('T2: a request undeliveredResumeAfter below the sale one still wins; the first nextCursor is kept', async () => {
+    const { consumer, store, feedPages, recoveryPages } = setup();
+    await store.saveCursor('000000000001', '2026-11-01T00:00:00.000Z');
+    feedPages.push(410);
+    recoveryPages.push({
+      items: [
+        {
+          id: 'req-1',
+          folio: null,
+          kind: 'QUESTION',
+          subtype: 'UNKNOWN_QUESTION',
+          status: 'NEW',
+          conversationRef: REF,
+          legacyId: null,
+          whatsappWindowClosesAt: null,
+          cancelReason: null,
+          createdAt: '2026-11-01T00:00:00.000Z',
+          updatedAt: '2026-11-01T00:00:00.000Z',
+          closedAt: null,
+          pendingDeliveries: [],
+          undeliveredTruncated: true,
+          undeliveredResumeAfter: '000000000050',
+        },
+      ],
+      nextCursor: '000000000900',
+      nextPage: null,
+      saleUndeliveredResumeAfter: '000000000100',
+    });
+    await consumer.runOnce();
+    await expect(store.readCursor()).resolves.toBe('000000000050');
+  });
+
+  it('T2: saleUndeliveredResumeAfter null on every page (all sale items ACKed) leaves nextCursor', async () => {
+    const { consumer, store, feedPages, recoveryPages } = setup();
+    await store.saveCursor('000000000001', '2026-11-01T00:00:00.000Z');
+    feedPages.push(410);
+    recoveryPages.push(
+      {
+        items: [],
+        nextCursor: '000000000900',
+        nextPage: 'p2',
+        saleUndeliveredResumeAfter: null,
+      },
+      {
+        items: [],
+        nextCursor: '000000000950',
+        nextPage: null,
+        saleUndeliveredResumeAfter: null,
+      },
+    );
+    await consumer.runOnce();
     await expect(store.readCursor()).resolves.toBe('000000000900');
   });
+
+  it('a recovery page without the field (backend before pay in store) resumes from nextCursor as before', async () => {
+    const { consumer, store, feedPages, recoveryPages } = setup();
+    await store.saveCursor('000000000001', '2026-11-01T00:00:00.000Z');
+    feedPages.push(410);
+    recoveryPages.push({
+      items: [],
+      nextCursor: '000000000900',
+      nextPage: null,
+    });
+    await consumer.runOnce();
+    await expect(store.readCursor()).resolves.toBe('000000000900');
+  });
+
+  it.each([
+    ['a number', 100],
+    ['an empty string', ''],
+  ])(
+    'a recovery page whose saleUndeliveredResumeAfter is %s is out of contract',
+    async (_name, value) => {
+      const { client, recoveryPages } = setup();
+      recoveryPages.push({
+        items: [],
+        nextCursor: '000000000900',
+        nextPage: null,
+        saleUndeliveredResumeAfter: value,
+      });
+      await expect(client.listOpenRequests()).rejects.toBeInstanceOf(
+        UpstreamError,
+      );
+    },
+  );
 });

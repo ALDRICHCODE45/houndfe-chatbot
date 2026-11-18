@@ -91,7 +91,11 @@ import {
   type InteractiveReplyIntent,
   type ProductImageContext,
 } from '../domain/customer-reply';
-import { PAYMENT_METHODS, matchPaymentMethod } from '../domain/payment-methods';
+import {
+  PAY_IN_STORE_METHOD,
+  PAYMENT_METHODS,
+  matchPaymentMethod,
+} from '../domain/payment-methods';
 import {
   MINIMAL_FULFILMENT_QUESTION,
   isCheckoutStartRequest,
@@ -1086,15 +1090,27 @@ export class MinimalCatalogAgentService {
         }
       }
       // Payment step: the reply right after the payment offer answers it.
+      // A bare yes picks the method only when the offer had a single one.
       if (input.interactiveReplyId === undefined) {
         const offer = this.pendingPaymentOffer(input.senderId);
-        if (
-          offer !== null &&
-          ((PAYMENT_METHODS.length === 1 &&
-            classifyConfirmationReply(input.text) === 'accept') ||
-            matchPaymentMethod(input.text) !== null)
-        ) {
-          const decision = await this.sendPaymentDetails(input, offer.saleId);
+        const methods =
+          offer === null
+            ? PAYMENT_METHODS
+            : ((await this.payment?.offeredMethods(input.senderId)) ??
+              PAYMENT_METHODS);
+        const chosen =
+          offer === null
+            ? null
+            : (matchPaymentMethod(input.text, methods) ??
+              (methods.length === 1 &&
+              classifyConfirmationReply(input.text) === 'accept'
+                ? methods[0]
+                : null));
+        if (offer !== null && chosen !== null) {
+          const decision =
+            chosen.id === PAY_IN_STORE_METHOD.id
+              ? await this.sendPayInStore(input, offer.saleId)
+              : await this.sendPaymentDetails(input, offer.saleId);
           if (decision !== null) return decision;
         }
       }
@@ -1496,8 +1512,12 @@ export class MinimalCatalogAgentService {
         };
       }
       case 'payment_method': {
-        // Only transfer exists today; a new method adds its own handler.
-        const decision = await this.sendPaymentDetails(input, intent.reference);
+        // One handler per method: transfer (bank details) and, for pickup
+        // orders with pay in store on, «Pagar en tienda» (S3).
+        const decision =
+          intent.method === PAY_IN_STORE_METHOD.id
+            ? await this.sendPayInStore(input, intent.reference)
+            : await this.sendPaymentDetails(input, intent.reference);
         return decision === null
           ? answer({ reply: STALE_BUTTON_FALLBACK })
           : { decision };
@@ -1758,6 +1778,42 @@ export class MinimalCatalogAgentService {
       this.paymentTrigger(input),
       input.text,
     );
+    if (result === null) return null;
+    const reply = applyCustomerStyle(
+      result.reply,
+      this.customerStyle(senderId, input.text),
+    );
+    this.recordTurn(
+      senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+      undefined,
+      undefined,
+      result.paymentOffer === undefined
+        ? {}
+        : { paymentOffer: result.paymentOffer },
+    );
+    return this.decision({ reply });
+  }
+
+  /**
+   * Pay in store S3: «Pagar en tienda» for the placed order `saleId`,
+   * answered here without the model. `null` when it is not offered for that
+   * order (the caller answers as for a stale button or lets other routes
+   * keep the turn).
+   */
+  private async sendPayInStore(
+    input: { senderId: string; text: string },
+    saleId: string,
+  ): Promise<MinimalCatalogAgentDecision | null> {
+    const payment = this.payment;
+    if (payment === undefined) return null;
+    const { senderId } = input;
+    this.order?.dismiss(senderId);
+    const result = await payment.payInStore(senderId, saleId);
     if (result === null) return null;
     const reply = applyCustomerStyle(
       result.reply,

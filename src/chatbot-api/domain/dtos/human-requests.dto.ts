@@ -482,12 +482,58 @@ export const SALE_PICKUP_TYPES = [
 ] as const;
 export type SalePickupType = (typeof SALE_PICKUP_TYPES)[number];
 
-/** Sale items carry `requestId: null` and a `saleId`, so they are not a
- *  request item: the parser surfaces every `sale.*` item as `unknown`
- *  (never a rejected page) and the delivery service ACKs it STALE with no
- *  customer message until the pay-in-store flow (S3) handles them. */
+/** Sale items carry `requestId: null` and a `saleId`: they belong to a
+ *  sale, not to a request. A well-formed `sale.pickup_*` item parses as a
+ *  typed `SalePickupItem` (T2); a malformed one or an unknown `sale.*` type
+ *  is `unknown` (ACKed STALE), never a rejected page. */
 export const isSalePickupType = (type: string): type is SalePickupType =>
   (SALE_PICKUP_TYPES as readonly string[]).includes(type);
+
+interface SaleFeedItemEnvelope {
+  cursor: string;
+  deliveryId: string;
+  /** Always `null`: a sale item belongs to no request. */
+  requestId: null;
+  saleId: string;
+  /** The top-level ref, else the payload one; `null` when neither names a
+   *  chat. Carries the customer's phone: never log it unmasked. */
+  conversationRef: string | null;
+  notBefore: string | null;
+  expiresAt: string | null;
+  /** Never deferred (not in pending-deliveries). */
+  deferredReason?: never;
+}
+
+export interface SalePickupHoldPayload {
+  saleId: string;
+  folio: string | null;
+  /** ISO UTC deadline of the hold this item belongs to. */
+  holdUntil: string;
+  /** The hold version (>= 1); a later change bumps it. */
+  holdVersion: number;
+}
+
+export type SalePickupReminderItem = SaleFeedItemEnvelope & {
+  type: 'sale.pickup_reminder';
+  payload: SalePickupHoldPayload;
+};
+export type SalePickupExpiredItem = SaleFeedItemEnvelope & {
+  type: 'sale.pickup_expired';
+  payload: Omit<SalePickupHoldPayload, 'holdUntil'>;
+};
+export type SalePickupExtendedItem = SaleFeedItemEnvelope & {
+  type: 'sale.pickup_extended';
+  payload: SalePickupHoldPayload;
+};
+/** Pay in store notices (backend T3): reminder, expiry, staff extension. */
+export type SalePickupItem =
+  | SalePickupReminderItem
+  | SalePickupExpiredItem
+  | SalePickupExtendedItem;
+
+/** True for the three typed pay-in-store sale items. */
+export const isSalePickupItem = (item: FeedItem): item is SalePickupItem =>
+  item.type !== 'unknown' && isSalePickupType(item.type);
 
 /** A type this bot does not know (or a malformed known one): ACK or skip
  *  it by `deliveryId`, never crash. */
@@ -506,6 +552,7 @@ export type FeedItem =
   | RequestOverdueNoticeItem
   | LiveConversationItem
   | ScheduledConversationItem
+  | SalePickupItem
   | UnknownFeedItem;
 
 export type ReadFeedResult =
@@ -619,6 +666,11 @@ export type ListOpenRequestsResult =
       nextCursor: string;
       /** `null` on the last page. */
       nextPage: string | null;
+      /** Pay in store: the feed `after` re-serving the branch's oldest sale
+       *  item with no terminal outcome (read live on every page, so a later
+       *  page may carry a larger one); `null` when every sale item is ACKed
+       *  (absent when the backend predates pay in store). */
+      saleUndeliveredResumeAfter?: string | null;
     }
   | RateLimitedResult
   | ValidationErrorResult;
@@ -1037,9 +1089,20 @@ export function parseFeedItem(item: unknown): FeedItem | null {
         raw: item,
       }
     );
-  // Every other type, sale.* included (pay in store: `requestId` null and a
-  // `saleId`), is unknown: ACKed STALE, never a rejected page. Only
-  // request.answered / request.cancelled below require a requestId.
+  // Pay in store: a malformed sale item is ACKed STALE as unknown too.
+  if (isSalePickupType(item.type))
+    return (
+      parseSalePickupItem(item, item.cursor, item.deliveryId) ?? {
+        type: 'unknown',
+        rawType: item.type,
+        cursor: item.cursor,
+        deliveryId: item.deliveryId,
+        raw: item,
+      }
+    );
+  // Every other type, an unknown sale.* included, is unknown: ACKed STALE,
+  // never a rejected page. Only request.answered / request.cancelled below
+  // require a requestId.
   if (item.type !== 'request.answered' && item.type !== 'request.cancelled')
     return {
       type: 'unknown',
@@ -1446,6 +1509,63 @@ function parseScheduleItem(
   };
 }
 
+/** `sale.pickup_reminder` / `_expired` / `_extended` (pay in store): needs
+ *  `requestId` null (or absent), the envelope `saleId` (a payload copy must
+ *  agree),
+ *  a nullable folio, `holdVersion` >= 1 and, except for the expiry, an ISO
+ *  `holdUntil`. Null (→ unknown) when malformed. */
+function parseSalePickupItem(
+  item: Record<string, unknown>,
+  cursor: string,
+  deliveryId: string,
+): SalePickupItem | null {
+  const optional = (value: unknown): value is string | null | undefined =>
+    value === undefined || isNullableString(value);
+  const { payload } = item;
+  if (
+    (item.requestId !== undefined && item.requestId !== null) ||
+    !optional(item.conversationRef) ||
+    !optional(item.notBefore) ||
+    !optional(item.expiresAt) ||
+    !isRecord(payload) ||
+    !optional(payload.conversationRef)
+  )
+    return null;
+  // The envelope always names the sale; the payload copy must agree.
+  const saleId = item.saleId;
+  if (
+    !isText(saleId) ||
+    (payload.saleId !== undefined && payload.saleId !== saleId) ||
+    !(payload.folio === undefined || isNullableString(payload.folio)) ||
+    !isScheduleVersion(payload.holdVersion)
+  )
+    return null;
+  const envelope: SaleFeedItemEnvelope = {
+    cursor,
+    deliveryId,
+    requestId: null,
+    saleId,
+    conversationRef:
+      [item.conversationRef, payload.conversationRef].find(isText) ?? null,
+    notBefore: item.notBefore ?? null,
+    expiresAt: item.expiresAt ?? null,
+  };
+  const common = {
+    saleId,
+    folio: isText(payload.folio) ? payload.folio : null,
+    holdVersion: payload.holdVersion,
+  };
+  if (item.type === 'sale.pickup_expired')
+    return { ...envelope, type: 'sale.pickup_expired', payload: common };
+  if (!isInstantText(payload.holdUntil)) return null;
+  const withDeadline = { ...common, holdUntil: payload.holdUntil };
+  if (item.type === 'sale.pickup_reminder')
+    return { ...envelope, type: 'sale.pickup_reminder', payload: withDeadline };
+  if (item.type === 'sale.pickup_extended')
+    return { ...envelope, type: 'sale.pickup_extended', payload: withDeadline };
+  return null;
+}
+
 function parseItems(items: unknown): FeedItem[] | null {
   if (!Array.isArray(items)) return null;
   const parsed: FeedItem[] = [];
@@ -1518,7 +1638,10 @@ function parseOpenRequest(raw: unknown): OpenHumanRequest | null {
   if (
     pendingDeliveries === null ||
     pendingDeliveries.some(
-      (item) => item.type !== 'unknown' && item.requestId !== id,
+      (item) =>
+        item.type !== 'unknown' &&
+        item.requestId !== null &&
+        item.requestId !== id,
     )
   )
     return null;
@@ -1546,12 +1669,19 @@ export function parseOpenRequestsPage(body: unknown): {
   items: OpenHumanRequest[];
   nextCursor: string;
   nextPage: string | null;
+  saleUndeliveredResumeAfter?: string | null;
 } | null {
   if (
     !isRecord(body) ||
     !Array.isArray(body.items) ||
     !isText(body.nextCursor) ||
-    !(body.nextPage === null || isText(body.nextPage))
+    !(body.nextPage === null || isText(body.nextPage)) ||
+    // Pay in store: absent (backend before it) or null → no sale position.
+    !(
+      body.saleUndeliveredResumeAfter === undefined ||
+      body.saleUndeliveredResumeAfter === null ||
+      isText(body.saleUndeliveredResumeAfter)
+    )
   )
     return null;
   const items: OpenHumanRequest[] = [];
@@ -1560,7 +1690,19 @@ export function parseOpenRequestsPage(body: unknown): {
     if (request === null) return null;
     items.push(request);
   }
-  return { items, nextCursor: body.nextCursor, nextPage: body.nextPage };
+  return {
+    items,
+    nextCursor: body.nextCursor,
+    nextPage: body.nextPage,
+    // Absent (backend before pay in store) stays absent.
+    ...(body.saleUndeliveredResumeAfter === undefined
+      ? {}
+      : {
+          saleUndeliveredResumeAfter: isText(body.saleUndeliveredResumeAfter)
+            ? body.saleUndeliveredResumeAfter
+            : null,
+        }),
+  };
 }
 
 /** Local create check; the backend owns the full validation (400). */

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { HumanRequestsClient } from '../../chatbot-api/domain/chatbot-api.client';
 import {
   isLiveConversationItem,
+  isSalePickupItem,
   isSalePickupType,
   isScheduledConversationItem,
   normalizeDeliveryOutcome,
@@ -23,6 +24,7 @@ import type {
 } from './live-conversation.service';
 import type { SendResult } from '../../whatsapp/domain/whatsapp-sender.port';
 import type { ScheduledConversationHandler } from './scheduled-conversation.service';
+import type { SalePickupHandler } from './sale-pickup-notice.service';
 import {
   CANCEL_NOTICE,
   LEDGER_RETENTION_MS,
@@ -77,6 +79,10 @@ export interface HumanRequestDeliveryPorts {
    *  and `conversation.rescheduled`. Without it those items stay the safe
    *  STALE / UNKNOWN_TYPE (nothing is sent). */
   scheduled?: ScheduledConversationHandler;
+  /** Pay in store S3: the sale.pickup_* notices. Wired only when
+   *  PAY_IN_STORE_ENABLED is on; without it those items stay the STALE of
+   *  T1 (UNKNOWN_TYPE, nothing sent). */
+  salePickup?: SalePickupHandler;
   /** Unit 14 T4: a staff cancel drops the cancelled request's stored
    *  appointment. Optional; a failure is logged, never blocks the notice. */
   schedule?: {
@@ -906,11 +912,11 @@ export class HumanRequestDeliveryService {
         return { action: 'stale', decision: 'UNKNOWN_TYPE' };
       }
       if (isSalePickupType(item.rawType)) {
-        // Pay in store S2: expected items, not an anomaly. Nothing is sent
-        // until the S3 flow handles them (never log the raw item: it
-        // carries the customer's conversationRef).
+        // A malformed pay-in-store item (or one stored as unknown before
+        // T2): nothing can be verified, so nothing is sent. Never log the
+        // raw item: it carries the customer's conversationRef.
         this.logger.log(
-          `feed item ${row.deliveryId} ${item.rawType}: pay in store notices are not enabled: STALE`,
+          `feed item ${row.deliveryId} ${item.rawType}: malformed or not enabled pay in store notice: STALE`,
         );
         return { action: 'stale', decision: 'UNKNOWN_TYPE' };
       }
@@ -949,6 +955,26 @@ export class HumanRequestDeliveryService {
       }
       this.logger.warn(
         `feed item ${row.deliveryId} of type ${item.type} has no handler wired: STALE`,
+      );
+      return { action: 'stale', decision: 'UNKNOWN_TYPE' };
+    }
+
+    if (isSalePickupItem(item)) {
+      if (this.ports.salePickup !== undefined) {
+        const planned = await this.ports.salePickup.plan(row, item);
+        // A notice that may not wait (the backend refuses DEFERRED_*): a
+        // HUMAN chat is an immediate STALE (HUMAN_SESSION), a closed window
+        // at send time is STALE.
+        return planned.action === 'send'
+          ? { ...planned, cancellation: true }
+          : planned.action === 'stale'
+            ? planned
+            : { action: 'stale', decision: 'UNKNOWN_TYPE' };
+      }
+      // Pay in store S2 (flag off): expected items, not an anomaly. Never
+      // log the raw item: it carries the customer's conversationRef.
+      this.logger.log(
+        `feed item ${row.deliveryId} ${item.type}: pay in store notices are not enabled: STALE`,
       );
       return { action: 'stale', decision: 'UNKNOWN_TYPE' };
     }

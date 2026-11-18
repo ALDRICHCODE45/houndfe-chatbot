@@ -224,6 +224,11 @@ const innerEnvValidationSchema = Joi.object({
     .valid(RECEIPT_LEASE_MS_VALUE)
     .default(RECEIPT_LEASE_MS_VALUE),
   RECEIPT_MEDIA_WORKER_POLL_MS: receiptLessThanLease(5_000),
+  // Pay in store (odd/tasks/pay-in-store.md S3): «Pagar en tienda» for
+  // pickup orders and the sale.pickup_* feed notices. Default off until the
+  // backend (feat/pay-in-store-hold) is deployed.
+  PAY_IN_STORE_ENABLED: Joi.boolean().default(false),
+
   // N18: destination/origin receipt fields inside `extracted` (backend
   // aebb60ef). Kill switch only; default on.
   RECEIPT_DESTINATION_FIELDS_ENABLED: Joi.boolean().default(true),

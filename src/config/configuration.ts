@@ -37,6 +37,11 @@ const configuration = () => ({
       process.env.CONVERSATION_MIRROR_DELIVERY_ENABLED,
     ),
   },
+  payInStore: {
+    // Default off: only a value Joi.boolean() accepts as true enables the
+    // «Pagar en tienda» button and the sale.pickup_* notices (S3).
+    enabled: envBoolean(process.env.PAY_IN_STORE_ENABLED),
+  },
   chatbotApi: {
     baseUrl: process.env.CHATBOT_API_BASE_URL as string,
     serviceKey: process.env.SERVICE_KEY as string,

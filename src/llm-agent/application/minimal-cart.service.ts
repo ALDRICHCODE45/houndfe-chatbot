@@ -11,6 +11,7 @@ import {
 } from '../../conversation/domain/conversation-store';
 import type { CartItem, CartState } from '../../sale-flow/domain/cart-state';
 import type { CartEvaluationResult } from '../../chatbot-api/domain/dtos/pricing.dto';
+import { CheckoutPickupLocationSchema } from '../../chatbot-api/domain/dtos/checkout.dto';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
 import {
@@ -40,6 +41,15 @@ const placedSaleSchema = z.strictObject({
   // The receipt outcome poller saw a CONFIRMED receipt with no debt left.
   // Absent in orders stored before this field: absent means unpaid.
   paid: z.literal(true).optional(),
+  // Pay in store S3: a store-pickup order placed with PAY_IN_STORE_ENABLED.
+  // Its checkout key reads the live hold (GET /checkouts/status) and the
+  // branch is named in the replies. Absent: no «Pagar en tienda» offer.
+  pickup: z
+    .strictObject({
+      checkoutKey: z.uuid(),
+      location: CheckoutPickupLocationSchema.nullable(),
+    })
+    .optional(),
 });
 const cartSchema = z.strictObject({
   items: z.array(lineSchema),

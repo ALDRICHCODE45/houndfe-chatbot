@@ -30,6 +30,7 @@ import {
 } from './human-requests.module';
 import { PostgresHumanRequestFeedStore } from './infrastructure/postgres-human-request-feed.store';
 import { SCHEDULED_APPOINTMENT_READER } from './application/scheduled-conversation.service';
+import { SalePickupNoticeService } from './application/sale-pickup-notice.service';
 import { SchedulingStateService } from '../scheduling/application/scheduling-state.service';
 import { StoredAppointmentReader } from '../scheduling/application/stored-appointment.reader';
 
@@ -58,13 +59,14 @@ const createHumanRequest = jest.fn(() =>
 const compile = (
   pool: ReturnType<typeof fakePool>['pool'],
   feature: typeof HumanRequestsModule = HumanRequestsModule,
+  extraConfig: Record<string, unknown> = {},
 ) =>
   Test.createTestingModule({
     imports: [
       ConfigModule.forRoot({
         isGlobal: true,
         ignoreEnvFile: true,
-        load: [() => ({ meta: { phoneNumberId: 'phone-1' } })],
+        load: [() => ({ meta: { phoneNumberId: 'phone-1' }, ...extraConfig })],
       }),
       feature,
     ],
@@ -117,6 +119,42 @@ describe('HumanRequestsModule', () => {
     const ports = (delivery as unknown as { ports: { live: unknown } }).ports;
     expect(ports.live).toBeInstanceOf(LiveConversationService);
     await moduleRef.close();
+  });
+
+  describe('pay in store S3 wiring (PAY_IN_STORE_ENABLED)', () => {
+    const salePickupOf = (delivery: HumanRequestDeliveryService) =>
+      (delivery as unknown as { ports: { salePickup?: unknown } }).ports
+        .salePickup;
+
+    it('wires the sale notice handler only when the flag is exactly true', async () => {
+      const { pool } = fakePool();
+      const on = await compile(pool, HumanRequestsServicesModule, {
+        payInStore: { enabled: true },
+      });
+      expect(salePickupOf(on.get(HumanRequestDeliveryService))).toBeInstanceOf(
+        SalePickupNoticeService,
+      );
+      await on.close();
+    });
+
+    it.each([
+      ['off', { payInStore: { enabled: false } }],
+      ['unset', {}],
+    ])(
+      'flag %s: no handler (sale items stay STALE as in T1)',
+      async (_name, config) => {
+        const { pool } = fakePool();
+        const moduleRef = await compile(
+          pool,
+          HumanRequestsServicesModule,
+          config,
+        );
+        expect(
+          salePickupOf(moduleRef.get(HumanRequestDeliveryService)),
+        ).toBeUndefined();
+        await moduleRef.close();
+      },
+    );
   });
 
   describe('unit 14 T4 wiring (scheduling state ports)', () => {

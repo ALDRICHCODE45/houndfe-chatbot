@@ -5,6 +5,7 @@ import {
   CustomerUpsertResponse,
 } from './dtos/customers.dto';
 import type { PaymentDetail } from './dtos/payment-details.dto';
+import type { PayInStoreHold } from './dtos/pay-in-store.dto';
 import type { ExpirationIntakeInput } from './dtos/human-decisions-expiration.dto';
 import type { ExpirationIntakeReceipt } from './dtos/human-decisions-expiration-receipt.dto';
 import type { ExpirationDecision } from './dtos/human-decisions-expiration-decision.dto';
@@ -142,6 +143,13 @@ export interface ChatbotApiClient {
    *  human outcome of an uploaded receipt. UUID-validated before any request,
    *  safe GET retry policy, strict body parse; errors carry `body.error`. */
   getReceiptOutcome(receiptId: string): Promise<ReceiptOutcome>;
+  /** Pay in store S3: `PATCH /chatbot-api/sales/:saleId/payment-intent`
+   *  `{ "method": "IN_STORE" }` (scope `sales:write`). Idempotent upstream;
+   *  one attempt per call. Refusals reject with `ChatbotApiError` carrying
+   *  the code (`PAY_IN_STORE_SALE_ALREADY_PAID`, `…_NOT_CONFIRMED`,
+   *  `…_REQUIRES_PICKUP`, `…_REQUIRES_ONLINE`, `SALE_NOT_FOUND`). Optional
+   *  so hand-built fakes stay valid. */
+  setPayInStoreIntent?(saleId: string): Promise<PayInStoreHold>;
   updateDelivery(saleId: string, dto: UpdateDeliveryInput): Promise<void>;
   getOrderHistory(phone: string, cc: string): Promise<OrderHistoryResponse[]>;
   /** HD-R2b2: `POST /chatbot-api/human-decisions` RESTOCK intake (scope

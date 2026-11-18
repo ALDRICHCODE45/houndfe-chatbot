@@ -165,6 +165,34 @@ export const SCHEDULE_DECISIONS: DeliveryDecision[] = [
   'STALE_SCHEDULE',
 ];
 
+/** Decisions of the pay in store sale notices (migration 5200). */
+export const SALE_PICKUP_DECISIONS: DeliveryDecision[] = [
+  'PICKUP_REMINDER',
+  'PICKUP_EXPIRED_NOTICE',
+  'PICKUP_EXTENDED_NOTICE',
+  'HOLD_SUPERSEDED',
+  'SALE_CLOSED',
+  'SALE_UNKNOWN',
+];
+
+/** A typed pay-in-store sale item (requestId null, a saleId). */
+export const salePickupItem = (deliveryId: string): FeedItem => ({
+  type: 'sale.pickup_reminder',
+  cursor: '000000002210',
+  deliveryId,
+  requestId: null,
+  saleId: '8c1d0000-1111-4222-8333-444455556666',
+  conversationRef: REF,
+  notBefore: null,
+  expiresAt: null,
+  payload: {
+    saleId: '8c1d0000-1111-4222-8333-444455556666',
+    folio: 'B-0042',
+    holdUntil: '2026-11-19T18:30:00.000Z',
+    holdVersion: 1,
+  },
+});
+
 /** Decisions of the live conversation (migration 4900). */
 export const LIVE_DECISIONS: DeliveryDecision[] = [
   'SESSION_STARTED',
@@ -449,6 +477,48 @@ export function runHumanRequestFeedStoreContract(
         await expect(store.getDelivery('sc-d')).resolves.toMatchObject({
           decision,
           item: { type: 'conversation.scheduled_reminder' },
+        });
+      },
+    );
+
+    it('stores a typed sale item with no request and its conversation', async () => {
+      const item = salePickupItem('sale-t1');
+      const first = await store.insertDelivery(item);
+      expect(first.inserted).toBe(true);
+      expect(first.row).toMatchObject({
+        type: 'sale.pickup_reminder',
+        requestId: null,
+        conversationRef: REF,
+        messageId: null,
+        localState: 'RECEIVED',
+      });
+      await expect(store.getDelivery('sale-t1')).resolves.toMatchObject({
+        item,
+      });
+      await expect(store.insertDelivery(item)).resolves.toMatchObject({
+        inserted: false,
+      });
+    });
+
+    it.each(SALE_PICKUP_DECISIONS)(
+      'records the pay in store decision %s on a transition',
+      async (decision) => {
+        await store.insertDelivery(salePickupItem('sale-d'));
+        const next = await store.transition(
+          'sale-d',
+          { localState: 'RECEIVED', attemptId: null },
+          {
+            localState: 'STALE',
+            decision,
+            attemptId: ATTEMPT_A,
+            attemptedAt: AT,
+            providerMessageId: null,
+            ack: 'STALE',
+          },
+        );
+        expect(next).toMatchObject({ decision, localState: 'STALE' });
+        await expect(store.getDelivery('sale-d')).resolves.toMatchObject({
+          decision,
         });
       },
     );
