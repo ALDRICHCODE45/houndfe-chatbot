@@ -194,9 +194,12 @@ function harness(customer: 'new' | '03100' | '04000' = '03100') {
 }
 
 /** The bot shows ONE product and offers to add it (fixed F8 behaviour). */
+// S13: the search turn's options message is rendered from the result, so the
+// query must yield exactly ONE relevant product for the single-product cart
+// offer («¿Se lo agrego al carrito?») these "sí"/"claro" tests answer.
 async function showSilice(h: ReturnType<typeof harness>) {
   await h.turn('Buen día. Deseo comprar una arena de sílice para gato.', [
-    call('searchCatalog', { q: 'arena de sílice para gato' }),
+    call('searchCatalog', { q: 'sílice' }),
     say(
       'Buen día. Encontré Arena para Gato de Sílice 3.8 L en nuestro catálogo, $179.00. ¿Se la agrego al carrito?',
     ),
@@ -612,7 +615,10 @@ describe('F8 catalog claims need a catalog read', () => {
     const raw = h.seen[0].system;
     const system = typeof raw === 'string' ? raw : '';
     expect(system).not.toContain('SOLO registra una intención');
-    expect(system).toMatch(/enumere|enumera/i);
+    // S13g: the options list is rendered by the application; the prompt
+    // tells the model not to write it instead of asking it to enumerate.
+    expect(system).toContain('presented_by_application');
+    expect(system).toContain('no escribas la lista ni el cierre');
     expect(system).toMatch(/nunca diga que registró la intención/i);
   });
 });
