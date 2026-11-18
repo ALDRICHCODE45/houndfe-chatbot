@@ -45,6 +45,7 @@ import {
   applyCustomerRegister,
   applyCustomerStyle,
   customerAllowsEmojis,
+  customerOwnText,
   customerStyleDirective,
   detectCustomerStyle,
   explicitStyleSignal,
@@ -912,6 +913,8 @@ type CatalogRun = {
   plans: CatalogOptionsPlan[];
   /** A checkStock ran after a search: the model answers that read. */
   stockAfter: boolean;
+  /** L31: the customer's own words this turn ({lo pedido}). */
+  customerText?: string;
 };
 
 /** The customer's own text turns, oldest first. */
@@ -1990,7 +1993,11 @@ export class MinimalCatalogAgentService {
     const reorderRun: ReorderRun | null = this.cart
       ? { attempted: false, value: null }
       : null;
-    const catalogRun: CatalogRun = { plans: [], stockAfter: false };
+    const catalogRun: CatalogRun = {
+      plans: [],
+      stockAfter: false,
+      customerText: customerOwnText(input.text),
+    };
     // S13d: the agotado product the previous options message offered to ask
     // about; a non-plain acceptance reaches the model with that exact id
     // (never on a cart-only yes: restockAvailable is false then).
@@ -2436,12 +2443,14 @@ export class MinimalCatalogAgentService {
         restockAvailable: restockRun !== null,
         style: styled,
         cartAvailable: this.cart !== undefined,
+        emoji: style.emojis,
       });
       traceLog(
         this.logger,
         `minimal_catalog catalog_options rendered=application sections=${catalogRun.plans.length} shown=${rendered.shown.length} restock_offer=${rendered.restockOffer !== null} trace=${traceId}`,
       );
-      const reply = rendered.text;
+      // L31: one emoji on the closing only when the customer uses them.
+      const reply = limitCustomerEmojis(rendered.text, style);
       const media = photoFor(reply);
       this.recordTurn(
         input.senderId,
@@ -3171,7 +3180,7 @@ export class MinimalCatalogAgentService {
             // S13b: when the items are classifiable the application picks
             // (available first, exact → same type → brand only, ≤ 3) and
             // renders the options; otherwise the model answers as before.
-            const plan = planCatalogOptions(q, items);
+            const plan = planCatalogOptions(q, items, catalogRun?.customerText);
             const offered =
               plan === null
                 ? limited.offered
