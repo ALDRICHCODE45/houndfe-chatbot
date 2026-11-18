@@ -105,6 +105,8 @@ export const CATALOG_RESTOCK_QUESTION =
 /** S13f: replaces the choose question when more relevant products exist. */
 export const CATALOG_NARROWING_QUESTION =
   'Tengo más opciones. ¿Qué marca, tamaño o presentación busca?';
+/** L31: one emoji on the closing when the customer style allows emojis. */
+export const CATALOG_CLOSING_EMOJI = '😊';
 const OTHER_BRAND_LABEL = ' (de otra marca)';
 const DESCRIPTION_MAX = 90;
 /** Presentations listed per option line; the rest are counted. */
@@ -200,11 +202,18 @@ export interface CatalogOption {
   agotado: boolean;
   /** A brand was requested and this item's brand is a different one. */
   otherBrand: boolean;
+  /**
+   * L31: a brand was requested and this item is that brand's product of the
+   * requested type (or the brand alone when no type was asked).
+   */
+  brandMatch: boolean;
 }
 
 export interface CatalogOptionsPlan {
   /** The customer's significant words as asked ("Croquetas Pedigree"). */
   requested: string;
+  /** L31: the query names a brand token (a word of some result's brand). */
+  brandRequested: boolean;
   /** Offered options in render order (≤ 3, available first). */
   options: CatalogOption[];
   /** Relevant products not shown (S13f narrowing question). */
@@ -216,13 +225,35 @@ export interface CatalogOptionsPlan {
   contradicted: boolean;
 }
 
+/**
+ * L31: the span of the customer's own message that carries the query's
+ * significant words, first to last, connectors between them kept
+ * ("croquetas para cachorro tienen?" for q "croquetas cachorro" →
+ * "croquetas para cachorro"). `null` when the message does not carry every
+ * significant query word (the model rephrased or the turn is about something
+ * else): the model query is used instead.
+ */
+function customerSpan(q: string, customerText: string | undefined) {
+  if (typeof customerText !== 'string') return null;
+  const wanted = new Set(significantQueryWords(q).map((w) => stem(w.word)));
+  const hits = significantQueryWords(customerText).filter((w) =>
+    wanted.has(stem(w.word)),
+  );
+  const found = new Set(hits.map((w) => stem(w.word)));
+  if (hits.length === 0 || [...wanted].some((s) => !found.has(s))) return null;
+  return customerText.slice(hits[0].start, hits[hits.length - 1].end);
+}
+
 /** "croquetas de pedigree" → "Croquetas de Pedigree" (brand casing kept). */
 function requestedPhrase(
   q: string,
   items: readonly Partial<CatalogItemResponse>[],
+  customerText?: string,
 ): string {
   const words = significantQueryWords(q);
-  const span = q.slice(words[0].start, words[words.length - 1].end);
+  const span =
+    customerSpan(q, customerText) ??
+    q.slice(words[0].start, words[words.length - 1].end);
   const brandCase = new Map<string, string>();
   for (const item of items)
     for (const match of (item.brand ?? '').matchAll(/[\p{L}\p{N}]+/gu))
@@ -239,11 +270,13 @@ function requestedPhrase(
  * available before agotado, then exact → same_type → brand_only (stable in
  * backend order), at most {@link MAX_CATALOG_OPTIONS}. `null` when nothing is
  * classifiable (no significant word or no relevant item): the model answers
- * as before.
+ * as before. `customerText` (the customer's own message of this turn) words
+ * {lo pedido} when it carries the query's words (L31).
  */
 export function planCatalogOptions(
   q: string,
   items: readonly CatalogItemResponse[],
+  customerText?: string,
 ): CatalogOptionsPlan | null {
   if (significantQueryWords(q).length === 0) return null;
   const tokens = queryTokens(q, brandStems(items));
@@ -255,19 +288,27 @@ export function planCatalogOptions(
     if (cls === 'other' || cls === 'contradicts') continue;
     const availability = deriveAvailability(item);
     const itemBrand = stems(item.brand);
+    const hasBrand = tokens.brand.some((t) => itemBrand.has(t));
+    const itemText = new Set([...stems(item.name), ...stems(item.description)]);
+    const hasType =
+      tokens.type.length === 0 || tokens.type.some((t) => itemText.has(t));
     relevant.push({
       item,
       cls,
       availability,
       agotado: availability.status === 'out_of_stock',
-      otherBrand:
-        tokens.brand.length > 0 && !tokens.brand.some((t) => itemBrand.has(t)),
+      otherBrand: tokens.brand.length > 0 && !hasBrand,
+      brandMatch:
+        tokens.brand.length > 0 && (cls === 'exact' || (hasBrand && hasType)),
     });
   }
+  const requested = requestedPhrase(q, items, customerText);
+  const brandRequested = tokens.brand.length > 0;
   if (relevant.length === 0)
     return contradicted
       ? {
-          requested: requestedPhrase(q, items),
+          requested,
+          brandRequested,
           options: [],
           moreResults: 0,
           contradicted,
@@ -283,7 +324,8 @@ export function planCatalogOptions(
     )
     .map(({ option }) => option);
   return {
-    requested: requestedPhrase(q, items),
+    requested,
+    brandRequested,
     options: ordered.slice(0, MAX_CATALOG_OPTIONS),
     moreResults: Math.max(0, ordered.length - MAX_CATALOG_OPTIONS),
     contradicted,
@@ -397,6 +439,11 @@ export function renderCatalogOptions(
     style: (fixed: string) => string;
     /** A cart exists: one available option closes with the add offer. */
     cartAvailable?: boolean;
+    /**
+     * L31: the customer style allows emojis (CustomerStyle.emojis): the
+     * message ends with exactly one emoji on its closing question.
+     */
+    emoji?: boolean;
   },
 ): RenderedCatalogOptions {
   const { style } = opts;
@@ -443,10 +490,14 @@ export function renderCatalogOptions(
     const agotado = options.filter((option) => option.agotado);
     const lines: string[] = [];
     if (available.length > 0) {
+      // L31: «no tengo» only for a requested brand that no available option
+      // offers in the requested type; anything else is what was asked.
+      const brandMissing =
+        plan.brandRequested && !available.some((option) => option.brandMatch);
       lines.push(
-        exact
-          ? style(CATALOG_EXACT_OPENING)
-          : `${plan.requested}${style(CATALOG_ALTERNATIVES_OPENING)}`,
+        brandMissing
+          ? `${plan.requested}${style(CATALOG_ALTERNATIVES_OPENING)}`
+          : style(CATALOG_EXACT_OPENING),
       );
       lines.push(...available.map(optionLine));
       lines.push(
@@ -488,8 +539,12 @@ export function renderCatalogOptions(
         : `${agotadoName(target.option)} está agotado. ${style(CATALOG_RESTOCK_QUESTION)}`;
   }
   if (closing !== null) blocks.push(closing);
+  const text = blocks.join('\n\n');
   return {
-    text: blocks.join('\n\n'),
+    text:
+      opts.emoji === true && text.length > 0
+        ? `${text} ${CATALOG_CLOSING_EMOJI}`
+        : text,
     restockOffer: target?.subject ?? null,
     restockAcceptsYes: target !== null && !addOffer,
     shown: all.map((option) => option.item),

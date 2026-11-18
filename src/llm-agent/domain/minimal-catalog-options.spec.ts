@@ -679,3 +679,123 @@ describe('S10/S13 contradiction class (life stage, species)', () => {
     ).toHaveLength(1);
   });
 });
+
+describe('S13c follow-up (L31): opening, {lo pedido}, emoji', () => {
+  const nupec = item(300, {
+    name: 'Nupec Cachorro Razas Medianas y Grandes',
+    brand: 'Nupec',
+    description:
+      'Alimento seco premium para cachorros de razas medianas y grandes.',
+  });
+
+  it('prod case: «croquetas para cachorro tienen?» + Nupec Cachorro (no "croquetas" in the name) → «Encontré estas opciones:»', () => {
+    const plan = planCatalogOptions(
+      'croquetas cachorro',
+      [nupec],
+      'croquetas para cachorro tienen?',
+    )!;
+    const out = renderCatalogOptions([plan], {
+      restockAvailable: true,
+      style: usted,
+    });
+    expect(out.text.split('\n')[0]).toBe('Encontré estas opciones:');
+    expect(out.text).not.toContain('no tengo');
+    // Same without the customer text (model query only).
+    const fromQuery = renderCatalogOptions(
+      [planCatalogOptions('croquetas para cachorro tienen?', [nupec])!],
+      { restockAvailable: true, style: usted },
+    );
+    expect(fromQuery.text.split('\n')[0]).toBe('Encontré estas opciones:');
+  });
+
+  it('«alimento para gato» with cat products → «Encontré estas opciones:»', () => {
+    const plan = planCatalogOptions('alimento para gato', [
+      item(310, { name: 'Inaba Churu Atún para Gato', brand: 'Inaba' }),
+      item(311, { name: 'Whiskas Gato Adulto Pollo', brand: 'Whiskas' }),
+    ])!;
+    expect(
+      renderCatalogOptions([plan], {
+        restockAvailable: true,
+        style: usted,
+      }).text.split('\n')[0],
+    ).toBe('Encontré estas opciones:');
+  });
+
+  it('a requested brand absent from every offered available option keeps «{lo pedido} no tengo, pero tengo estas opciones:»', () => {
+    const plan = planCatalogOptions(
+      'croquetas pedigree',
+      [dentastix, naturales, lata],
+      'croquetas pedigree manejan?',
+    )!;
+    expect(
+      renderCatalogOptions([plan], {
+        restockAvailable: true,
+        style: usted,
+      }).text.split('\n')[0],
+    ).toBe('Croquetas Pedigree no tengo, pero tengo estas opciones:');
+  });
+
+  it('{lo pedido} comes from the customer words in order (connectors kept), falling back to the model query', () => {
+    expect(
+      planCatalogOptions(
+        'croquetas cachorro',
+        [nupec],
+        'croquetas para cachorro tienen?',
+      )!.requested,
+    ).toBe('Croquetas para cachorro');
+    const adult = item(320, {
+      name: 'Croquetas Adulto Pollo',
+      description: 'Para perro adulto.',
+    });
+    const deadEnd = renderCatalogOptions(
+      [
+        planCatalogOptions(
+          'croquetas cachorro',
+          [adult],
+          'croquetas para cachorro tienen?',
+        )!,
+      ],
+      { restockAvailable: true, style: usted },
+    );
+    expect(deadEnd.text).toBe(
+      'Croquetas para cachorro no tengo por ahora. ¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa?',
+    );
+    // Customer text that does not carry the query words → model query.
+    expect(
+      planCatalogOptions('croquetas cachorro', [nupec], 'sí, búsquelas')!
+        .requested,
+    ).toBe('Croquetas cachorro');
+    expect(
+      planCatalogOptions('croquetas pedigree', [dentastix, naturales], '')!
+        .requested,
+    ).toBe('Croquetas Pedigree');
+  });
+
+  const emojiCount = (text: string) =>
+    (text.match(/\p{Extended_Pictographic}/gu) ?? []).length;
+
+  it('emojis allowed → exactly one emoji appended to the closing; not allowed → none', () => {
+    const plan = planCatalogOptions(
+      'croquetas pedigree',
+      [dentastix, naturales, lata],
+      'croquetas pedigree manejan?😊',
+    )!;
+    const withEmoji = renderCatalogOptions([plan], {
+      restockAvailable: true,
+      style: usted,
+      emoji: true,
+    });
+    const closing = withEmoji.text.split('\n').at(-1)!;
+    expect(closing).toMatch(/ \p{Extended_Pictographic}$/u);
+    expect(emojiCount(withEmoji.text)).toBe(1);
+    const without = renderCatalogOptions([plan], {
+      restockAvailable: true,
+      style: usted,
+      emoji: false,
+    });
+    expect(emojiCount(without.text)).toBe(0);
+    expect(withEmoji.text.replace(/ \p{Extended_Pictographic}$/u, '')).toBe(
+      without.text,
+    );
+  });
+});

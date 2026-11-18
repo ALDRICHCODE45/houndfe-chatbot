@@ -1311,6 +1311,84 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
         reply: 'No encontré arena; ¿qué producto busca?',
       });
     });
+
+    describe('S13c follow-up (L31, prod retest)', () => {
+      const nupec = {
+        ...dentastix,
+        productId: pid(20),
+        name: 'Nupec Cachorro Razas Medianas y Grandes',
+        brand: 'Nupec',
+        description:
+          'Alimento seco premium para cachorros de razas medianas y grandes.',
+      };
+
+      it('«croquetas para cachorro tienen?» + model q «croquetas cachorro» + Nupec Cachorro → «Encontré estas opciones:», never «Croquetas cachorro no tengo»', async () => {
+        const built = build(
+          [
+            call('s1', 'searchCatalog', { q: 'croquetas cachorro' }),
+            say('Croquetas cachorro no tengo.'),
+          ],
+          {},
+          { item: nupec, stock: lataStock },
+        );
+        built.chatbotApi.searchCatalog.mockResolvedValue([nupec] as never);
+        const first = await built.service.tryHandle({
+          senderId: SENDER,
+          text: 'croquetas para cachorro tienen?',
+        });
+        if (first.kind !== 'handled') throw new Error('expected handled');
+        expect(first.reply.split('\n')[0]).toBe('Encontré estas opciones:');
+        expect(first.reply).not.toContain('no tengo');
+      });
+
+      it('{lo pedido} uses the customer words («Croquetas para cachorro»), not the model q', async () => {
+        const built = build(
+          [
+            call('s1', 'searchCatalog', { q: 'croquetas cachorro' }),
+            say('Tengo croquetas para adulto.'),
+          ],
+          {},
+          { item: naturales, stock: lataStock },
+        );
+        built.chatbotApi.searchCatalog.mockResolvedValue([
+          { ...naturales, name: 'Croquetas Naturales para Perros Adultos' },
+        ] as never);
+        const first = await built.service.tryHandle({
+          senderId: SENDER,
+          text: 'croquetas para cachorro tienen?',
+        });
+        if (first.kind !== 'handled') throw new Error('expected handled');
+        expect(first.reply.startsWith('Croquetas para cachorro no tengo')).toBe(
+          true,
+        );
+      });
+
+      it('prod case «croquetas pedigree manejan?😊» → same message with one emoji closing it', async () => {
+        const { first } = await prodTurn(
+          [
+            call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+            say(MODEL_TEXT),
+          ],
+          { text: 'croquetas pedigree manejan?😊' },
+        );
+        if (first.kind !== 'handled') throw new Error('expected handled');
+        expect(first.reply).toMatch(/ \p{Extended_Pictographic}$/u);
+        expect(
+          (first.reply.match(/\p{Extended_Pictographic}/gu) ?? []).length,
+        ).toBe(1);
+        expect(first.reply.replace(/ \p{Extended_Pictographic}$/u, '')).toBe(
+          PROD_REPLY,
+        );
+      });
+
+      it('no emoji in the customer style → no emoji in the rendered message', async () => {
+        const { first } = await prodTurn([
+          call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+          say(`${MODEL_TEXT} 😊`),
+        ]);
+        expect(first).toEqual({ kind: 'handled', reply: PROD_REPLY });
+      });
+    });
   });
 
   describe('S12 checkStock with presentations never claims from the product-level stock', () => {
