@@ -23,12 +23,16 @@ const catalogItem = {
   stock,
   packageInfo: { weightGrams: null, dimensions: null },
   variants: [],
+  // S14: backend 2ab0ef7e sends the product category.
+  category: { id: 'c-perro', name: 'Alimento para perro' },
 };
 const stockCheck = {
   productId: PRODUCT,
   name: 'Croquetas',
   stock,
   variants: [],
+  // S14: backend 2ab0ef7e sends the product category (null when none).
+  category: null,
 };
 const evaluation = {
   items: [

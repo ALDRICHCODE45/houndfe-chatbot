@@ -51,8 +51,9 @@ const stockCheck = () => ({
 
 describe('parseCatalogSearchResponse', () => {
   it('parses a real-shaped search body with no unknown keys', () => {
+    // S14: an absent category is read as null.
     expect(parseCatalogSearchResponse([catalogItem()])).toEqual({
-      value: [catalogItem()],
+      value: [{ ...catalogItem(), category: null }],
       unknownKeys: [],
     });
     expect(parseCatalogSearchResponse([])).toEqual({
@@ -92,6 +93,59 @@ describe('parseCatalogSearchResponse', () => {
         parseCatalogSearchResponse([
           { ...catalogItem(), match: 'all', name: 7 },
         ]),
+      ).toBeNull();
+    });
+  });
+
+  describe('optional per-item category (S14)', () => {
+    const category = { id: 'cat-aves', name: 'Alimento para aves' };
+
+    it('accepts a present category without unknown keys', () => {
+      const parsed = parseCatalogSearchResponse([
+        { ...catalogItem(), category },
+      ]);
+      expect(parsed?.value[0].category).toEqual(category);
+      expect(parsed?.unknownKeys).toEqual([]);
+    });
+
+    it('keeps an explicit null as null', () => {
+      const parsed = parseCatalogSearchResponse([
+        { ...catalogItem(), category: null },
+      ]);
+      expect(parsed?.value[0].category).toBeNull();
+      expect(parsed?.unknownKeys).toEqual([]);
+    });
+
+    it('reads an absent category as null (older backend)', () => {
+      const parsed = parseCatalogSearchResponse([catalogItem()]);
+      expect(parsed?.value[0].category).toBeNull();
+      expect(parsed?.unknownKeys).toEqual([]);
+    });
+
+    it.each([
+      'Alimento para aves',
+      7,
+      [],
+      {},
+      { id: 'c1' },
+      { name: 'Aves' },
+      { id: 1, name: 'Aves' },
+      { id: 'c1', name: 2 },
+      { id: '', name: 'Aves' },
+      { id: 'c1', name: '   ' },
+    ])('reads the malformed category %p as null, never rejecting', (bad) => {
+      const parsed = parseCatalogSearchResponse([
+        { ...catalogItem(), category: bad },
+      ]);
+      expect(parsed).not.toBeNull();
+      expect(parsed?.value[0].category).toBeNull();
+      expect(parsed?.value[0].productId).toBe(catalogItem().productId);
+      expect(parsed?.unknownKeys).toEqual([]);
+    });
+
+    it('keeps rejecting broken existing fields next to a valid category', () => {
+      expect(
+        parseCatalogSearchResponse([{ ...catalogItem(), category, brand: 3 }]),
       ).toBeNull();
     });
   });
@@ -182,10 +236,32 @@ describe('parseCatalogSearchResponse', () => {
 
 describe('parseStockCheckResponse', () => {
   it('parses a real-shaped stock body', () => {
+    // S14: an absent category is read as null.
     expect(parseStockCheckResponse(stockCheck())).toEqual({
-      value: stockCheck(),
+      value: { ...stockCheck(), category: null },
       unknownKeys: [],
     });
+  });
+
+  describe('optional category (S14)', () => {
+    it('accepts a present category', () => {
+      const category = { id: 'cat-gato', name: 'Alimento para gato' };
+      const parsed = parseStockCheckResponse({ ...stockCheck(), category });
+      expect(parsed?.value.category).toEqual(category);
+      expect(parsed?.unknownKeys).toEqual([]);
+    });
+
+    it.each([null, undefined, 'Aves', { id: 'c1' }, { id: 2, name: 'x' }])(
+      'reads %p as null without rejecting the body',
+      (category) => {
+        const body =
+          category === undefined ? stockCheck() : { ...stockCheck(), category };
+        const parsed = parseStockCheckResponse(body);
+        expect(parsed).not.toBeNull();
+        expect(parsed?.value.category).toBeNull();
+        expect(parsed?.unknownKeys).toEqual([]);
+      },
+    );
   });
 
   it('strips unknown keys and reports their paths', () => {
@@ -195,7 +271,7 @@ describe('parseStockCheckResponse', () => {
       stock: { ...stockCheck().stock, reservedQuantity: 3 },
     };
     const parsed = parseStockCheckResponse(body);
-    expect(parsed?.value).toEqual(stockCheck());
+    expect(parsed?.value).toEqual({ ...stockCheck(), category: null });
     expect(parsed?.unknownKeys.sort()).toEqual(
       ['stock.reservedQuantity', 'warehouse'].sort(),
     );

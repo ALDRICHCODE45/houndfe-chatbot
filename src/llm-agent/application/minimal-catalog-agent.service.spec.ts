@@ -1428,6 +1428,85 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
         });
       });
 
+      describe('S14: prod shape with categories', () => {
+        const withCategory = (
+          over: Record<string, unknown>,
+          category: { id: string; name: string },
+        ) => ({ ...dentastix, ...over, category });
+        const jaula = withCategory(
+          {
+            productId: pid(30),
+            name: 'Vision jaula para aves',
+            brand: 'Vision',
+            description: 'Jaula metálica para aves pequeñas.',
+          },
+          { id: 'c-jaulas', name: 'Jaulas y accesorios' },
+        );
+        const tetra = withCategory(
+          {
+            productId: pid(31),
+            name: 'TetraMin Hojuelas para Peces Tropicales',
+            brand: 'Tetra',
+            description: 'Alimento en hojuelas para peces tropicales.',
+          },
+          { id: 'c-peces', name: 'Alimento para peces' },
+        );
+        const hills = withCategory(
+          {
+            productId: pid(32),
+            name: "Hill's Science Diet Felino Adult 7+",
+            brand: "Hill's",
+            description: 'Alimento seco para gatos sénior.',
+          },
+          { id: 'c-gato', name: 'Alimento para gato' },
+        );
+        const alpiste = withCategory(
+          {
+            productId: pid(33),
+            name: 'Alpiste 1 kg',
+            brand: null,
+            description: null,
+            price: priced(4500),
+          },
+          { id: 'c-aves', name: 'Alimento para aves' },
+        );
+        const turn = async (items: unknown[]) => {
+          const built = build(
+            [
+              call('s1', 'searchCatalog', { q: 'alimento para aves' }),
+              say('Encontré estas opciones: Vision jaula para aves.'),
+            ],
+            {},
+            { item: jaula, stock: lataStock },
+          );
+          built.chatbotApi.searchCatalog.mockResolvedValue(items as never);
+          return built.service.tryHandle({
+            senderId: SENDER,
+            text: 'alimento para aves manejan?😊',
+          });
+        };
+
+        it('no bird food among the results → still the dead end, nothing listed', async () => {
+          await expect(turn([jaula, tetra, hills])).resolves.toEqual({
+            kind: 'handled',
+            reply:
+              'Alimento para aves no tengo por ahora. ¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa? 😊',
+          });
+        });
+
+        it('an Alpiste in «Alimento para aves» (name without species/type) → listed alone', async () => {
+          const result = await turn([jaula, tetra, hills, alpiste]);
+          if (result.kind !== 'handled') throw new Error('expected handled');
+          expect(result.reply.startsWith('Encontré estas opciones:')).toBe(
+            true,
+          );
+          expect(result.reply).toContain('*Alpiste 1 kg*');
+          expect(result.reply).toContain('$45.00 MXN');
+          expect(result.reply).not.toMatch(/jaula|Tetra|Hill/i);
+          expect(result.reply).not.toContain('no tengo');
+        });
+      });
+
       it('no emoji in the customer style → no emoji in the rendered message', async () => {
         const { first } = await prodTurn([
           call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
