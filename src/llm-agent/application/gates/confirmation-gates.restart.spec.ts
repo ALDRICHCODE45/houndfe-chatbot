@@ -237,6 +237,20 @@ describe('checkout confirmation gates survive a restart (S4)', () => {
     });
   };
 
+  it('retest S2: a dismissed pending offer stays gone after a restart and its SÍ confirms nothing', async () => {
+    const w = world();
+    await armedOffer(w);
+    const a = boot(w);
+    await a.gates.begin(SENDER);
+    a.checkout.dismissPending(SENDER);
+    expect(a.checkout.status(SENDER)).toBeNull();
+    await expect(a.gates.settle(SENDER)).resolves.toBe(true);
+    const b = boot(w);
+    await b.gates.begin(SENDER);
+    expect(b.checkout.status(SENDER)).toBeNull();
+    expect(await confirm(b, 'wamid.yes')).toBeNull();
+  });
+
   it('the pending offer and then the confirmation survive restarts', async () => {
     const w = world();
     const offer = await armedOffer(w);

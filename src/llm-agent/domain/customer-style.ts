@@ -266,6 +266,11 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     'Tenemos una falla técnica, en cuanto se resuelva te respondemos.',
   ],
   // S4 interactive prompts and the change-button reply.
+  // Retest S4 (N15): delivery-or-pickup question at checkout start.
+  [
+    '¿Se lo enviamos a su dirección o prefiere recogerlo en tienda?',
+    '¿Te lo enviamos a tu dirección o prefieres recogerlo en tienda?',
+  ],
   ['¿Confirma su pedido?', '¿Confirmas tu pedido?'],
   ['Claro, ¿qué desea cambiar?', 'Claro, ¿qué quieres cambiar?'],
   ['¿Qué desea hacer?', '¿Qué quieres hacer?'],
@@ -314,6 +319,11 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['Su PDF está protegido', 'Tu PDF está protegido'],
   ['¿Nos envía una captura', '¿Nos envías una captura'],
   ['Confirmamos su pago', 'Confirmamos tu pago'],
+  // Retest S3 (N19): payment request while a receipt is in review.
+  [
+    'no hace falta que vuelva a pagar. Le aviso en cuanto quede confirmado.',
+    'no hace falta que vuelvas a pagar. Te aviso en cuanto quede confirmado.',
+  ],
   ['Gracias por su compra', 'Gracias por tu compra'],
   // Third-person verbs that read as usted markers in the tú copy.
   ['en cuanto se confirme.', 'en cuanto quede confirmado.'],

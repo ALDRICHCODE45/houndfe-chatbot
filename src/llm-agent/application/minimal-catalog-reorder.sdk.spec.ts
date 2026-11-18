@@ -430,10 +430,13 @@ describe('S2 reorder: accepting or declining', () => {
     const lookup = await h.checkout.lookup(SENDER, null);
     if (!lookup.ok || lookup.status !== 'unique') throw new Error('lookup');
     await h.checkout.selectAddress(SENDER, lookup.addresses[0].addressRef);
-    const delivery = await h.turn('quiero comprar', [
-      call('confirmCheckoutDetails'),
-      say(),
-    ]);
+    // Retest S4 (N15): «quiero comprar» asks delivery or pickup first.
+    const asked = await h.turn('quiero comprar');
+    const delivery = await h.turn(
+      'Envío a domicilio',
+      [call('confirmCheckoutDetails'), say()],
+      buttons(asked).find((button) => button.title === 'Envío a domicilio')?.id,
+    );
     expect(delivery.reply).toContain('Confirme sus datos de entrega:');
     const summary = await h.turn('sí');
     expect(summary.reply).toContain('Resumen de su pedido:');

@@ -224,6 +224,9 @@ const innerEnvValidationSchema = Joi.object({
     .valid(RECEIPT_LEASE_MS_VALUE)
     .default(RECEIPT_LEASE_MS_VALUE),
   RECEIPT_MEDIA_WORKER_POLL_MS: receiptLessThanLease(5_000),
+  // N18: destination/origin receipt fields inside `extracted` (backend
+  // aebb60ef). Kill switch only; default on.
+  RECEIPT_DESTINATION_FIELDS_ENABLED: Joi.boolean().default(true),
 })
   .custom((value: Record<string, unknown>, helpers) => {
     // WU1C2A cross-field rule: download timeout must be at least as large as metadata timeout.

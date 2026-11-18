@@ -56,6 +56,10 @@ describe('LlmReceiptExtractionAdapter', () => {
       date: '2026-11-04',
       reference: 'ABC123',
       bank: 'BBVA',
+      destinationBank: null,
+      destinationName: null,
+      destinationAccountLast4: null,
+      originName: null,
       confidence: 'high',
       amountMismatch: false,
     });
@@ -127,6 +131,10 @@ describe('LlmReceiptExtractionAdapter', () => {
       date: null,
       reference: 'R'.repeat(64),
       bank: null,
+      destinationBank: null,
+      destinationName: null,
+      destinationAccountLast4: null,
+      originName: null,
       confidence: 'low',
       amountMismatch: false,
     });
@@ -144,6 +152,106 @@ describe('LlmReceiptExtractionAdapter', () => {
 
     expect(result).toMatchObject({ kind: 'receipt', [field]: null });
   });
+
+  it('asks the model for the destination and origin fields (N18)', async () => {
+    const generate = fakeModel(RECEIPT_OUTPUT);
+
+    await adapterWith(generate).extract(PNG_INPUT);
+
+    const [[{ output, system }]] = generate.mock.calls as [
+      [
+        {
+          output: { responseFormat: PromiseLike<{ schema: unknown }> };
+          system: string;
+        },
+      ],
+    ];
+    const { schema } = (await output.responseFormat) as {
+      schema: { properties: Record<string, unknown> };
+    };
+    expect(Object.keys(schema.properties)).toEqual(
+      expect.arrayContaining([
+        'destinationBank',
+        'destinationName',
+        'destinationAccountLast4',
+        'originName',
+      ]),
+    );
+    expect(system).toMatch(/destinationAccountLast4/);
+  });
+
+  it('reads the production receipt destination and origin (N18)', async () => {
+    const generate = fakeModel({
+      ...RECEIPT_OUTPUT,
+      bank: 'BBVA MEXICO',
+      destinationBank: ' BBVA MEXICO ',
+      destinationName: 'Abril Alejandra Vazquez Ramos',
+      destinationAccountLast4: '****9616',
+      originName: '  Bryan Aldrich Flores',
+    });
+
+    await expect(
+      adapterWith(generate).extract(PNG_INPUT),
+    ).resolves.toMatchObject({
+      kind: 'receipt',
+      destinationBank: 'BBVA MEXICO',
+      destinationName: 'Abril Alejandra Vazquez Ramos',
+      destinationAccountLast4: '9616',
+      originName: 'Bryan Aldrich Flores',
+    });
+  });
+
+  it.each([
+    ['plain', '9616', '9616'],
+    ['masked', '****9616', '9616'],
+    ['masked with spaces', '**** **** 9616', '9616'],
+    ['split by a space', '96 16', '9616'],
+    ['leading zero kept as text', '0123', '0123'],
+    ['three digits', '616', null],
+    ['five digits', '19616', null],
+    ['a full CLABE', '012180001234569616', null],
+    ['a masked value with more digits', '4152 **** 9616', null],
+    ['letters', 'ab12', null],
+    ['a number instead of a string', 9616, null],
+    ['empty', '   ', null],
+  ])(
+    'normalizes a %s destinationAccountLast4',
+    async (_label, value, expected) => {
+      const generate = fakeModel({
+        ...RECEIPT_OUTPUT,
+        destinationAccountLast4: value,
+      });
+
+      await expect(
+        adapterWith(generate).extract(PNG_INPUT),
+      ).resolves.toMatchObject({ destinationAccountLast4: expected });
+    },
+  );
+
+  it.each([
+    ['destinationBank', 80],
+    ['destinationName', 120],
+    ['originName', 120],
+  ] as const)(
+    'omits (never truncates) a too long %s and keeps one at its limit',
+    async (field, max) => {
+      const atLimit = 'A'.repeat(max);
+      const tooLong = 'A'.repeat(max + 1);
+      const ok = await adapterWith(
+        fakeModel({ ...RECEIPT_OUTPUT, [field]: `  ${atLimit}  ` }),
+      ).extract(PNG_INPUT);
+      const omitted = await adapterWith(
+        fakeModel({ ...RECEIPT_OUTPUT, [field]: tooLong }),
+      ).extract(PNG_INPUT);
+      const blank = await adapterWith(
+        fakeModel({ ...RECEIPT_OUTPUT, [field]: '   ' }),
+      ).extract(PNG_INPUT);
+
+      expect(ok).toMatchObject({ [field]: atLimit });
+      expect(omitted).toMatchObject({ [field]: null });
+      expect(blank).toMatchObject({ [field]: null });
+    },
+  );
 
   it.each([
     ['true when amounts differ', 140000, 150000, true],

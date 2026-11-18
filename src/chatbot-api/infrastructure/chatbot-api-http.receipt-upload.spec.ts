@@ -113,6 +113,52 @@ describe('receipt upload mocked HTTP contract', () => {
     });
   });
 
+  it('sends the destination and origin fields inside extracted, as strings (N18)', async () => {
+    request.mockReturnValue(of(response(uploaded)));
+    await client.uploadReceipt(
+      saleId,
+      file,
+      {
+        extracted: {
+          amountCents: 38900,
+          bank: 'BBVA MEXICO',
+          destinationBank: 'BBVA MEXICO',
+          destinationName: 'Abril Alejandra Vazquez Ramos',
+          destinationAccountLast4: '0616',
+          originName: 'Bryan Aldrich Flores',
+          confidence: 0.9,
+        },
+      },
+      'wamid-media-1',
+    );
+    const raw = (sent().data as FormData).get('extracted') as string;
+    expect(JSON.parse(raw)).toEqual({
+      amountCents: 38900,
+      bank: 'BBVA MEXICO',
+      destinationBank: 'BBVA MEXICO',
+      destinationName: 'Abril Alejandra Vazquez Ramos',
+      destinationAccountLast4: '0616',
+      originName: 'Bryan Aldrich Flores',
+      confidence: 0.9,
+    });
+    expect(raw).toContain('"destinationAccountLast4":"0616"');
+  });
+
+  it('omits absent destination fields from extracted (N18)', async () => {
+    request.mockReturnValue(of(response(uploaded)));
+    await client.uploadReceipt(
+      saleId,
+      file,
+      { extracted: { destinationName: 'Abril', confidence: 0.6 } },
+      'wamid-media-1',
+    );
+    const raw = (sent().data as FormData).get('extracted') as string;
+    expect(JSON.parse(raw)).toEqual({
+      destinationName: 'Abril',
+      confidence: 0.6,
+    });
+  });
+
   it('sends only the file when nothing was declared or extracted', async () => {
     request.mockReturnValue(of(response(uploaded)));
     await client.uploadReceipt(saleId, file, {}, 'wamid-media-1');

@@ -514,6 +514,30 @@ describe('envValidationSchema', () => {
     });
   });
 
+  describe('RECEIPT_DESTINATION_FIELDS_ENABLED', () => {
+    it.each([
+      [undefined, true, false],
+      ['true', true, false],
+      ['false', false, false],
+      ['yes', undefined, true],
+    ])('validates flag=%s', (flag, expected, invalid) => {
+      const { error, value } = envValidationSchema.validate(
+        flag === undefined
+          ? { ...validEnv }
+          : { ...validEnv, RECEIPT_DESTINATION_FIELDS_ENABLED: flag },
+        { abortEarly: false },
+      ) as { error?: Joi.ValidationError; value: Record<string, unknown> };
+      expect(Boolean(error)).toBe(invalid);
+      if (invalid) {
+        expect(error!.details[0].path).toContain(
+          'RECEIPT_DESTINATION_FIELDS_ENABLED',
+        );
+      } else {
+        expect(value.RECEIPT_DESTINATION_FIELDS_ENABLED).toBe(expected);
+      }
+    });
+  });
+
   describe('CONVERSATION_MIRROR_DELIVERY_ENABLED', () => {
     it.each([
       [undefined, false, false],

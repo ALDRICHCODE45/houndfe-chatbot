@@ -338,6 +338,15 @@ export class MinimalCheckoutConfirmation {
     this.confirmed.delete(senderId);
   }
 
+  /**
+   * Retest S2 (N17): drop the pending delivery-data offer without answering
+   * it (the customer chose store pickup, so the question no longer applies).
+   * A local confirmation already given is kept.
+   */
+  dismissPending(senderId: string): void {
+    this.pending.delete(senderId);
+  }
+
   /** Detached copy of the live (unexpired) pending offer, or `null`. */
   exportPending(senderId: string): MinimalCheckoutPendingState | null {
     const pending = this.pending.get(senderId);

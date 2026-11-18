@@ -1,7 +1,36 @@
 import {
   isOrderSummaryRequest,
+  isPayRemainderRequest,
   isPaymentQuestion,
 } from './minimal-order-requests';
+
+describe('isPayRemainderRequest (retest S3)', () => {
+  it.each([
+    'me faltó pagar el resto',
+    'Me faltó pagar el resto',
+    '¿cómo pago lo que falta?',
+    'necesito transferir la diferencia',
+    'quiero hacer otro pago',
+    'voy a hacer otra transferencia',
+    'me falta por pagar',
+    'te debo el restante',
+    'tengo que depositar más',
+  ])('recognises %j', (text) => {
+    expect(isPayRemainderRequest(text)).toBe(true);
+  });
+
+  it.each([
+    '¿A qué cuenta le transfiero?',
+    'Transferencia',
+    'quiero pagar por transferencia',
+    'ya pagué',
+    'me faltó una croqueta',
+    'gracias',
+    undefined,
+  ])('ignores %j', (text) => {
+    expect(isPayRemainderRequest(text)).toBe(false);
+  });
+});
 
 describe('isOrderSummaryRequest (S5)', () => {
   it.each([

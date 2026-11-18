@@ -15,6 +15,11 @@ import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
 import { HumanRequestsServicesModule } from '../human-requests/human-requests.module';
 import { LlmAgentModule } from '../llm-agent/llm-agent.module';
 import { ReceiptMediaModule } from '../receipt-media/receipt-media.module';
+import {
+  RECEIPT_REVIEW_STATUS,
+  ReceiptReviewStatusRegistry,
+  type ReceiptReviewStatusPort,
+} from '../llm-agent/domain/receipt-review-status';
 import { SchedulingModule } from '../scheduling/scheduling.module';
 import { ProductImageModule } from '../product-image/product-image.module';
 import { WebhookDedupPurgeWorker } from './application/webhook-dedup-purge.worker';
@@ -29,6 +34,11 @@ import { PostgresWebhookDedupStore } from './infrastructure/postgres-webhook-ded
 import { WebhookController } from './presentation/webhook.controller';
 import { SignatureGuard } from './presentation/signature.guard';
 import { WhatsappSenderModule } from './whatsapp-sender.module';
+
+/** Marker provider that wires the receipt-in-review read (retest S3). */
+export const RECEIPT_REVIEW_STATUS_WIRING = Symbol(
+  'RECEIPT_REVIEW_STATUS_WIRING',
+);
 
 /**
  * WhatsappModule
@@ -72,6 +82,20 @@ import { WhatsappSenderModule } from './whatsapp-sender.module';
   controllers: [WebhookController],
   providers: [
     WebhookDispatcherService,
+    {
+      // Retest S3 (N19): this module imports both the LLM agent and the
+      // receipt media modules, so it registers the receipt read into the
+      // payment step's late-bound registry (no module cycle).
+      provide: RECEIPT_REVIEW_STATUS_WIRING,
+      inject: [ReceiptReviewStatusRegistry, RECEIPT_REVIEW_STATUS],
+      useFactory: (
+        registry: ReceiptReviewStatusRegistry,
+        receipts: ReceiptReviewStatusPort,
+      ): true => {
+        registry.register(receipts);
+        return true;
+      },
+    },
     customerInboundCaptureProvider,
     {
       provide: RestockInboundCapture,

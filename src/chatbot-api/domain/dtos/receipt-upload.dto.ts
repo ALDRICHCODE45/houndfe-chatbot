@@ -48,7 +48,47 @@ export interface ReceiptUploadExtracted {
   date?: string;
   reference?: string;
   bank?: string;
+  /** N18 (backend aebb60ef): trimmed, non-empty, ≤80. */
+  destinationBank?: string;
+  /** ≤120. */
+  destinationName?: string;
+  /** A JSON string of exactly 4 digits (e.g. "9616"), never a number. */
+  destinationAccountLast4?: string;
+  /** ≤120. */
+  originName?: string;
   confidence?: number;
+}
+
+/** The N18 keys behind `RECEIPT_DESTINATION_FIELDS_ENABLED` and the
+ * INVALID_RECEIPT_EXTRACTED fallback. */
+export const RECEIPT_DESTINATION_KEYS = [
+  'destinationBank',
+  'destinationName',
+  'destinationAccountLast4',
+  'originName',
+] as const satisfies readonly (keyof ReceiptUploadExtracted)[];
+
+/** The same fields without any N18 key; `extracted` is dropped when it
+ * ends up empty. Never mutates its input. */
+export function withoutDestinationFields(
+  fields: ReceiptUploadFields,
+): ReceiptUploadFields {
+  if (fields.extracted === undefined) return fields;
+  const extracted: ReceiptUploadExtracted = { ...fields.extracted };
+  for (const key of RECEIPT_DESTINATION_KEYS) delete extracted[key];
+  const stripped: ReceiptUploadFields = { ...fields, extracted };
+  if (Object.keys(extracted).length === 0) delete stripped.extracted;
+  return stripped;
+}
+
+/** The N18 keys this upload carries, in fixed order. */
+export function destinationKeysOf(
+  fields: ReceiptUploadFields,
+): (typeof RECEIPT_DESTINATION_KEYS)[number][] {
+  const extracted = fields.extracted;
+  return extracted === undefined
+    ? []
+    : RECEIPT_DESTINATION_KEYS.filter((key) => extracted[key] !== undefined);
 }
 
 export interface ReceiptUploadFields {
@@ -111,6 +151,7 @@ const EXTRACTED_KEYS = [
   'date',
   'reference',
   'bank',
+  ...RECEIPT_DESTINATION_KEYS,
   'confidence',
 ] as const satisfies readonly (keyof ReceiptUploadExtracted)[];
 

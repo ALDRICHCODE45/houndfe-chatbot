@@ -208,6 +208,7 @@ describe('AppConfigModule integration', () => {
             pollIntervalMs: 5_000,
           },
           metricsToken: undefined,
+          destinationFieldsEnabled: true,
         });
 
         await moduleRef.close();

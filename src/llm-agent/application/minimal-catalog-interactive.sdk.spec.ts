@@ -506,14 +506,12 @@ describe('S2 cart summary invites the customer to continue', () => {
 
     expect(tapped.reply).toBe(typed.reply);
     expect(tapped.interactive).toEqual(typed.interactive);
-    // The model saw the same user turn and the same checkout read ran.
-    expect(tapHarness.seen).toHaveLength(callsBefore + 1);
-    const lastUser = (seen: unknown) =>
-      (seen as { messages: Array<{ role: string; content: string }> }).messages
-        .filter((message) => message.role === 'user')
-        .at(-1)?.content;
-    expect(lastUser(tapHarness.seen.at(-1))).toBe('Quiero comprar');
-    expect(lastUser(typedHarness.seen.at(-1))).toBe('Quiero comprar');
+    // Retest S4 (N15): with store pickup available both first ask delivery
+    // or pickup, without the model.
+    expect(tapped.reply).toBe(
+      '¿Se lo enviamos a su dirección o prefiere recogerlo en tienda?',
+    );
+    expect(tapHarness.seen).toHaveLength(callsBefore);
     expect(tapHarness.api.getCustomerCheckoutContext).toHaveBeenCalledTimes(
       typedHarness.api.getCustomerCheckoutContext.mock.calls.length,
     );

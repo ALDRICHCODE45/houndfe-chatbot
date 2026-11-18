@@ -54,6 +54,7 @@ Partial drafts stay valid for collection, but `prepare` returns `blocked` with t
 | `handled`          | Affirmative that cannot confirm yet (unarmed, stale, foreign phone) or a changed draft (`MINIMAL_CHECKOUT_CHANGED_REPLY`).         |
 | Draft change       | Any content or `revision` change (a same-revision content change too) invalidates the pending and any local confirmation.          |
 | Non-confirmation   | A `false` checkpoint never finalizes and never retries; a new presentation supersedes pending and confirmation.                    |
+| Dismissal          | `dismissPending` drops the pending unanswered (store pickup chosen, retest S2); a local confirmation already given is kept.        |
 | Restart            | The presentation/confirmation is instance-scoped and lost. The durable draft survives elsewhere, so re-present and re-confirm.     |
 
 ## Composition duties (coordinator-owned)

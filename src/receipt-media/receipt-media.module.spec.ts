@@ -38,6 +38,7 @@ import {
 } from './domain/receipt-extraction.port';
 import { ReceiptIngestionProcessor } from './application/receipt-ingestion.processor';
 import { ReceiptIngressService } from './application/receipt-ingress.service';
+import { RECEIPT_REVIEW_STATUS } from '../llm-agent/domain/receipt-review-status';
 import { META_MEDIA } from './domain/meta-media.port';
 import type { ReceiptMediaRow } from './domain/receipt-media.types';
 import { MetaMediaClient } from './infrastructure/meta-media.client';
@@ -536,7 +537,11 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       LlmCoreModule,
     ])
       expect(meta('imports')).toContain(required);
-    expect(meta('exports')).toEqual([ReceiptIngressService, RECEIPT_TELEMETRY]);
+    expect(meta('exports')).toEqual([
+      ReceiptIngressService,
+      RECEIPT_TELEMETRY,
+      RECEIPT_REVIEW_STATUS,
+    ]);
   });
 
   it('registers neither receipt worker nor the receipt outbox composition', async () => {
@@ -673,6 +678,94 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         await drainMicrotasks();
       }
     });
+
+    it.each([
+      [undefined, true],
+      ['false', false],
+    ])(
+      'honors RECEIPT_DESTINATION_FIELDS_ENABLED=%s in the composed upload (N18)',
+      async (flag, sent) => {
+        const uploadReceipt = jest.fn().mockResolvedValue({
+          receiptId: '33333333-3333-4333-8333-333333333333',
+          status: 'PENDING',
+          mimeType: 'image/jpeg',
+          sizeBytes: 3,
+          sha256: 'ab',
+          previewStatus: 'READY',
+        });
+        applyEnv(
+          flag === undefined
+            ? RECEIPT_ENABLED_ENV
+            : {
+                ...RECEIPT_ENABLED_ENV,
+                RECEIPT_DESTINATION_FIELDS_ENABLED: flag,
+              },
+        );
+        if (flag === undefined)
+          delete process.env.RECEIPT_DESTINATION_FIELDS_ENABLED;
+        const moduleRef = await Test.createTestingModule({
+          imports: [
+            AppConfigModule.forRoot({ ignoreEnvFile: true }),
+            ReceiptMediaModule,
+          ],
+        })
+          .overrideProvider(PG_POOL)
+          .useValue(makeOutboxPool().pool)
+          .overrideProvider(CONVERSATION_STORE)
+          .useValue(conversationStore())
+          .overrideProvider(CHATBOT_API_CLIENT)
+          .useValue({ uploadReceipt })
+          .overrideProvider(PostgresReceiptMediaStore)
+          .useValue({
+            commitUploadSuccess: jest
+              .fn()
+              .mockResolvedValue({ kind: 'committed' }),
+            claimBatch: jest.fn().mockResolvedValue([]),
+            listOutcomeDue: jest.fn().mockResolvedValue([]),
+          })
+          .overrideProvider(WHATSAPP_SENDER)
+          .useValue({
+            sendText: jest
+              .fn()
+              .mockResolvedValue({ providerMessageId: 'wamid' }),
+          })
+          .compile();
+        try {
+          await moduleRef.get(ReceiptAttachmentService).upload({
+            receipt: {
+              id: '11111111-1111-4111-8111-111111111111',
+              capturedSaleId: 'sale-1',
+              providerMediaId: 'wa-media-1',
+              declaredAmountCents: null,
+            } as unknown as ReceiptMediaRow,
+            fence: {
+              id: '11111111-1111-4111-8111-111111111111',
+              owner: 'o',
+              expectedVersion: '7',
+            },
+            file: { bytes: Buffer.from('img'), mimeType: 'image/jpeg' },
+            fields: {
+              extracted: {
+                destinationBank: 'BBVA MEXICO',
+                destinationName: 'Abril Alejandra Vazquez Ramos',
+                destinationAccountLast4: '9616',
+                originName: 'Bryan Aldrich Flores',
+                confidence: 0.9,
+              },
+            },
+            order: null,
+          });
+          const fields = (uploadReceipt.mock.calls as unknown[][])[0][2] as {
+            extracted: Record<string, unknown>;
+          };
+          expect('destinationAccountLast4' in fields.extracted).toBe(sent);
+          expect('originName' in fields.extracted).toBe(sent);
+        } finally {
+          await moduleRef.close().catch(() => undefined);
+          await drainMicrotasks();
+        }
+      },
+    );
   });
 
   describe('ReceiptMediaModule WU15-2 telemetry composition', () => {

@@ -242,6 +242,15 @@ export class MinimalCheckoutService {
     return this.confirmation.confirmedDraft(senderId, current.raw);
   }
 
+  /**
+   * Retest S2 (N17): store pickup was chosen, so a delivery-data summary
+   * still waiting for SÍ is no longer the current question. It is dropped
+   * unanswered; a later tap of its button is a stale button.
+   */
+  dismissPendingConfirmation(senderId: string): void {
+    this.confirmation.dismissPending(senderId);
+  }
+
   /** Backend rejected the selected base; a fresh lookup/selection is required. */
   clearSelection(senderId: string): void {
     this.addresses.unselect(senderId);

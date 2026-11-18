@@ -73,6 +73,8 @@ const PICK_PRODUCT = 'pick_product';
 const PAYMENT_METHOD = 'pay';
 const CART_CONTINUE = 'cart_continue';
 const CART_ADD_MORE = 'cart_add';
+const FULFIL_DELIVERY = 'fulfil_delivery';
+const FULFIL_PICKUP = 'fulfil_pickup';
 
 /** Customer text a confirm button stands for (the gates' affirmative). */
 export const INTERACTIVE_CONFIRM_TEXT = 'SÍ';
@@ -81,6 +83,9 @@ export const INTERACTIVE_ORDER_CHANGE_TEXT = 'Quiero cambiar algo';
 export const INTERACTIVE_CHECKOUT_CHANGE_TEXT = 'Quiero corregir mis datos';
 /** «Seguir con la compra» is the customer asking to buy (starts checkout). */
 export const INTERACTIVE_CART_CONTINUE_TEXT = 'Quiero comprar';
+/** Retest S4 (N15): the two answers to the delivery-or-pickup question. */
+export const INTERACTIVE_FULFIL_DELIVERY_TEXT = 'Envío a domicilio';
+export const INTERACTIVE_FULFIL_PICKUP_TEXT = 'Recoger en tienda';
 
 /** What a tapped button or list row means, from its id. */
 export type InteractiveReplyIntent =
@@ -97,7 +102,9 @@ export type InteractiveReplyIntent =
   /** Payment-step method button; the reference is the placed sale id. */
   | { kind: 'payment_method'; method: string; reference: string }
   /** Cart-summary buttons; the reference identifies the cart they were sent with. */
-  | { kind: 'cart_continue' | 'cart_add_more'; reference: string };
+  | { kind: 'cart_continue' | 'cart_add_more'; reference: string }
+  /** Retest S4: delivery-or-pickup answer, bound to the cart it was asked for. */
+  | { kind: 'fulfilment'; mode: 'delivery' | 'pickup'; reference: string };
 
 /** Parse a reply id the bot issued; anything else (unknown, forged) is `null`. */
 export function parseInteractiveReplyId(
@@ -125,6 +132,15 @@ export function parseInteractiveReplyId(
         ? null
         : {
             kind: head === CART_CONTINUE ? 'cart_continue' : 'cart_add_more',
+            reference: tail,
+          };
+    case FULFIL_DELIVERY:
+    case FULFIL_PICKUP:
+      return tail === null
+        ? null
+        : {
+            kind: 'fulfilment',
+            mode: head === FULFIL_PICKUP ? 'pickup' : 'delivery',
             reference: tail,
           };
     case PAYMENT_METHOD: {
@@ -169,6 +185,10 @@ export function interactiveReplyText(id: unknown, title: unknown): string {
       return INTERACTIVE_CHECKOUT_CHANGE_TEXT;
     case 'cart_continue':
       return INTERACTIVE_CART_CONTINUE_TEXT;
+    case 'fulfilment':
+      return intent.mode === 'pickup'
+        ? INTERACTIVE_FULFIL_PICKUP_TEXT
+        : INTERACTIVE_FULFIL_DELIVERY_TEXT;
     default:
       return fallback;
   }
@@ -265,6 +285,31 @@ export function cartNextStepButtons(
     buttons: [
       { id: `${CART_CONTINUE}:${reference}`, title: 'Seguir con la compra' },
       { id: `${CART_ADD_MORE}:${reference}`, title: 'Agregar algo más' },
+    ],
+    prompt,
+  };
+}
+
+/**
+ * Retest S4 (N15): «Envío a domicilio» / «Recoger en tienda» under the
+ * delivery-or-pickup question, bound to the cart it was asked for. Titles
+ * are the same in usted and tú.
+ */
+export function fulfilmentChoiceButtons(
+  reference: string,
+  prompt: string,
+): CustomerReplyInteractive {
+  return {
+    type: 'buttons',
+    buttons: [
+      {
+        id: `${FULFIL_DELIVERY}:${reference}`,
+        title: INTERACTIVE_FULFIL_DELIVERY_TEXT,
+      },
+      {
+        id: `${FULFIL_PICKUP}:${reference}`,
+        title: INTERACTIVE_FULFIL_PICKUP_TEXT,
+      },
     ],
     prompt,
   };

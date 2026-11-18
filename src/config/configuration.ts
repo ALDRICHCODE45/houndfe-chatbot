@@ -92,6 +92,12 @@ const configuration = () => ({
       pollIntervalMs: int(process.env.RECEIPT_MEDIA_WORKER_POLL_MS, 5_000),
     },
     metricsToken: process.env.RECEIPT_MEDIA_METRICS_TOKEN,
+    // N18 kill switch, default on (backend aebb60ef is deployed): false
+    // sends none of the destination/origin keys inside `extracted`.
+    destinationFieldsEnabled: envBoolean(
+      process.env.RECEIPT_DESTINATION_FIELDS_ENABLED,
+      true,
+    ),
   },
 });
 

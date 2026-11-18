@@ -33,6 +33,7 @@ import {
   distinctiveMatches,
   mentionsPhrase,
   nameCoverage,
+  presentationPickForm,
   requestsCartAction,
   requestsCartChange,
   statedUnitCount,
@@ -412,7 +413,8 @@ export class MinimalCartConversation {
       const pending = this.pending;
       const form =
         conversationalAddForm(this.text, this.dialogue.previousAssistantText) ??
-        this.answeredChoiceForm(selection.productId);
+        this.answeredChoiceForm(selection.productId) ??
+        this.presentationPick(selection.productId);
       if (
         pending !== null &&
         pending.productId === selection.productId &&
@@ -572,6 +574,24 @@ export class MinimalCartConversation {
       return statedUnitCount(text).status === 'none' ? form : null;
     }
     return null;
+  }
+
+  /**
+   * Retest S5 (N14): the current message picks exactly one presentation of
+   * the product without a count («quiero el de 2 kg», «la de 7 piezas»);
+   * that is one unit, like a countless «agrégalo». `null` otherwise.
+   */
+  private presentationPick(productId: string): 'singular' | null {
+    const named = this.variantsOf(productId)
+      .map(presentationLabel)
+      .filter((label) => label.length > 0 && mentionsPhrase(this.text, label));
+    return named.length === 1
+      ? presentationPickForm(
+          this.text,
+          named[0],
+          this.dialogue.previousAssistantText,
+        )
+      : null;
   }
 
   /**
