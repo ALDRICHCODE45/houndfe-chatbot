@@ -205,6 +205,66 @@ export function conversationalAddForm(
     : null;
 }
 
+/** Words that say the customer wants the thing named («quiero», «dame»…). */
+const WANT_WORDS: ReadonlySet<string> = new Set([
+  'quiero',
+  'quisiera',
+  'queria',
+  'dame',
+  'deme',
+  'damelo',
+  'demelo',
+  'damela',
+  'demela',
+  'llevo',
+  'llevare',
+  'mandame',
+  'mandeme',
+  'ocupo',
+  'necesito',
+  'prefiero',
+]);
+
+/** The bot's message offered to add or asked which option to take. */
+export function offersCartChoice(assistantText: string | null): boolean {
+  if (assistantText === null) return false;
+  return (
+    offersCartAdd(assistantText) ||
+    asksCartChoice(assistantText) ||
+    mentionsPhrase(assistantText, 'cual le gustaria llevar') ||
+    mentionsPhrase(assistantText, 'cual te gustaria llevar')
+  );
+}
+
+/**
+ * Retest S5 (N14): `singular` when `text` picks ONE presentation (`label`,
+ * already found in the text by the caller) without a count — «quiero el de
+ * 2 kg», «la de 7 piezas» — as a purchase: a want word, or an answer to the
+ * bot's add offer / options question. A question, a negation or a plural
+ * article («los de 2 kg») is never a default unit; `null` otherwise.
+ */
+export function presentationPickForm(
+  text: string,
+  label: string,
+  previousAssistantText: string | null,
+): 'singular' | null {
+  if (/[?¿]/.test(text)) return null;
+  const words = cartWords(text).map(fold);
+  if (words.some((word) => NEGATION_TOKENS.has(word))) return null;
+  const needle = cartWords(label).map(fold);
+  const at = words.findIndex((_, index) =>
+    needle.every((part, offset) => words[index + offset] === part),
+  );
+  if (at === -1) return null;
+  // «los de 2 kg» / «las de 7 piezas» ask for several: the count is asked.
+  const article = words[at - 1] === 'de' ? words[at - 2] : words[at - 1];
+  if (article === 'los' || article === 'las') return null;
+  return words.some((word) => WANT_WORDS.has(word)) ||
+    offersCartChoice(previousAssistantText)
+    ? 'singular'
+    : null;
+}
+
 const fold = (word: string) =>
   word.length > 4 && word.endsWith('s') ? word.slice(0, -1) : word;
 

@@ -5,6 +5,7 @@ import {
   mentionsPhrase,
   nameCoverage,
   offersCartAdd,
+  presentationPickForm,
   statedUnitCount,
 } from './minimal-cart-request';
 
@@ -120,5 +121,64 @@ describe('"un par" citation', () => {
     expect(groundCartQuantity({ ...base, quantity: 1 }).kind).toBe(
       'invalid_evidence',
     );
+  });
+});
+
+describe('presentationPickForm (retest S5, N14)', () => {
+  const OPTIONS =
+    'Croquetas Nupec: 2 kg $349.00, 8 kg $999.00, 20 kg $1899.00. ¿Cuál le gustaría llevar?';
+  it.each([
+    ['quiero el de 2 kg', '2 kg', null],
+    ['quiero el de 2kg porfa', '2 kg', null],
+    ['la de 7 piezas', '7 piezas', OPTIONS],
+    ['el de 20 kg por favor', '20 kg', OPTIONS],
+  ])('"%s" picks one unit of %s', (text, label, previous) => {
+    expect(presentationPickForm(text, label, previous)).toBe('singular');
+  });
+
+  it.each([
+    ['¿y el de 2 kg cuánto cuesta?', '2 kg', OPTIONS],
+    ['no quiero el de 2 kg', '2 kg', OPTIONS],
+    ['quiero los de 2 kg', '2 kg', OPTIONS],
+    ['las de 7 piezas', '7 piezas', OPTIONS],
+    ['la de 7 piezas', '7 piezas', 'Tiene 7 y 14 piezas.'],
+    ['quiero el de 8 kg', '2 kg', OPTIONS],
+  ])('"%s" is not a one-unit pick of %s', (text, label, previous) => {
+    expect(presentationPickForm(text, label, previous)).toBeNull();
+  });
+});
+
+describe('a presentation number is never the cited count (retest S5)', () => {
+  it('«la de 7 piezas» citing "7" is rejected', () => {
+    expect(
+      groundCartQuantity({
+        text: 'la de 7 piezas',
+        productId: 'p',
+        productName: 'Premios Dentales para Perro',
+        variantName: 'Premios Dentales para Perro 7 piezas',
+        operation: 'add',
+        quantity: 7,
+        quantityText: '7',
+        continuation: false,
+      }).kind,
+    ).toBe('invalid_evidence');
+  });
+
+  it('«quiero 2 de 7 piezas» citing "2" adds two', () => {
+    expect(
+      groundCartQuantity({
+        text: 'quiero 2 de 7 piezas',
+        productId: 'p',
+        productName: 'Premios Dentales para Perro',
+        variantName: 'Premios Dentales para Perro 7 piezas',
+        operation: 'add',
+        quantity: 2,
+        quantityText: '2',
+        continuation: false,
+      }),
+    ).toEqual({
+      kind: 'ready',
+      intent: { productId: 'p', operation: 'add', quantity: 2 },
+    });
   });
 });

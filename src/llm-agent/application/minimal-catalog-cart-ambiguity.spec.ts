@@ -327,7 +327,10 @@ describe('reported quantity-before-presentation flow', () => {
 });
 
 describe('Minimal cart ambiguity through the public SDK route', () => {
-  it('asks for quantity on the reported 500mg confirmation and preserves other lines (S2)', async () => {
+  // Retest 2026-11-18 S5 (N14) supersedes the old "ask the count" rule: a
+  // countless presentation pick after the options adds ONE unit and says so
+  // (never 500, the presentation number); the other lines are untouched.
+  it('adds one unit on the reported 500mg confirmation and preserves other lines (S2, retest S5)', async () => {
     const f = fixture();
     const allowed = new Set([PRODUCT, FOOD]);
     expect(
@@ -376,9 +379,22 @@ describe('Minimal cart ambiguity through the public SDK route', () => {
     });
     expect(reply.kind).toBe('handled');
     if (reply.kind !== 'handled') throw new Error('Expected handled reply');
-    expect(reply.reply).toMatch(QUANTITY_QUESTION);
-    expect(mutation).not.toHaveBeenCalled();
-    expect(await f.cart.view(SENDER)).toEqual(before);
+    expect(reply.reply).toMatch(
+      /^Te agregué 1 unidad; si quieres otra cantidad/,
+    );
+    expect(reply.reply).not.toMatch(QUANTITY_QUESTION);
+    expect(mutation).toHaveBeenCalledTimes(1);
+    if (!before.ok) throw new Error('Expected verified cart');
+    const after = await f.cart.view(SENDER);
+    if (!after.ok) throw new Error('Expected verified cart');
+    expect(after.items).toEqual([
+      ...before.items,
+      expect.objectContaining({
+        productId: PRODUCT,
+        variantId: LARGE,
+        quantity: 1,
+      }),
+    ]);
     expect(f.api.createSale).not.toHaveBeenCalled();
     expect(f.api.getPaymentDetails).not.toHaveBeenCalled();
   });
@@ -1285,14 +1301,19 @@ describe('Minimal cart singular "otra unidad" add phrasing (S4)', () => {
   );
 });
 
+// Retest 2026-11-18 S5 (N14): the countless pick adds the default ONE unit
+// (`one`); a model-guessed count or the presentation number (500) is never
+// adopted: the count is asked and nothing is written (`ask`).
 describe('reported presentation-only confirmation after the full cart sequence', () => {
   it.each([
-    ['adjustCartItem', { delta: 1, quantityText: '500mg' }],
-    ['adjustCartItem', { delta: 1, quantityText: null }],
-    ['setCartItem', { quantity: 0, quantityText: null }],
+    ['adjustCartItem', { delta: 1, quantityText: '500mg' }, 'one'],
+    ['adjustCartItem', { delta: 1, quantityText: null }, 'one'],
+    ['adjustCartItem', { delta: 500, quantityText: '500mg' }, 'ask'],
+    ['adjustCartItem', { delta: 2, quantityText: null }, 'ask'],
+    ['setCartItem', { quantity: 0, quantityText: null }, 'ask'],
   ])(
-    'retains 500mg without adopting a guessed count through %s',
-    async (toolName, proposal) => {
+    'retains 500mg without adopting a guessed count through %s %j',
+    async (toolName, proposal, outcome) => {
       const f = fixture();
       const allowed = new Set([PRODUCT, FOOD]);
       await f.cart.setItem(
@@ -1388,19 +1409,28 @@ describe('reported presentation-only confirmation after the full cart sequence',
         call('searchCatalog', { q: 'ibuprofeno' }),
         say('250mg y 500mg'),
       ]);
-      expect(
-        await turn('Si, la de 500mg por favor.', [
-          call(toolName, {
-            selectionRef: f.refs.large,
-            continuation: true,
-            ...proposal,
-          }),
-          say(),
-        ]),
-      ).toMatch(QUANTITY_QUESTION);
-      expect(adjust).not.toHaveBeenCalled();
-      expect(set).not.toHaveBeenCalled();
-      expect(await f.cart.view(SENDER)).toEqual(beforeSelection);
+      const picked = await turn('Si, la de 500mg por favor.', [
+        call(toolName, {
+          selectionRef: f.refs.large,
+          continuation: true,
+          ...proposal,
+        }),
+        say(),
+      ]);
+      if (outcome === 'ask') {
+        expect(picked).toMatch(QUANTITY_QUESTION);
+        expect(adjust).not.toHaveBeenCalled();
+        expect(set).not.toHaveBeenCalled();
+        expect(await f.cart.view(SENDER)).toEqual(beforeSelection);
+      } else {
+        expect(picked).toMatch(/^Te agregué 1 unidad/);
+        expect(adjust).toHaveBeenCalledTimes(1);
+        expect(set).not.toHaveBeenCalled();
+        expect(await f.cart.view(SENDER)).toMatchObject({
+          totalCents: 86000,
+        });
+      }
+      const picks = outcome === 'one' ? 1 : 0;
       // The next turn sees the server-retained chosen presentation, not a saved 250mg count.
       const reply = await turn('Quiero agregar un ibuprofeno de 500', [
         call('adjustCartItem', {
@@ -1413,10 +1443,11 @@ describe('reported presentation-only confirmation after the full cart sequence',
       ]);
       expect(String(f.optionsSeen.at(-1)?.system)).toContain(f.refs.large);
       expect(reply).toContain('500mg');
-      expect(adjust).toHaveBeenCalledTimes(1);
+      // The explicit count lands exactly once on top of the pick.
+      expect(adjust).toHaveBeenCalledTimes(1 + picks);
       expect(set).not.toHaveBeenCalled();
       const after = await f.cart.view(SENDER);
-      expect(after).toMatchObject({ totalCents: 86000 });
+      expect(after).toMatchObject({ totalCents: 86000 + picks * 15000 });
       if (!after.ok) throw new Error('Expected verified cart');
       expect(after.items).toEqual(
         expect.arrayContaining([
@@ -1429,7 +1460,7 @@ describe('reported presentation-only confirmation after the full cart sequence',
           expect.objectContaining({
             productId: PRODUCT,
             variantId: LARGE,
-            quantity: 1,
+            quantity: 1 + picks,
           }),
         ]),
       );
@@ -1444,7 +1475,11 @@ describe('reported presentation-only confirmation after the full cart sequence',
               stock,
               variants: products[0].variants.map((v) =>
                 v.variantId === LARGE
-                  ? { ...v, stock: { status: 'available', quantity: 1 } }
+                  ? {
+                      ...v,
+                      // Exactly the units already in the cart.
+                      stock: { status: 'available', quantity: 1 + picks },
+                    }
                   : v,
               ),
             }) as never)
@@ -1468,6 +1503,8 @@ describe('reported presentation-only confirmation after the full cart sequence',
 
 // F6: when the customer's own text carries the count ("solo 1") the missing
 // or bad citation no longer blocks the write; the strict detail stays traced.
+// Retest S5: the plural pick («los de 500mg») still asks the count (a singular
+// countless pick now adds one unit), so the follow-up count is the first write.
 it.each([
   [null, 'missing_citation'],
   ['500mg', 'citation_not_literal'],
@@ -1501,7 +1538,7 @@ it.each([
       ]);
       await f.agent.tryHandle({
         senderId: SENDER,
-        text: 'Si, la de 500mg por favor.',
+        text: 'Si, los de 500mg por favor.',
       });
       const adjust = jest.spyOn(f.cart, 'adjustItem');
       logs.mockClear();
@@ -1575,7 +1612,7 @@ it.each([['1', 2, 'count_mismatch']])(
       ]);
       const question = await f.agent.tryHandle({
         senderId: SENDER,
-        text: 'Si, la de 500mg por favor.',
+        text: 'Si, los de 500mg por favor.',
       });
       expect(question).toMatchObject({
         kind: 'handled',

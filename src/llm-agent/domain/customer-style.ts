@@ -266,6 +266,11 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     'Tenemos una falla técnica, en cuanto se resuelva te respondemos.',
   ],
   // S4 interactive prompts and the change-button reply.
+  // Retest S4 (N15): delivery-or-pickup question at checkout start.
+  [
+    '¿Se lo enviamos a su dirección o prefiere recogerlo en tienda?',
+    '¿Te lo enviamos a tu dirección o prefieres recogerlo en tienda?',
+  ],
   ['¿Confirma su pedido?', '¿Confirmas tu pedido?'],
   ['Claro, ¿qué desea cambiar?', 'Claro, ¿qué quieres cambiar?'],
   ['¿Qué desea hacer?', '¿Qué quieres hacer?'],

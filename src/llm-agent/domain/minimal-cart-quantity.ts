@@ -379,6 +379,25 @@ function measureUnitFollows(text: string, endIndex: number): boolean {
   return match !== null && MEASURE_UNITS.has(match[0]);
 }
 
+/**
+ * True when `citation` is a digit run followed in `text` by a word, and the
+ * server-owned variant label holds that same number followed by that word.
+ */
+function presentationNumberFollows(
+  text: string,
+  endIndex: number,
+  citation: string,
+  variantName: string | undefined,
+): boolean {
+  if (typeof variantName !== 'string' || !/^\d+$/.test(citation)) return false;
+  const next = /^\s*([a-z]+)/.exec(text.slice(endIndex))?.[1];
+  if (next === undefined) return false;
+  const label = tokenize(variantName);
+  return label.some(
+    (token, index) => token === citation && label[index + 1] === next,
+  );
+}
+
 /** True when `text` states any generic count (digit run or count word). */
 function hasCountToken(text: string): boolean {
   const haystack = normalize(text);
@@ -535,6 +554,17 @@ function resolveEvidence(input: CartQuantityEvidenceInput): ResolvedEvidence {
     // Judge the citation in context: a count immediately followed by a
     // measurement unit in the real turn is a dosage, not a quantity.
     if (measureUnitFollows(haystack, matchIndex + citation.length))
+      return invalid;
+    // Retest S5 (N14): a number the chosen presentation's label carries with
+    // the same next word («7 piezas») is the presentation, never the count.
+    if (
+      presentationNumberFollows(
+        haystack,
+        matchIndex + citation.length,
+        citation,
+        input.variantName,
+      )
+    )
       return invalid;
     // A bare `otra` is a count only through its real context: the following
     // token must be the singular noun `unidad`. The whole phrase `otra unidad`

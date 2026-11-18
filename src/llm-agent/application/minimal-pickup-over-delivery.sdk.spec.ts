@@ -216,13 +216,20 @@ async function setup() {
   const presentDelivery = async () => {
     const lookup = await checkout.lookup(SENDER, null);
     if (!lookup.ok || lookup.status !== 'unique') throw new Error('lookup');
-    const presented = await send('quiero comprar', [
-      call('selectCheckoutAddress', {
-        addressRef: lookup.addresses[0].addressRef,
-      }),
-      call('confirmCheckoutDetails'),
-      say(),
-    ]);
+    // Retest S4 (N15): «quiero comprar» first asks delivery or pickup; the
+    // customer taps «Envío a domicilio» and today's delivery flow runs.
+    const asked = await send('quiero comprar');
+    const presented = await send(
+      'Envío a domicilio',
+      [
+        call('selectCheckoutAddress', {
+          addressRef: lookup.addresses[0].addressRef,
+        }),
+        call('confirmCheckoutDetails'),
+        say(),
+      ],
+      buttonId(asked.interactive, 'fulfil_delivery:'),
+    );
     expect(presented.reply).toMatch(DELIVERY_SUMMARY);
     return presented;
   };

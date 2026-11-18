@@ -75,6 +75,7 @@ import {
   boundProductImageContext,
   checkoutConfirmationButtons,
   choiceList,
+  fulfilmentChoiceButtons,
   isSendableProductImageUrl,
   orderConfirmationButtons,
   ORDER_BUTTONS_PROMPT,
@@ -91,6 +92,10 @@ import {
   type ProductImageContext,
 } from '../domain/customer-reply';
 import { PAYMENT_METHODS, matchPaymentMethod } from '../domain/payment-methods';
+import {
+  MINIMAL_FULFILMENT_QUESTION,
+  isCheckoutStartRequest,
+} from '../domain/minimal-checkout-start';
 import {
   isOrderSummaryRequest,
   isPaymentQuestion,
@@ -1206,8 +1211,103 @@ export class MinimalCatalogAgentService {
           };
         }
       }
+      // Retest S4 (N15): a bare checkout start asks delivery or pickup first.
+      if (pick === undefined && input.interactiveReplyId === undefined) {
+        const asked = await this.askFulfilment(input);
+        if (asked !== null) return asked;
+      }
       return this.decision(await this.runTurn(input, pick));
     }
+  }
+
+  /**
+   * Retest S4 (N15): «quiero comprar» / [Seguir con la compra] with a cart,
+   * store pickup available and no delivery/pickup choice or pending summary
+   * yet: ask «¿Se lo enviamos a su dirección o prefiere recogerlo en tienda?»
+   * with two buttons bound to the current cart, without the model. `null`
+   * keeps today's route (explicit wording, no pickup, empty cart, …).
+   */
+  private async askFulfilment(input: {
+    senderId: string;
+    text: string;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    const { senderId, text } = input;
+    if (
+      !isCheckoutStartRequest(text) ||
+      !this.shippingAvailable() ||
+      !this.checkoutAvailable() ||
+      this.cart === undefined ||
+      this.checkout!.confirmationStatus(senderId)?.stage === 'pending' ||
+      this.order!.offerStatus(senderId) !== null
+    )
+      return null;
+    if ((await this.cart.storedLines(senderId)).length === 0) return null;
+    if ((await this.cart.shippingMode(senderId)) !== null) return null;
+    const reference = await this.cart.fingerprint(senderId);
+    if (reference === null) return null;
+    const style = this.customerStyle(senderId, text);
+    const reply = applyCustomerStyle(MINIMAL_FULFILMENT_QUESTION, style);
+    this.recordTurn(
+      senderId,
+      [
+        { role: 'user', content: text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return this.decision({
+      reply,
+      interactive: fulfilmentChoiceButtons(reference, reply),
+    });
+  }
+
+  /**
+   * Retest S4: «Recoger en tienda» records store pickup and continues to the
+   * order summary, exactly like the chooseStorePickup tool.
+   */
+  private async chooseFulfilmentPickup(input: {
+    senderId: string;
+    text: string;
+    inboundEvent?: unknown;
+  }): Promise<MinimalCatalogAgentDecision> {
+    const { senderId } = input;
+    let result: MinimalCheckoutReply;
+    try {
+      const pickup = await this.shipping!.chooseStorePickup(senderId);
+      result =
+        pickup.kind === 'pickup'
+          ? await this.continueToOrder(
+              senderId,
+              input.inboundEvent,
+              minimalPickupReply(pickup),
+            )
+          : { reply: minimalPickupReply(pickup) };
+    } catch {
+      result = {
+        reply: minimalPickupReply({
+          kind: 'refused',
+          reason: 'cart_unverified',
+        }),
+      };
+    }
+    const style = this.customerStyle(senderId, input.text);
+    const reply = applyCustomerStyle(result.reply, style);
+    this.recordTurn(
+      senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return {
+      kind: 'handled',
+      reply,
+      ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
+      ...(result.interactive === undefined
+        ? {}
+        : { interactive: styleInteractivePrompt(result.interactive, style) }),
+    };
   }
 
   /**
@@ -1352,6 +1452,36 @@ export class MinimalCatalogAgentService {
           return answer({ reply: CART_ADD_MORE_REPLY });
         // «Seguir con la compra» is the customer asking to buy: the turn
         // continues exactly like the typed «quiero comprar».
+        return {
+          input: {
+            senderId,
+            text: input.text,
+            ...(input.inboundEvent === undefined
+              ? {}
+              : { inboundEvent: input.inboundEvent }),
+            ...(input.inboundAt === undefined
+              ? {}
+              : { inboundAt: input.inboundAt }),
+          },
+        };
+      }
+      case 'fulfilment': {
+        // Retest S4: honoured only for the cart the question was asked for.
+        if (
+          !this.shippingAvailable() ||
+          (await this.cart?.fingerprint(senderId)) !== intent.reference
+        )
+          return {
+            decision: await this.representCartAfterStaleButton(
+              senderId,
+              input.text,
+              style,
+            ),
+          };
+        this.order?.dismiss(senderId);
+        if (intent.mode === 'pickup')
+          return { decision: await this.chooseFulfilmentPickup(input) };
+        // «Envío a domicilio» continues with today's delivery-data flow.
         return {
           input: {
             senderId,
@@ -2120,7 +2250,7 @@ export class MinimalCatalogAgentService {
         '«Quita uno» resta una unidad con adjustCartItem(delta: -1). «Solo deja las croquetas», «quita todo lo demás» o «que solo contenga las croquetas»: llame getCart si hace falta, luego keepOnlyCartItems con keepSelectionRefs: los cartSelectionRef de cada renglón que se queda, obtenidos de getCart en este turno; nunca elimine renglones uno por uno para esa solicitud. «Quita el ibuprofeno» elimina un renglón completo: llame setCartItem(quantity: 0, quantityText: null) para ese renglón; no hay número que citar, así que nunca cite un "0" ni cantidades del carrito que el cliente no escribió. «Agrega otra unidad» suma UNA unidad con adjustCartItem(delta: 1), citando el fragmento literal ("otra unidad" o "otra"); no fije el total con setCartItem. Cuando el producto y su presentación ya estén identificados (el que acaba de mostrar, el único renglón del carrito o la presentación que eligió el cliente), use directamente adjustCartItem o setCartItem: «Agrégame uno», «agrégalo», «sí, agréguela», «quiero 2», «dame dos» o «sí» a su pregunta "¿Se lo agrego al carrito?" agregan ese producto; si el cliente no dijo cantidad, use delta: null y quantityText: null (la aplicación agrega 1 y lo dice). «Cambia la cantidad a 2» fija el total con setCartItem. prepareCartItem es solo para conservar una cantidad explícita mientras falta elegir la presentación; si la selección ya está resuelta la aplicación la agrega de verdad. Nunca diga que registró la intención ni que algo quedó en el carrito: la aplicación confirma el carrito real. Si mostró varios productos o presentaciones y el cliente no dijo cuál, pregunte cuál, sin elegir por él. ' +
         'Si el cliente da una cantidad explícita ANTES de elegir la presentación, llame prepareCartItem en ESA MISMA respuesta para conservar la cantidad, y pregunte la presentación después; no la adivine ni la posponga. ' +
         'Cuando el cliente confirme o aclare la presentación y ya exista una solicitud pendiente, continúe esa solicitud con continuation: true y NO repita la cantidad. Una cantidad nueva explícita reemplaza la pendiente. ' +
-        '«Sí, la de 500mg» elige una presentación, NO una cantidad: si no hay cantidad pendiente, use adjustCartItem(delta: null, quantityText: null) para conservar la selección y preguntar cuántas unidades. «Un ibuprofeno de 500» indica una unidad: cite "un", no la dosis. Nunca use setCartItem(quantity: 0) para elegir presentación. ' +
+        '«Sí, la de 500mg», «quiero el de 2 kg» o «la de 7 piezas» eligen una presentación sin decir cantidad: si no hay cantidad pendiente, use adjustCartItem con el selectionRef de esa presentación, delta: null y quantityText: null (la aplicación agrega 1 y lo dice). El número de la presentación (500mg, 2 kg, 7 piezas) nunca es la cantidad; «quiero 2 de 7 piezas» o «dos bolsas de 2 kg» sí dicen la cantidad. «Un ibuprofeno de 500» indica una unidad: cite "un", no la dosis. Nunca use setCartItem(quantity: 0) para elegir presentación. ' +
         'No convierta un ajuste en una cantidad absoluta ni repita el ajuste tras un fallo. ' +
         'Consulte getCart si necesita recuperar o aclarar qué renglón se modifica, especialmente tras un reinicio. Nunca elija una presentación ni una cantidad por su cuenta; pregunte si faltan. ' +
         CART_VARIANT_GUIDANCE +

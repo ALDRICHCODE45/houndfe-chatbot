@@ -1,3 +1,4 @@
+import { MINIMAL_FULFILMENT_QUESTION } from '../domain/minimal-checkout-start';
 import { normalizeMinimalCheckoutDraft } from '../../conversation/domain/minimal-checkout-draft';
 import { PENDING_HUMAN_REQUEST_REPLY } from '../../human-handoff/application/human-handoff.service';
 import {
@@ -252,6 +253,7 @@ const REPLIES: Record<string, string> = {
   MINIMAL_PAYMENT_NEW_ORDER_REPLY,
   receiptInReview: minimalReceiptInReviewReply('A-12'),
   receiptInReviewNoFolio: minimalReceiptInReviewReply(null),
+  MINIMAL_FULFILMENT_QUESTION,
   ...Object.fromEntries(
     Object.entries(MINIMAL_ORDER_INELIGIBLE_REPLIES).map(([k, v]) => [
       `ineligible_${k}`,
