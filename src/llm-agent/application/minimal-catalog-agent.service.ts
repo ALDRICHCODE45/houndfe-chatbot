@@ -1930,14 +1930,26 @@ export class MinimalCatalogAgentService {
     const currentIds = new Set<string>();
     // Offer the tool ONLY with a trusted bound inbound identity.
     const restockEnabled = this.restock !== undefined;
-    const restockAvailable =
+    const restockBound =
       restockEnabled &&
       bindRestockInboundEvent(input.inboundEvent, input.senderId) !== null;
+    // S13d B2: the previous options message asked «¿Se lo agrego al carrito?»
+    // next to a restock offer (acceptsYes false). A plain yes answers the cart
+    // question only, so this turn exposes no restock tool, prompt or context.
+    const lastRestockOffer = turns.at(-1)?.catalogRestockOffer ?? null;
+    const cartYesOnly =
+      lastRestockOffer !== null &&
+      lastRestockOffer.acceptsYes === false &&
+      classifyConfirmationReply(input.text) === 'accept';
+    const restockAvailable = restockBound && !cartYesOnly;
     // Closed capability diagnostic: same booleans as tool registration, no raw
     // identity. `available` only when the tool is actually exposed.
-    let restockCapability: 'disabled' | 'available' | 'unbound' = 'disabled';
+    let restockCapability: 'disabled' | 'available' | 'unbound' | 'cart_yes' =
+      'disabled';
     if (restockAvailable) {
       restockCapability = 'available';
+    } else if (restockBound) {
+      restockCapability = 'cart_yes';
     } else if (restockEnabled) {
       restockCapability = 'unbound';
     }
@@ -1980,10 +1992,9 @@ export class MinimalCatalogAgentService {
       : null;
     const catalogRun: CatalogRun = { plans: [], stockAfter: false };
     // S13d: the agotado product the previous options message offered to ask
-    // about; a non-plain acceptance reaches the model with that exact id.
-    const previousRestockOffer = restockAvailable
-      ? (turns.at(-1)?.catalogRestockOffer ?? null)
-      : null;
+    // about; a non-plain acceptance reaches the model with that exact id
+    // (never on a cart-only yes: restockAvailable is false then).
+    const previousRestockOffer = restockAvailable ? lastRestockOffer : null;
     const restockOfferContext =
       previousRestockOffer === null
         ? ''

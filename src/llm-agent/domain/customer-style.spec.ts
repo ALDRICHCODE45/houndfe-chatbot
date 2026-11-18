@@ -450,3 +450,15 @@ describe('explicitStyleSignal', () => {
     ).toEqual({});
   });
 });
+
+describe('catalog dead end (L26) tú register', () => {
+  it('renders the whole question in tú, with no usted leftover', () => {
+    const out = applyCustomerStyle(
+      'Croquetas para cachorro no tengo por ahora. ¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa?',
+      style({ register: 'tu' }),
+    );
+    expect(out).toBe(
+      'Croquetas para cachorro no tengo por ahora. ¿Quieres que le pregunte al equipo si lo pueden conseguir, o te busco otra cosa?',
+    );
+  });
+});

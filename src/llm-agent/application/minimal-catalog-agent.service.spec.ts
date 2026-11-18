@@ -14,6 +14,9 @@ import {
   minimalRestockProposal,
 } from './minimal-restock-request.service';
 import { deriveRestockSourceRequestId } from '../../human-decisions/domain/restock-source-identity';
+import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
+import { MinimalCartSelections } from '../domain/minimal-cart-selections';
+import { MinimalCartService } from './minimal-cart.service';
 
 const SENDER = '5215550001111';
 const OTHER = '5215550002222';
@@ -94,6 +97,7 @@ function build(
     historyTurns: number;
     sessionStore: MinimalCatalogSessionStore;
     restock: (chatbotApi: ChatbotApiClient) => MinimalRestockRequestService;
+    cart: (chatbotApi: ChatbotApiClient) => MinimalCartService;
   }> = {},
   fixtures: { item: unknown; stock: unknown } = {
     item: simpleItem,
@@ -131,6 +135,8 @@ function build(
       config,
       sessionStore,
       over.restock?.(chatbotApi),
+      undefined,
+      over.cart?.(chatbotApi),
     ),
     chatbotApi,
     costGuard,
@@ -1072,6 +1078,133 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       expect(history).not.toContain('Si buscas las croquetas de Pedigree');
     });
 
+    describe('S13d B2: cart-add closing next to an agotado restock offer', () => {
+      const CROQ = 'Croquetas Pedigree Adulto Res 2 kg';
+      const croquetas = {
+        productId: pid(4),
+        name: CROQ,
+        brand: 'Pedigree',
+        imageUrl: null,
+        description: 'Croquetas para perro adulto.',
+        price: priced(32000),
+        stock: AVAILABLE,
+        variants: [],
+      };
+      const croqStock = {
+        productId: pid(4),
+        name: CROQ,
+        stock: AVAILABLE,
+        variants: [],
+      };
+      const croqRef = (() => {
+        const reference = new MinimalCartSelections(SENDER).register({
+          productId: pid(4),
+          productName: CROQ,
+        });
+        if (reference === null) throw new Error('fixture ref');
+        return reference;
+      })();
+      const ADD_CLOSING = `¿Se lo agrego al carrito? Y si la que busca es ${LATA}, con gusto le averiguo cuándo nos vuelve a llegar.`;
+      const cartTurn = async (steps: unknown[]) => {
+        const built = build(steps, {
+          restock: restockWiring,
+          cart: (api) =>
+            new MinimalCartService(api, new InMemoryConversationStore()),
+        });
+        built.chatbotApi.searchCatalog.mockResolvedValue([
+          croquetas,
+          lata,
+        ] as never);
+        built.chatbotApi.getStock.mockImplementation(
+          async (id: string) =>
+            (id === pid(3) ? lataStock : croqStock) as never,
+        );
+        (
+          built.chatbotApi as unknown as { evaluateCart: jest.Mock }
+        ).evaluateCart = jest.fn(
+          async (
+            items: Array<{
+              productId: string;
+              quantity: number;
+              unitPriceCents: number;
+            }>,
+          ) => ({
+            items: items.map((i) => ({
+              ...i,
+              variantId: null,
+              originalPriceCents: i.quantity * i.unitPriceCents,
+              finalPriceCents: i.quantity * i.unitPriceCents,
+              discountAmountCents: 0,
+              appliedPromotionTitle: null,
+            })),
+            promotionEvaluationStatus: 'fully_evaluated',
+          }),
+        );
+        const first = await built.service.tryHandle({
+          senderId: SENDER,
+          text: 'croquetas pedigree manejan?',
+          inboundEvent: inbound(1),
+        });
+        if (first.kind !== 'handled') throw new Error('expected handled');
+        expect(first.reply.endsWith(ADD_CLOSING)).toBe(true);
+        return built;
+      };
+
+      it('a plain "sí" answers the cart question only: no restock context, no restock prepared, the cart add happens', async () => {
+        const { service, chatbotApi, captured } = await cartTurn([
+          call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+          say(MODEL_TEXT),
+          call('a1', 'adjustCartItem', {
+            selectionRef: croqRef,
+            delta: null,
+            quantityText: null,
+            continuation: false,
+          }),
+          say('Listo.'),
+        ]);
+        const second = await service.tryHandle({
+          senderId: SENDER,
+          text: 'sí',
+          inboundEvent: inbound(2),
+        });
+        if (second.kind !== 'handled') throw new Error('expected handled');
+        expect(captured).toHaveLength(2);
+        const system = String(captured[1].system);
+        expect(system).not.toContain(
+          'Oferta de reposición del mensaje anterior',
+        );
+        // Deterministic: the restock tool is not exposed for that turn, so
+        // the model cannot prepare a restock from a cart "sí"; cart tools are.
+        const tools = Object.keys(captured[1].tools!);
+        expect(tools).not.toContain('prepareRestock');
+        expect(tools).toEqual(
+          expect.arrayContaining(['adjustCartItem', 'setCartItem']),
+        );
+        expect(system).not.toContain('Herramienta prepareRestock');
+        expect(second.reply).toMatch(/agregué 1 unidad/i);
+        expect(second.reply).not.toContain(`«${LATA}»`);
+        expect(second.onSent).toBeUndefined();
+        expect(chatbotApi.getStock).not.toHaveBeenCalledWith(pid(3));
+      });
+
+      it('a "sí" that also asks about the agotado product still gets the restock context', async () => {
+        const { service, captured } = await cartTurn([
+          call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+          say(MODEL_TEXT),
+          say('Claro.'),
+        ]);
+        await service.tryHandle({
+          senderId: SENDER,
+          text: 'sí, y avíseme cuando llegue la lata',
+          inboundEvent: inbound(2),
+        });
+        const system = String(captured[1].system);
+        expect(system).toContain('Oferta de reposición del mensaje anterior');
+        expect(system).toContain(pid(3));
+        expect(Object.keys(captured[1].tools!)).toContain('prepareRestock');
+      });
+    });
+
     it('checkStock and the rendered products stay usable on the next turn (registry unchanged)', async () => {
       const { service, captured } = await prodTurn([
         call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
@@ -1141,7 +1274,7 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       ).resolves.toEqual({ ok: false, error: 'unknown_product' });
     });
 
-    it('S10: only contradicting results → «{lo pedido} no tengo.», nothing listed', async () => {
+    it('S10: only contradicting results → «{lo pedido} no tengo por ahora. ¿Quiere que le pregunte al equipo…?», nothing listed', async () => {
       const built = build(
         [
           call('s1', 'searchCatalog', { q: 'croquetas para cachorro' }),

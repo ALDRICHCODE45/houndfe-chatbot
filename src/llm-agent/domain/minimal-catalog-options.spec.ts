@@ -581,7 +581,7 @@ describe('S10/S13 contradiction class (life stage, species)', () => {
     ).not.toContain(CATALOG_NARROWING_QUESTION);
   });
 
-  it('only contradicting items → «{lo pedido} no tengo.» and none of them listed (no false match)', () => {
+  it('only contradicting items → «{lo pedido} no tengo por ahora. ¿Quiere que le pregunte al equipo…?» and none of them listed (no false match)', () => {
     const plan = planCatalogOptions('croquetas para cachorro', [adultos]);
     expect(plan).not.toBeNull();
     const out = renderCatalogOptions([plan!], {
