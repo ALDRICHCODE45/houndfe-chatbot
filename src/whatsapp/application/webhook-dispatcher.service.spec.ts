@@ -1912,6 +1912,17 @@ describe('WebhookDispatcherService (agent dispatch path)', () => {
         );
       });
 
+      it('review R3: an agent without photo admission runs the turn UNADMITTED, so the agent still applies the budget and per-number limit', async () => {
+        delete (minimalAgent as unknown as { admitPhotoTurn?: jest.Mock })
+          .admitPhotoTurn;
+        productImage.recognize.mockResolvedValueOnce(PRODUCT);
+        await service.dispatch(mediaEvent('wamid.lim7', { type: 'image' }));
+        expect(minimalAgent.tryHandle).toHaveBeenCalledTimes(1);
+        expect(minimalAgent.tryHandle).toHaveBeenCalledWith(
+          expect.not.objectContaining({ llmAdmitted: true }),
+        );
+      });
+
       it('a placed-sale receipt and a PDF never ask for admission (receipt flow keeps working)', async () => {
         conversationStore.get.mockResolvedValue(placedSaleState(CUSTOMER));
         await service.dispatch(mediaEvent('wamid.lim4', { type: 'image' }));

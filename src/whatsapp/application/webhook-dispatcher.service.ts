@@ -447,9 +447,9 @@ export class WebhookDispatcherService {
           // a refused photo gets the same reply/silence as a text turn and
           // never reaches vision. The admitted agent turn is not counted
           // again. Receipts of a placed sale (above) are never gated.
-          const refused = await this.admitPhotoTurn(message, media);
-          if (refused !== null) {
-            await this.deliverCustomerDecision(message, refused);
+          const admission = await this.admitPhotoTurn(message, media);
+          if (admission.kind === 'refused') {
+            await this.deliverCustomerDecision(message, admission.decision);
             continue;
           }
 
@@ -467,7 +467,8 @@ export class WebhookDispatcherService {
             await this.runCustomerTurn(
               message,
               buildProductImageTurnText(media.caption, recognition),
-              true,
+              // Only an actually admitted photo skips the agent's admission.
+              admission.kind === 'admitted',
             );
             continue;
           }
@@ -861,23 +862,31 @@ export class WebhookDispatcherService {
 
   /**
    * R1-001: the cost-guard admission of a product photo before its vision
-   * call. `null` = admitted (or no vision/agent capability to gate).
+   * call. `admitted` = counted here (the agent skips its own admission);
+   * `ungated` = nothing was admitted (no vision/agent capability), so the
+   * agent turn keeps its own budget and per-number admission (review R3).
    */
   private async admitPhotoTurn(
     message: InboundMessage,
     media: InboundMedia,
-  ): Promise<MinimalCatalogAgentDecision | null> {
-    if (this.productImage === undefined) return null;
+  ): Promise<
+    | { kind: 'admitted' | 'ungated' }
+    | { kind: 'refused'; decision: MinimalCatalogAgentDecision }
+  > {
+    if (this.productImage === undefined) return { kind: 'ungated' };
     const agent = this
       .minimalCatalogAgent as Partial<MinimalCatalogAgentService>;
-    if (typeof agent.admitPhotoTurn !== 'function') return null;
-    return agent.admitPhotoTurn({
+    if (typeof agent.admitPhotoTurn !== 'function') return { kind: 'ungated' };
+    const refused = await agent.admitPhotoTurn({
       senderId: message.senderId,
       text: media.caption ?? '',
       ...(Number.isNaN(Date.parse(message.timestamp))
         ? {}
         : { inboundAt: new Date(message.timestamp).toISOString() }),
     });
+    return refused === null
+      ? { kind: 'admitted' }
+      : { kind: 'refused', decision: refused };
   }
 
   /** (5) Sends one customer decision (media, text, buttons) or nothing. */
