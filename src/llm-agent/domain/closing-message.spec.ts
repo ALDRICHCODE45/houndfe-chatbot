@@ -79,3 +79,25 @@ describe('S6 closing messages (answered without the LLM)', () => {
     expect(isFarewellOrClosingReply(text)).toBe(false);
   });
 });
+
+describe('S6 review R3: an opening greeting is not a closing (goes to the model)', () => {
+  it.each([
+    'Buenas tardes',
+    'buenos días',
+    'Buenas noches!',
+    'buen día',
+    'Buen dia 😊',
+    'buenas tardes, buen día',
+  ])('%p alone is a greeting, not a closing', (text) => {
+    expect(isClosingMessage(text)).toBe(false);
+  });
+
+  it.each([
+    'gracias, buen día',
+    'muchas gracias, buenas noches',
+    'ok, buenas tardes 👍',
+    'que tenga buen día',
+  ])('%p (with a closing word or farewell form) is still a closing', (text) => {
+    expect(isClosingMessage(text)).toBe(true);
+  });
+});

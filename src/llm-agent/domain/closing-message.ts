@@ -60,6 +60,16 @@ const PHRASES: readonly string[] = [
 const PHRASE_TOKENS = PHRASES.map((phrase) => phrase.split(' ')).sort(
   (a, b) => b.length - a.length,
 );
+/** Review R3: these also open a conversation, so alone they are a greeting
+ *  for the model, never a closing («Buenas tardes» → greeting). */
+const GREETING_PHRASES: ReadonlySet<string> = new Set([
+  'buenos dias',
+  'buenas tardes',
+  'buenas noches',
+  ...DAY_ADJECTIVES.flatMap((adjective) =>
+    DAY_WORDS.map((word) => `${adjective} ${word}`),
+  ),
+]);
 
 const stripAccents = (text: string) =>
   text.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
@@ -77,16 +87,18 @@ function words(text: string): string[] {
 /** True when the tokens are a sequence of closing phrases only. */
 function onlyClosingPhrases(tokens: readonly string[]): boolean {
   let at = 0;
+  let closingWord = false;
   outer: while (at < tokens.length) {
     for (const phrase of PHRASE_TOKENS) {
       if (phrase.every((token, i) => tokens[at + i] === token)) {
+        if (!GREETING_PHRASES.has(phrase.join(' '))) closingWord = true;
         at += phrase.length;
         continue outer;
       }
     }
     return false;
   }
-  return true;
+  return closingWord;
 }
 
 /**
