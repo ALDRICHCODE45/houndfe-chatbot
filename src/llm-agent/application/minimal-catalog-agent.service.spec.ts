@@ -1163,7 +1163,8 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
         }),
       ).resolves.toEqual({
         kind: 'handled',
-        reply: 'Croquetas para cachorro no tengo.',
+        reply:
+          'Croquetas para cachorro no tengo por ahora. ¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa?',
       });
     });
 

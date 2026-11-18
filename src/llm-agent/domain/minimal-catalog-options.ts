@@ -86,6 +86,9 @@ function contradicts(
 
 /** S13c/d: fixed copy (usted; tú via customer-style phrase pairs). */
 export const CATALOG_EXACT_OPENING = 'Encontré estas opciones:';
+/** Owner 2026-11-17: nothing offerable (all results contradict the request). */
+export const CATALOG_NOTHING_TAIL =
+  ' no tengo por ahora. ¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa?';
 export const CATALOG_ALTERNATIVES_OPENING =
   ' no tengo, pero tengo estas opciones:';
 export const CATALOG_CHOOSE_QUESTION = '¿Cuál le gustaría llevar?';
@@ -419,11 +422,20 @@ export function renderCatalogOptions(
         .map((option) => ({ option, subject: restockSubject(option) }))
         .find((candidate) => candidate.subject !== null) ?? null)
     : null;
+  const nothingOffered = sections.every(
+    (section) => section.plan.options.length === 0,
+  );
   const blocks: string[] = [];
   for (const { plan, options } of sections) {
     if (plan.options.length === 0) {
-      // Only contradicting items: say so, list none of them.
-      blocks.push(`${plan.requested} no tengo.`);
+      // Only contradicting items: say so, list none of them. When nothing at
+      // all is offerable the reply keeps the customer in the conversation
+      // (owner 2026-11-17): ask the team, or search something else.
+      blocks.push(
+        nothingOffered
+          ? `${plan.requested}${style(CATALOG_NOTHING_TAIL)}`
+          : `${plan.requested} no tengo.`,
+      );
       continue;
     }
     const exact = options.some((option) => option.cls === 'exact');

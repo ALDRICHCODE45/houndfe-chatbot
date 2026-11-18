@@ -588,7 +588,9 @@ describe('S10/S13 contradiction class (life stage, species)', () => {
       restockAvailable: true,
       style: usted,
     });
-    expect(out.text).toBe('Croquetas para cachorro no tengo.');
+    expect(out.text).toBe(
+      'Croquetas para cachorro no tengo por ahora. ¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa?',
+    );
     expect(out.shown).toEqual([]);
     expect(out.restockOffer).toBeNull();
   });
