@@ -14,6 +14,11 @@ import { describeError } from '../../common/log-safe';
 
 export const DEFAULT_RECEIPT_EXTRACTION_TIMEOUT_MS = 15_000;
 const MAX_TEXT_FIELD_LENGTH = 64;
+/** Backend `extracted` bounds (N18): a longer value is omitted, never cut. */
+const MAX_DESTINATION_BANK_LENGTH = 80;
+const MAX_HOLDER_NAME_LENGTH = 120;
+/** Optional leading mask characters, then exactly the last 4 digits. */
+const LAST4 = /^[*•xX·.-]*(\d{4})$/;
 const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const CONFIDENCES: readonly ReceiptExtractionConfidence[] = [
   'high',
@@ -40,6 +45,24 @@ const extractionSchema = z.object({
     .nullable()
     .describe('Tracking key, folio or reference number, or null.'),
   bank: z.string().nullable().describe('Issuing bank name, or null.'),
+  destinationBank: z
+    .string()
+    .nullable()
+    .describe('Bank of the receiving (destination) account, or null.'),
+  destinationName: z
+    .string()
+    .nullable()
+    .describe('Holder name of the receiving (destination) account, or null.'),
+  destinationAccountLast4: z
+    .string()
+    .nullable()
+    .describe(
+      'Last 4 digits of the destination CLABE/account/card as text, or null.',
+    ),
+  originName: z
+    .string()
+    .nullable()
+    .describe('Holder name of the sending (origin) account, or null.'),
   confidence: z.enum(['high', 'medium', 'low']),
 });
 
@@ -51,6 +74,10 @@ const RECEIPT_EXTRACTION_INSTRUCTIONS = [
   'date: the transfer date as YYYY-MM-DD. Null if not legible.',
   'reference: the tracking key (clave de rastreo), folio or reference. Null if absent.',
   'bank: the issuing bank name. Null if absent.',
+  'destinationBank: the bank of the account that RECEIVED the money (beneficiary bank). Null if absent.',
+  'destinationName: the holder name of the account that RECEIVED the money (beneficiary). Null if absent.',
+  'destinationAccountLast4: only the last 4 digits of the destination CLABE, account or card, as a text string (e.g. "9616"). Null unless exactly those 4 digits are clearly printed.',
+  'originName: the holder name of the account that SENT the money (ordering party). Null if absent.',
   'Never guess: use null for anything you cannot read with certainty and lower the confidence.',
 ].join('\n');
 
@@ -177,6 +204,16 @@ function toExtraction(
     date: toIsoDate(fields.date),
     reference: toTextField(fields.reference),
     bank: toTextField(fields.bank),
+    destinationBank: toBoundedText(
+      fields.destinationBank,
+      MAX_DESTINATION_BANK_LENGTH,
+    ),
+    destinationName: toBoundedText(
+      fields.destinationName,
+      MAX_HOLDER_NAME_LENGTH,
+    ),
+    destinationAccountLast4: toLast4(fields.destinationAccountLast4),
+    originName: toBoundedText(fields.originName, MAX_HOLDER_NAME_LENGTH),
     confidence: CONFIDENCES.includes(
       fields.confidence as ReceiptExtractionConfidence,
     )
@@ -203,6 +240,21 @@ function toIsoDate(value: unknown): string | null {
     date.getUTCMonth() === month - 1 &&
     date.getUTCDate() === day;
   return isRealDate ? match[0] : null;
+}
+
+/** Trimmed and non-empty within `max`; a longer value is omitted (null),
+ * never truncated (N18). */
+function toBoundedText(value: unknown, max: number): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 && trimmed.length <= max ? trimmed : null;
+}
+
+/** Exactly 4 visible digits (spaces ignored, leading mask allowed), kept
+ * as text so a leading zero survives; anything else is omitted. */
+function toLast4(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  return LAST4.exec(value.replace(/\s+/g, ''))?.[1] ?? null;
 }
 
 function toTextField(value: unknown): string | null {

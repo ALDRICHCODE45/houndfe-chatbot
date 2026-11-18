@@ -48,6 +48,7 @@ describe('configuration()', () => {
     'RECEIPT_MEDIA_WORKER_POLL_MS',
     'RECEIPT_MEDIA_INGESTION_ENABLED',
     'RECEIPT_MEDIA_METRICS_TOKEN',
+    'RECEIPT_DESTINATION_FIELDS_ENABLED',
     'META_SANDBOX_RECIPIENT_NORMALIZATION',
     'CONVERSATION_MIRROR_DELIVERY_ENABLED',
     'OPS_CHANNEL_PHONE',
@@ -264,6 +265,23 @@ describe('configuration()', () => {
         expect(receiptMedia).not.toHaveProperty(removed);
       expect(receiptMedia.worker).not.toHaveProperty('enabled');
       expect(JSON.stringify(receiptMedia)).not.toMatch(/s3\.example|bucket/);
+    });
+
+    // N18: kill switch for the receipt destination fields, default on.
+    it.each([
+      [undefined, true],
+      ['true', true],
+      ['false', false],
+      ['FALSE', false],
+      [' false ', false],
+      ['', true],
+    ])('maps RECEIPT_DESTINATION_FIELDS_ENABLED=%s', (env, expected) => {
+      if (env === undefined)
+        delete process.env.RECEIPT_DESTINATION_FIELDS_ENABLED;
+      else process.env.RECEIPT_DESTINATION_FIELDS_ENABLED = env;
+      expect(configuration().receiptMedia.destinationFieldsEnabled).toBe(
+        expected,
+      );
     });
 
     // WU15-1: metricsToken surfaces independently on receiptMedia

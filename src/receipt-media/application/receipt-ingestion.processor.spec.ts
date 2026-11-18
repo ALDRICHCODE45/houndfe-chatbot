@@ -62,6 +62,10 @@ const receiptExtraction: ReceiptExtraction = {
   date: null,
   reference: null,
   bank: null,
+  destinationBank: null,
+  destinationName: null,
+  destinationAccountLast4: null,
+  originName: null,
   confidence: 'high',
   amountMismatch: false,
 };

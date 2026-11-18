@@ -314,6 +314,66 @@ ddescribe('R2 backend upload commits (Testcontainers)', () => {
     expect(rows[0].upload_fields).toEqual(first);
   });
 
+  it('replaces the stored upload fields with the stripped ones of a destination fallback (N18)', async () => {
+    const { id, fence } = await downloaded();
+    const first = {
+      extracted: {
+        amountCents: 38900,
+        destinationBank: 'BBVA MEXICO',
+        destinationAccountLast4: '9616',
+        confidence: 0.9,
+      },
+    };
+    const stripped = { extracted: { amountCents: 38900, confidence: 0.9 } };
+    await pool.query(
+      'UPDATE receipt_media SET storage_attempts = 0, version = version + 1 WHERE id = $1',
+      [id],
+    );
+    const start = await store.startStorageAttempt({
+      id,
+      owner: OWNER,
+      expectedVersion: String(BigInt(fence.expectedVersion) + 1n),
+      uploadFields: first,
+    });
+    await expect(
+      store.commitUploadUnknown({
+        id,
+        owner: OWNER,
+        expectedVersion: start!.version,
+        httpStatus: 503,
+        transportCode: null,
+        uploadFields: stripped,
+      }),
+    ).resolves.toMatchObject({
+      kind: 'retry-scheduled',
+      receipt: { uploadFields: stripped },
+    });
+    await pool.query(
+      'UPDATE receipt_media SET next_attempt_at = now() WHERE id = $1',
+      [id],
+    );
+    const [claimed] = await store.claimBatch(1, OWNER);
+    expect(claimed.uploadFields).toEqual(stripped);
+    // Without replacement fields an unknown outcome keeps the stored ones.
+    const retry = await store.startStorageAttempt({
+      id,
+      owner: OWNER,
+      expectedVersion: claimed.version,
+    });
+    await store.commitUploadUnknown({
+      id,
+      owner: OWNER,
+      expectedVersion: retry!.version,
+      httpStatus: 503,
+      transportCode: null,
+    });
+    const { rows } = await pool.query<{ upload_fields: unknown }>(
+      'SELECT upload_fields FROM receipt_media WHERE id = $1',
+      [id],
+    );
+    expect(rows[0].upload_fields).toEqual(stripped);
+  });
+
   it('commits a success after unknown retries', async () => {
     const { id, fence } = await downloaded();
     await store.commitUploadUnknown({

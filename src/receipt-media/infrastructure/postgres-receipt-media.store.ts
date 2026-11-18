@@ -363,10 +363,12 @@ const UPLOAD_UNKNOWN_TERMINAL_SQL = `UPDATE receipt_media
       RETURNING *`;
 
 /** Same-key retry: keep DOWNLOADED, persist the safe code, schedule, and
- * release the lease so any worker reclaims it when due. */
+ * release the lease so any worker reclaims it when due. `$6` replaces the
+ * stored upload fields only after an N18 destination fallback. */
 const UPLOAD_RETRY_SQL = `UPDATE receipt_media
       SET last_error_category = 'BACKEND_UPLOAD', last_error_code = $4,
         next_attempt_at = clock_timestamp() + ($5::int * interval '1 millisecond'),
+        upload_fields = COALESCE($6::jsonb, upload_fields),
         lease_owner = NULL, lease_expires_at = NULL,
         version = version + 1, updated_at = now()
       WHERE id = $1 AND lease_owner = $2 AND version = $3::bigint
@@ -1027,11 +1029,13 @@ export class PostgresReceiptMediaStore
         !UPLOAD_DEFINITE_STATUSES.has(status));
     const transportOk =
       input.transportCode === null || SAFE_CODE.test(input.transportCode);
+    const fields = input.uploadFields;
     if (
       !isUploadFence(input) ||
       !statusOk ||
       !transportOk ||
-      (status === null) === (input.transportCode === null)
+      (status === null) === (input.transportCode === null) ||
+      (fields !== undefined && !isRecord(fields))
     )
       return { kind: 'fenced' };
     const code = status === null ? input.transportCode! : `HTTP_${status}`;
@@ -1047,6 +1051,7 @@ export class PostgresReceiptMediaStore
         : await this.uploadUpdate(c, UPLOAD_RETRY_SQL, input, [
             code,
             uploadRetryDelayMs(Math.max(attempt, 1)),
+            fields === undefined ? null : JSON.stringify(fields),
           ]);
       return {
         kind: terminal ? 'committed' : 'retry-scheduled',

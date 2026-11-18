@@ -12,7 +12,7 @@ Scope: `sales:write`. Multipart form data.
 | `declaredAmountCents` | Optional. |
 | `declaredDate` | Optional. |
 | `declaredReference` | Optional. |
-| `extracted` | Optional JSON string: `{ amountCents?, date?, reference?, bank?, confidence? (0..1) }`. |
+| `extracted` | Optional JSON string: `{ amountCents?, date?, reference?, bank?, confidence? (0..1), destinationBank?, destinationName?, destinationAccountLast4?, originName? }`. Destination fields (backend aebb60ef, N18): trimmed non-empty strings, `destinationBank` ≤80, names ≤120, `destinationAccountLast4` a string of exactly 4 digits; any other key is rejected with `INVALID_RECEIPT_EXTRACTED`. The bot sends them unless `RECEIPT_DESTINATION_FIELDS_ENABLED=false` and retries once without them on that error. |
 
 Header `X-Idempotency-Key` is required: the WhatsApp media id (1–200 chars). A replay with the same key and file returns the same body with 201.
 

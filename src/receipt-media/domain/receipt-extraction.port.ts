@@ -23,6 +23,14 @@ export type ReceiptExtraction =
       date: string | null;
       reference: string | null;
       bank: string | null;
+      /** N18 destination/origin data for the human reviewer: trimmed,
+       * length-checked (never truncated), null when not read with
+       * confidence. */
+      destinationBank: string | null;
+      destinationName: string | null;
+      /** Exactly 4 digits as text (e.g. "0616"), never masked. */
+      destinationAccountLast4: string | null;
+      originName: string | null;
       confidence: ReceiptExtractionConfidence;
       /** True only when both amounts are known and differ. */
       amountMismatch: boolean;

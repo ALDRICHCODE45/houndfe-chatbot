@@ -1,11 +1,14 @@
+import { Logger } from '@nestjs/common';
 import {
   ChatbotApiError,
   UpstreamError,
 } from '../../chatbot-api/domain/errors';
 import {
   RECEIPT_UPLOAD_ERROR,
+  toReceiptUploadForm,
   type ReceiptUploadResponse,
 } from '../../chatbot-api/domain/dtos/receipt-upload.dto';
+import { LlmReceiptExtractionAdapter } from '../infrastructure/llm-receipt-extraction.adapter';
 import type {
   UploadCommitOutcome,
   ReceiptMediaStorePort,
@@ -43,7 +46,9 @@ const uploaded: ReceiptUploadResponse = {
 
 const committed = { kind: 'committed' } as unknown as UploadCommitOutcome;
 
-const fixture = () => {
+const fixture = (
+  options?: ConstructorParameters<typeof ReceiptAttachmentService>[2],
+) => {
   type Store = Pick<
     ReceiptMediaStorePort,
     | 'commitUploadSuccess'
@@ -78,7 +83,7 @@ const fixture = () => {
       >()
       .mockResolvedValue(uploaded),
   };
-  const service = new ReceiptAttachmentService(store, client);
+  const service = new ReceiptAttachmentService(store, client, options);
   return { store, client, service };
 };
 
@@ -90,10 +95,23 @@ const extracted = (
   date: '2026-11-05',
   reference: 'ABC123',
   bank: 'BBVA',
+  destinationBank: null,
+  destinationName: null,
+  destinationAccountLast4: null,
+  originName: null,
   confidence: 'high',
   amountMismatch: false,
   ...overrides,
 });
+
+/** The production retest receipt (N18). */
+const DESTINATION = {
+  destinationBank: 'BBVA MEXICO',
+  destinationName: 'Abril Alejandra Vazquez Ramos',
+  destinationAccountLast4: '9616',
+  originName: 'Bryan Aldrich Flores',
+} as const;
+const DESTINATION_KEYS = Object.keys(DESTINATION);
 
 /** Fields as the first attempt computes them from an extraction. */
 const invocation = ({
@@ -350,6 +368,204 @@ describe('ReceiptAttachmentService.upload (R2)', () => {
       ...FENCE,
       httpStatus: null,
       transportCode: 'ABORTED',
+    });
+  });
+
+  describe('destination fields (N18)', () => {
+    let warn: jest.SpyInstance;
+    beforeEach(() => {
+      warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+    });
+    afterEach(() => warn.mockRestore());
+
+    const invalidExtracted = (status: number) =>
+      new ChatbotApiError(
+        'refused',
+        status,
+        {},
+        RECEIPT_UPLOAD_ERROR.INVALID_EXTRACTED,
+      );
+    const withDestination = () =>
+      invocation({ extraction: extracted(DESTINATION) });
+    const baseExtracted = {
+      amountCents: 150000,
+      date: '2026-11-05',
+      reference: 'ABC123',
+      bank: 'BBVA',
+      confidence: 0.9,
+    };
+
+    it('maps only the read destination fields into the upload fields', () => {
+      expect(
+        toUploadFields(
+          receipt,
+          extracted({ destinationName: DESTINATION.destinationName }),
+        ).extracted,
+      ).toEqual({
+        ...baseExtracted,
+        destinationName: DESTINATION.destinationName,
+      });
+    });
+
+    it('carries the production receipt destination into the multipart extracted part', async () => {
+      const adapter = new LlmReceiptExtractionAdapter(
+        jest.fn().mockResolvedValue({
+          output: {
+            isReceipt: true,
+            amountCents: 38900,
+            date: '2026-11-18',
+            reference: 'MBAN01002611180012345678',
+            bank: 'BBVA MEXICO',
+            destinationBank: 'BBVA MEXICO',
+            destinationName: 'Abril Alejandra Vazquez Ramos',
+            destinationAccountLast4: '****9616',
+            originName: 'Bryan Aldrich Flores',
+            confidence: 'high',
+          },
+          usage: { inputTokens: 1, outputTokens: 1 },
+        }),
+        'gpt-test',
+      );
+      const extraction = await adapter.extract({
+        bytes: BYTES,
+        mimeType: 'image/jpeg',
+        expectedAmountCents: 38900,
+      });
+      const form = toReceiptUploadForm(
+        { bytes: BYTES, mimeType: 'image/jpeg', filename: 'receipt.jpg' },
+        toUploadFields(receipt, extraction),
+      );
+      const raw = form.get('extracted') as string;
+      expect(JSON.parse(raw)).toMatchObject({
+        destinationBank: 'BBVA MEXICO',
+        destinationName: 'Abril Alejandra Vazquez Ramos',
+        destinationAccountLast4: '9616',
+        originName: 'Bryan Aldrich Flores',
+      });
+      expect(raw).toContain('"destinationAccountLast4":"9616"');
+    });
+
+    it('sends the destination fields by default', async () => {
+      const { service, client } = fixture();
+      await service.upload(withDestination());
+      expect(client.uploadReceipt.mock.calls[0][2]).toEqual({
+        extracted: { ...baseExtracted, ...DESTINATION },
+      });
+    });
+
+    it('sends none of them when RECEIPT_DESTINATION_FIELDS_ENABLED is false, retries included', async () => {
+      const { service, client } = fixture({ destinationFieldsEnabled: false });
+      await service.upload(withDestination());
+      // A retry re-sends stored fields that still carry them.
+      await service.upload(
+        invocation({
+          fields: { extracted: { ...DESTINATION, confidence: 0.6 } },
+        }),
+      );
+      expect(client.uploadReceipt.mock.calls[0][2]).toEqual({
+        extracted: baseExtracted,
+      });
+      expect(client.uploadReceipt.mock.calls[1][2]).toEqual({
+        extracted: { confidence: 0.6 },
+      });
+    });
+
+    it.each([400, 422])(
+      'retries once without them, same key, when HTTP %i INVALID_RECEIPT_EXTRACTED refuses them',
+      async (status) => {
+        const { service, client, store } = fixture();
+        client.uploadReceipt
+          .mockRejectedValueOnce(invalidExtracted(status))
+          .mockResolvedValueOnce(uploaded);
+        await expect(service.upload(withDestination())).resolves.toEqual({
+          kind: 'uploaded',
+          backendReceiptId: BACKEND_ID,
+          outcome: committed,
+        });
+        expect(client.uploadReceipt).toHaveBeenCalledTimes(2);
+        const [first, second] = client.uploadReceipt.mock.calls;
+        expect(first[2].extracted).toMatchObject(DESTINATION);
+        expect(second[2]).toEqual({ extracted: baseExtracted });
+        expect(second[3]).toBe('wa-media-1');
+        expect(second[1]).toEqual(first[1]);
+        expect(store.commitUploadDefiniteFailure).not.toHaveBeenCalled();
+        expect(store.commitUploadSuccess).toHaveBeenCalledWith({
+          ...FENCE,
+          backendReceiptId: BACKEND_ID,
+          templateArgs: { folio: 'F-0042' },
+        });
+        expect(warn).toHaveBeenCalledTimes(1);
+        const line = String((warn.mock.calls as unknown[][])[0][0]);
+        for (const key of DESTINATION_KEYS) expect(line).toContain(key);
+        for (const value of Object.values(DESTINATION))
+          expect(line).not.toContain(value);
+        expect(line).not.toContain('BBVA');
+      },
+    );
+
+    it('stores the stripped fields for later retries when the fallback outcome is unknown', async () => {
+      const { service, client, store } = fixture();
+      client.uploadReceipt
+        .mockRejectedValueOnce(invalidExtracted(400))
+        .mockRejectedValueOnce(new UpstreamError('x', 503, {}, null));
+      await expect(service.upload(withDestination())).resolves.toMatchObject({
+        kind: 'unknown',
+      });
+      expect(store.commitUploadUnknown).toHaveBeenCalledWith({
+        ...FENCE,
+        httpStatus: 503,
+        transportCode: null,
+        uploadFields: { extracted: baseExtracted },
+      });
+    });
+
+    it('commits the fallback refusal as definite and never retries twice', async () => {
+      const { service, client, store } = fixture();
+      client.uploadReceipt
+        .mockRejectedValueOnce(invalidExtracted(400))
+        .mockRejectedValueOnce(invalidExtracted(400));
+      await expect(service.upload(withDestination())).resolves.toMatchObject({
+        kind: 'refused',
+        httpStatus: 400,
+      });
+      expect(client.uploadReceipt).toHaveBeenCalledTimes(2);
+      expect(store.commitUploadDefiniteFailure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          errorCode: RECEIPT_UPLOAD_ERROR.INVALID_EXTRACTED,
+          templateKey: 'RECEIPT_ATTACH_DEFINITE_FAILURE',
+        }),
+      );
+    });
+
+    it.each([
+      [
+        'without destination fields',
+        () => invocation(),
+        400,
+        RECEIPT_UPLOAD_ERROR.INVALID_EXTRACTED,
+      ],
+      [
+        'for another 400 code',
+        withDestination,
+        400,
+        RECEIPT_UPLOAD_ERROR.INVALID_FIELDS,
+      ],
+      [
+        'for a 409',
+        withDestination,
+        409,
+        RECEIPT_UPLOAD_ERROR.INVALID_EXTRACTED,
+      ],
+    ])('does not fall back %s', async (_label, build, status, code) => {
+      const { service, client, store } = fixture();
+      client.uploadReceipt.mockRejectedValue(
+        new ChatbotApiError('refused', status, {}, code),
+      );
+      await service.upload(build());
+      expect(client.uploadReceipt).toHaveBeenCalledTimes(1);
+      expect(store.commitUploadDefiniteFailure).toHaveBeenCalledTimes(1);
     });
   });
 });

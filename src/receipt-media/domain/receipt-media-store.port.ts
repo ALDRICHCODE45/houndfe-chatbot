@@ -164,6 +164,10 @@ export interface UploadDefiniteFailureInput extends LeaseFenceInput {
 export interface UploadUnknownInput extends LeaseFenceInput {
   httpStatus: number | null;
   transportCode: string | null;
+  /** N18 fallback: the fields actually sent (destination keys stripped),
+   * replacing the stored ones so later same-key retries re-send them.
+   * Absent keeps the stored fields. */
+  uploadFields?: ReceiptUploadFields;
 }
 
 /** DOWNLOADED → FAILED without any upload (S8/S9). */

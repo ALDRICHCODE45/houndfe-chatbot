@@ -320,9 +320,14 @@ class ReceiptOutcomeLifecycle
       useFactory: (
         store: PostgresReceiptMediaStore,
         client: ChatbotApiClient,
+        config: ConfigService,
       ): ReceiptAttachmentService =>
-        new ReceiptAttachmentService(store, client),
-      inject: [PostgresReceiptMediaStore, CHATBOT_API_CLIENT],
+        new ReceiptAttachmentService(store, client, {
+          destinationFieldsEnabled:
+            config.get<boolean>('receiptMedia.destinationFieldsEnabled') ??
+            true,
+        }),
+      inject: [PostgresReceiptMediaStore, CHATBOT_API_CLIENT, ConfigService],
     },
     {
       provide: ReceiptIngestionProcessor,

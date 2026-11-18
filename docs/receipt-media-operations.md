@@ -134,15 +134,22 @@ base URL or capability-signed URL. The removed variables `RECEIPT_MEDIA_ENABLED`
 `RECEIPT_MEDIA_PUBLIC_BASE_URL` and `CHATBOT_API_ATTACH_TIMEOUT_MS` have no
 effect. The remaining knobs all have defaults:
 
-| Variable                           | Default                     |
-| ---------------------------------- | --------------------------- |
-| `META_MEDIA_ALLOWED_HOSTS`         | `lookaside.fbsbx.com`       |
-| `META_MEDIA_METADATA_TIMEOUT_MS`   | 10000 (< 60000)             |
-| `META_MEDIA_DOWNLOAD_TIMEOUT_MS`   | 30000 (< 60000, ≥ metadata) |
-| `RECEIPT_MEDIA_WORKER_CONCURRENCY` | 2 (1–8)                     |
-| `RECEIPT_MEDIA_WORKER_LEASE_MS`    | 60000 (fixed)               |
-| `RECEIPT_MEDIA_WORKER_POLL_MS`     | 5000 (< 60000)              |
-| `RECEIPT_MEDIA_MAX_BYTES`          | 10485760 (fixed)            |
+| Variable                             | Default                     |
+| ------------------------------------ | --------------------------- |
+| `META_MEDIA_ALLOWED_HOSTS`           | `lookaside.fbsbx.com`       |
+| `META_MEDIA_METADATA_TIMEOUT_MS`     | 10000 (< 60000)             |
+| `META_MEDIA_DOWNLOAD_TIMEOUT_MS`     | 30000 (< 60000, ≥ metadata) |
+| `RECEIPT_MEDIA_WORKER_CONCURRENCY`   | 2 (1–8)                     |
+| `RECEIPT_MEDIA_WORKER_LEASE_MS`      | 60000 (fixed)               |
+| `RECEIPT_MEDIA_WORKER_POLL_MS`       | 5000 (< 60000)              |
+| `RECEIPT_MEDIA_MAX_BYTES`            | 10485760 (fixed)            |
+| `RECEIPT_DESTINATION_FIELDS_ENABLED` | `true` (boolean)            |
+
+`RECEIPT_DESTINATION_FIELDS_ENABLED` is the kill switch of the N18 destination
+fields (see "Destination fields" below): `false` sends none of
+`destinationBank`, `destinationName`, `destinationAccountLast4`, `originName`,
+on first attempts and same-key retries alike. Anything other than
+`true`/`false` (case-insensitive) is rejected at boot.
 
 The service credential needs `sales:write` (upload) and `sales:read`
 (outcome); `sales:write` alone answers 403 on the outcome read.
@@ -219,6 +226,35 @@ like any unknown outcome: fix the credential, then reconcile the
 up to 6 attempts (backoff 30 s, 2, 5, 10, 15 min, about 32 min in total) and
 then sets `ATTACH_OUTCOME_UNKNOWN`. Such a row may still exist in the backend;
 reconcile it against the backend before any manual action.
+
+#### Destination fields (N18)
+
+The vision pre-fill also reads the destination bank, the destination holder
+name, the last 4 digits of the destination CLABE/account/card and the origin
+holder name, and sends them inside the multipart `extracted` part (backend
+contract aebb60ef): `destinationBank` (≤80), `destinationName` (≤120),
+`destinationAccountLast4` (a JSON string of exactly 4 digits such as `"9616"`)
+and `originName` (≤120). Each value is trimmed and length-checked before
+sending; a value that is empty, too long (never truncated) or not read with
+confidence is omitted. `destinationAccountLast4` is sent only when exactly 4
+digits are visible (a leading mask such as `****9616` gives `"9616"`; a full
+CLABE, 3 or 5 digits, or letters omit it). The customer message does not
+change.
+
+Fallback: when an upload that carried any of the four keys is answered
+400/422 `INVALID_RECEIPT_EXTRACTED`, the worker retries **once, immediately,
+with the same idempotency key** and without the four keys, and logs a `warn`
+from `ReceiptAttachmentService` naming the keys only (never their values):
+
+```text
+receipt <uuid>: backend refused the destination fields (INVALID_RECEIPT_EXTRACTED, HTTP <400|422>); retrying once without destinationBank, destinationName, destinationAccountLast4, originName
+```
+
+The outcome of that second call is handled like any other (201, definite
+refusal, unknown). If it is unknown, the stripped fields replace the stored
+`upload_fields`, so later same-key retries send them without the four keys. A
+recurring warn means the backend does not accept the fields: set
+`RECEIPT_DESTINATION_FIELDS_ENABLED=false` and tell the backend.
 
 A file that must not be uploaded ends `FAILED` without any backend call:
 `NOT_A_RECEIPT` (the vision says it is not a payment receipt) or
