@@ -277,6 +277,12 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     '¿Quieres agregar algo más o seguimos con tu compra?',
   ],
   ['¿Qué producto busca?', '¿Qué producto buscas?'],
+  // S13 code-rendered catalog options: closing and restock offer.
+  ['¿Cuál le gustaría llevar?', '¿Cuál te gustaría llevar?'],
+  ['¿Se lo agrego al carrito?', '¿Te lo agrego al carrito?'],
+  ['Y si la que busca es ', 'Y si la que buscas es '],
+  [', con gusto le averiguo cuándo', ', con gusto te averiguo cuándo'],
+  ['¿Quiere que le pregunte al equipo', '¿Quieres que le pregunte al equipo'],
   // S2 cart summary «Agregar algo más» reply.
   [
     'Claro, ¿qué producto desea agregar?',

@@ -16,7 +16,7 @@ export const MAX_BROADEN_CALLS = 3;
  * deliberately NOT here: they appear in product names and often are the only
  * thing that matches ("alimento para gato" → "Inaba Churu ... para Gato").
  */
-const GENERIC_WORDS: ReadonlySet<string> = new Set([
+const FILLER_WORDS: ReadonlySet<string> = new Set([
   // articles, prepositions, conjunctions
   'a',
   'al',
@@ -62,7 +62,17 @@ const GENERIC_WORDS: ReadonlySet<string> = new Set([
   'marca',
   'producto',
   'productos',
-  // generic product-category words that fail as exact substrings
+  'maneja',
+  'manejan',
+  'manejas',
+]);
+
+/**
+ * Generic product-category words that fail as exact substrings. They are
+ * dropped from broadened queries but, for S13 option classification, they ARE
+ * the requested product type ("croquetas pedigree" → type "croquetas").
+ */
+const CATEGORY_WORDS: ReadonlySet<string> = new Set([
   'alimento',
   'alimentos',
   'comida',
@@ -87,7 +97,7 @@ const UNIT_WORDS: ReadonlySet<string> = new Set([
 
 const MIN_WORD_LENGTH = 3;
 
-function fold(word: string): string {
+export function fold(word: string): string {
   return word.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
 }
 
@@ -98,14 +108,40 @@ function words(text: string): string[] {
     .filter((word) => word.length > 0);
 }
 
-function isSignificant(word: string): boolean {
-  const folded = fold(word);
+function isMeaningful(folded: string): boolean {
   return (
     folded.length >= MIN_WORD_LENGTH &&
     !/^\p{N}+$/u.test(folded) &&
-    !GENERIC_WORDS.has(folded) &&
+    !FILLER_WORDS.has(folded) &&
     !UNIT_WORDS.has(folded)
   );
+}
+
+function isSignificant(word: string): boolean {
+  const folded = fold(word);
+  return isMeaningful(folded) && !CATEGORY_WORDS.has(folded);
+}
+
+/** A query word with its position in the original text. */
+export interface QueryWord {
+  word: string;
+  start: number;
+  end: number;
+}
+
+/**
+ * S13b: the words of a query that say WHAT the customer wants (same filler,
+ * number and unit rules as broadening), keeping product-category words such
+ * as "croquetas", with their offsets in `q`, in the customer's order.
+ */
+export function significantQueryWords(q: string): QueryWord[] {
+  const out: QueryWord[] = [];
+  for (const match of q.matchAll(/[\p{L}\p{N}]+/gu)) {
+    const word = match[0];
+    if (!isMeaningful(fold(word))) continue;
+    out.push({ word, start: match.index, end: match.index + word.length });
+  }
+  return out;
 }
 
 /**

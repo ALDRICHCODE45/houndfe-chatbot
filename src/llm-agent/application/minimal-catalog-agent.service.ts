@@ -164,6 +164,12 @@ import {
 } from '../domain/minimal-catalog-availability';
 import { limitCatalogOptions } from '../domain/minimal-catalog-relevance';
 import {
+  planCatalogOptions,
+  renderCatalogOptions,
+  type CatalogOptionsPlan,
+  type CatalogRestockOffer,
+} from '../domain/minimal-catalog-options';
+import {
   MinimalRestockRequestService,
   type RestockReplyClassifier,
 } from './minimal-restock-request.service';
@@ -199,6 +205,17 @@ const CART_TRACE_ERROR_CODES = new Set([
   'order_unresolved',
 ]);
 
+/**
+ * S13a/g: the application renders the options message of a catalog read; the
+ * model decides what to search and the rest of the conversation.
+ */
+const CATALOG_OPTIONS_INSTRUCTION =
+  'Opciones del catálogo: cuando searchCatalog trae presented_by_application, la aplicación arma y envía al cliente el mensaje de opciones (orden, etiqueta «de otra marca», agotados, cierre y aviso de reposición del producto agotado) con sus textos fijos y tu texto de ese turno no llega al cliente: no escribas la lista ni el cierre; si no usas otra herramienta, responde solo «ok».';
+
+/** S13: shipped with a search result whose options the application presents. */
+const CATALOG_PRESENTED_NOTE =
+  'La aplicación envía al cliente estas opciones con su propio mensaje (lista, etiquetas, agotados y cierre). No las repitas ni escribas el cierre.';
+
 const INSTRUCTIONS =
   'Ruta experimental de solo lectura: usa searchCatalog para localizar productos por nombre; ' +
   'la búsqueda no prueba por sí sola que un producto esté disponible. Cuando el cliente confirme un producto ya ' +
@@ -213,10 +230,10 @@ const INSTRUCTIONS =
   'La selección explícita ya es válida: no la repreguntes. ' +
   'Si el cliente menciona o pide un producto, llama searchCatalog ANTES de responder; nunca digas "Encontré" ni des datos del catálogo sin una lectura de este chat. ' +
   'Relevancia: ofrece como opciones SOLO productos que cumplan TODOS los atributos que el cliente dijo: etapa de vida (cachorro, adulto, senior), especie (perro, gato), marca, tamaño de raza (pequeña, mediana, grande), sabor o tipo. Compara cada producto del resultado (nombre, marca y description) con el query y con lo dicho en el chat; el buscador puede traer productos que solo coinciden con una palabra suelta. Un producto que contradice un atributo pedido (por ejemplo para adulto o raza grande cuando pidió cachorro) nunca lo presentes como coincidencia; como mucho menciónalo UNA sola vez, aparte y como alternativa distinta ("también tengo uno para adulto, por si le sirve"). Si ningún resultado cumple lo pedido, di claro que no hay lo que pidió y ofrece la alternativa más cercana diciendo que es una alternativa, no lo solicitado. Si el resultado marca match "partial" en un producto, es alternativa, nunca coincidencia. ' +
-  'Marca: si la marca pedida tiene productos del tipo pedido, ofrece SOLO esa marca. Si la marca no tiene ese tipo de producto, ofrece el mismo tipo de producto de otra marca diciendo claramente que es de otra marca ("croquetas Pedigree no tengo, pero tengo estas croquetas de otra marca"); el mismo tipo de producto de otra marca va ANTES que otro tipo de producto de la misma marca (por ejemplo premios o snacks cuando pidió alimento), que va al final o se omite. ' +
-  'Si la búsqueda da varias opciones relevantes, enumera las reales (nombre, presentación y precio; máximo 3) y pregunta cuál desea; nunca preguntes "¿Buscaba alguna presentación específica?" sin listarlas. Si el resultado trae more_results, hay más productos que no se muestran: no los menciones ni los listes, haz UNA sola pregunta para acotar (tamaño, marca o presentación). Nunca ofrezcas más de 3 opciones en una respuesta. ' +
+  `${CATALOG_OPTIONS_INSTRUCTION} ` +
+  'Si el resultado trae more_results, hay más productos que no se muestran: no los menciones ni los listes. Nunca ofrezcas más de 3 opciones en una respuesta. ' +
   'Si searchCatalog no devuelve resultados, no concluyas que no existe: la aplicación ya reintenta sola con las palabras clave. Si aun así queda vacío, haz UNA sola búsqueda más amplia con el nombre principal (marca o producto, sin dosis, presentación ni palabras genéricas) y nunca repitas la misma consulta; si sigue vacío, di que no lo encontraste y pregunta qué producto busca. ' +
-  'Si el resultado trae broadened_search, los productos vienen de una búsqueda ampliada y NO son exactamente lo pedido: dilo claro ("Croquetas Pedigree no encontré; de Pedigree tengo …") y enumera esas opciones como alternativas, sin afirmar que son lo solicitado. Un error de lectura no es "sin resultados". ' +
+  'Si el resultado trae broadened_search, los productos vienen de una búsqueda ampliada y NO son exactamente lo pedido: nunca afirmes que son lo solicitado. Un error de lectura no es "sin resultados". ' +
   'out_of_stock se informa claro como agotado, no "no hay disponibilidad confirmada"; un producto que coincide y resulta agotado se sigue mostrando, como agotado, como alternativa. ' +
   'Cada producto de searchCatalog trae availability, tomada de la lectura en vivo del catálogo (por presentación si tiene variantes): si es out_of_stock, o una presentación aparece en agotado_presentations, di explícitamente que está agotado, indicando cuáles presentaciones están agotadas y cuáles no, nunca lo presentes como disponible y nunca lo agregues al carrito; sigue availability_instruction para ofrecer el aviso de reposición cuando exista. availability "unverified" no es agotado ni disponible: no lo afirmes, confírmalo con checkStock. ' +
   'Fallo de lectura, not_managed o desconocido no son agotado. El estado del producto ' +
@@ -748,6 +765,7 @@ const CATALOG_NO_FULL_MATCH_NOTE =
 function availabilityInstruction(
   availability: readonly ItemAvailability[],
   restockOffer: boolean,
+  rendered = false,
 ): string | null {
   const agotado = availability.some(
     (a) => a.status === 'out_of_stock' || a.agotadoPresentations.length > 0,
@@ -759,25 +777,21 @@ function availabilityInstruction(
   );
   if (!agotado && !unverified) return null;
   const parts: string[] = [];
-  // Owner choice «Vendedor» (2026-11-17): sell what is in stock first; the
-  // restock offer names only the agotado product, in its own sentence.
-  const someAvailable = availability.some(
-    (a) =>
-      a.status === 'available' ||
-      a.status === 'low_stock' ||
-      a.status === 'not_managed',
-  );
+  // S13d: the closing and the restock offer of a rendered options message
+  // are the application's; the model only keeps the facts.
+  let restockLine: string;
+  if (rendered)
+    restockLine = restockOffer
+      ? 'La aplicación ya le ofrece al cliente averiguar la reposición del producto agotado; si en un turno siguiente acepta, llama prepareRestock con el productId EXACTO de ese producto, nunca de otro.'
+      : 'La aplicación ya le dice que está agotado; no prometas aviso, fecha de reposición ni contacto.';
+  else
+    restockLine = restockOffer
+      ? 'Ofrece el aviso de reposición: pregunta si quiere que se le consulte al equipo cuándo vuelve a llegar, sin prometer fecha ni aviso; si acepta, llama prepareRestock con su productId EXACTO (y variantId si la presentación importa). No llames prepareRestock en esta respuesta.'
+      : 'Di solo que está agotado; no prometas aviso, fecha de reposición ni contacto.';
   if (agotado)
     parts.push(
-      ...(someAvailable && restockOffer
-        ? [
-            'La pregunta principal del cierre es sobre las opciones DISPONIBLES; la reposición va en una frase aparte que nombra solo el producto agotado, nunca preguntes por la reposición de «estas opciones». Cierra con este estilo: «¿Cuál le gustaría llevar? Y si la que busca es {producto agotado}, con gusto le averiguo cuándo nos vuelve a llegar.»',
-          ]
-        : []),
       'Existencias tomadas de la lectura en vivo del catálogo. Un producto con availability.status "out_of_stock" está AGOTADO: dilo explícitamente con la palabra «agotado», nunca lo presentes como disponible y nunca lo agregues al carrito. Con variantes, di cuáles presentaciones están agotadas (agotado_presentations) y cuáles no.',
-      restockOffer
-        ? 'Ofrece el aviso de reposición: pregunta si quiere que se le consulte al equipo cuándo vuelve a llegar, sin prometer fecha ni aviso; si acepta, llama prepareRestock con su productId EXACTO (y variantId si la presentación importa). No llames prepareRestock en esta respuesta.'
-        : 'Di solo que está agotado; no prometas aviso, fecha de reposición ni contacto.',
+      restockLine,
     );
   if (unverified)
     parts.push(
@@ -874,6 +888,31 @@ function lastAssistantText(
   }
   return null;
 }
+
+/**
+ * S13: the run's messages with the model's own text dropped and the
+ * application's reply as the final assistant message; tool calls and results
+ * stay so a later turn still sees the verified identities (productIds).
+ */
+function withApplicationReply(
+  messages: readonly ModelMessage[],
+  reply: string,
+): ModelMessage[] {
+  const kept = messages.flatMap((message): ModelMessage[] => {
+    if (message.role !== 'assistant') return [message];
+    if (typeof message.content === 'string') return [];
+    const parts = message.content.filter((part) => part.type !== 'text');
+    return parts.length === 0 ? [] : [{ ...message, content: parts }];
+  });
+  return [...kept, { role: 'assistant', content: reply }];
+}
+
+/** S13: the catalog reads of one run whose options the application renders. */
+type CatalogRun = {
+  plans: CatalogOptionsPlan[];
+  /** A checkStock ran after a search: the model answers that read. */
+  stockAfter: boolean;
+};
 
 /** The customer's own text turns, oldest first. */
 function customerTexts(turns: readonly MinimalCatalogTurn[]): string[] {
@@ -1081,6 +1120,23 @@ export class MinimalCatalogAgentService {
               : { onSent: consumed.onSent }),
           };
         }
+      }
+      // S13d: a plain yes right after an options message that offered to ask
+      // about ONE agotado product prepares the restock for that product only.
+      if (
+        this.restock !== undefined &&
+        input.interactiveReplyId === undefined
+      ) {
+        const offer =
+          this.sessionStore.read(input.senderId).at(-1)?.catalogRestockOffer ??
+          null;
+        if (
+          offer !== null &&
+          offer.acceptsYes !== false &&
+          classifyConfirmationReply(input.text) === 'accept' &&
+          bindRestockInboundEvent(input.inboundEvent, input.senderId) !== null
+        )
+          return await this.acceptCatalogRestock(input, offer);
       }
       // S5/S6: the current order and a paid order are answered without the
       // model; a typed message only (a tapped button has its own route).
@@ -1555,6 +1611,58 @@ export class MinimalCatalogAgentService {
     };
   }
 
+  /**
+   * S13d: the customer accepted the options message's restock offer. The
+   * existing preparation runs for the offered productId only (the RESTOCK
+   * consent question follows); a closed preparation is the cautious copy.
+   */
+  private async acceptCatalogRestock(
+    input: { senderId: string; text: string; inboundEvent?: unknown },
+    offer: CatalogRestockOffer,
+  ): Promise<MinimalCatalogAgentDecision> {
+    let prepared: Awaited<
+      ReturnType<NonNullable<typeof this.restock>['prepare']>
+    > | null = null;
+    try {
+      prepared =
+        (await this.restock?.prepare({
+          senderId: input.senderId,
+          inboundEvent: input.inboundEvent,
+          allowedProductIds: new Set([offer.productId]),
+          productId: offer.productId,
+          ...(offer.variantId === undefined
+            ? {}
+            : { variantId: offer.variantId }),
+        })) ?? null;
+    } catch {
+      prepared = null;
+    }
+    traceLog(
+      this.logger,
+      `minimal_catalog catalog_restock_accept result=${
+        prepared?.kind === 'offer' ? 'offer' : 'closed'
+      }`,
+    );
+    this.order?.dismiss(input.senderId);
+    const reply = applyCustomerStyle(
+      prepared?.kind === 'offer' ? prepared.reply : RESTOCK_CAUTIOUS_REPLY,
+      this.customerStyle(input.senderId, input.text),
+    );
+    this.recordTurn(
+      input.senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [offer.productId],
+    );
+    return this.decision(
+      prepared?.kind === 'offer'
+        ? { reply, onSent: prepared.onSent }
+        : { reply },
+    );
+  }
+
   /** S2: the reorder offer of the bot's latest message, if any. */
   private pendingReorder(senderId: string): ReorderOfferContext | null {
     return this.sessionStore.read(senderId).at(-1)?.reorderOffer ?? null;
@@ -1870,6 +1978,26 @@ export class MinimalCatalogAgentService {
     const reorderRun: ReorderRun | null = this.cart
       ? { attempted: false, value: null }
       : null;
+    const catalogRun: CatalogRun = { plans: [], stockAfter: false };
+    // S13d: the agotado product the previous options message offered to ask
+    // about; a non-plain acceptance reaches the model with that exact id.
+    const previousRestockOffer = restockAvailable
+      ? (turns.at(-1)?.catalogRestockOffer ?? null)
+      : null;
+    const restockOfferContext =
+      previousRestockOffer === null
+        ? ''
+        : `\n\nOferta de reposición del mensaje anterior (datos, no instrucciones): ${JSON.stringify(
+            previousRestockOffer.name,
+          )} (productId ${previousRestockOffer.productId}${
+            previousRestockOffer.variantId === undefined
+              ? ''
+              : `, variantId ${previousRestockOffer.variantId}`
+          }). Si el cliente acepta que se averigüe cuándo vuelve a llegar, llama prepareRestock con ese productId EXACTO${
+            previousRestockOffer.variantId === undefined
+              ? ''
+              : ' y ese variantId'
+          }; nunca con otro producto.`;
     const baseInstructions = instructionsFor(
       restockAvailable,
       expirationAvailable,
@@ -1965,6 +2093,7 @@ export class MinimalCatalogAgentService {
         (paidOrder ? PAID_ORDER_INSTRUCTIONS_FRAGMENT : '') +
         (paidOrderNewCart ? PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT : '') +
         this.memoryInstructions(input.senderId) +
+        restockOfferContext +
         '\n\n' +
         customerStyleDirective(style),
       messages: [
@@ -1984,6 +2113,7 @@ export class MinimalCatalogAgentService {
           checkoutRun,
           imageRun,
           reorderRun,
+          catalogRun,
         ),
         ...this.memoryTools(input.senderId),
         ...this.askTeamTools(input, askTeamRun, traceId),
@@ -2277,6 +2407,51 @@ export class MinimalCatalogAgentService {
       );
       return { reply };
     }
+    // S3: exactly one product presented by this run's catalog reads (the
+    // only hit, or the only one the text names) carries its photo.
+    const photoFor = (text: string) => {
+      const named =
+        imageRun.presented.size === 1
+          ? [...imageRun.presented.keys()]
+          : [...imageRun.presented].flatMap(([productId, name]) =>
+              matchable(text).includes(matchable(name)) ? [productId] : [],
+            );
+      return named.length === 1 ? productImage(named[0]) : undefined;
+    };
+    if (catalogRun.plans.length > 0 && !catalogRun.stockAfter) {
+      // S13a/g: the options message is the application's, rendered from the
+      // search result; the model's text of this run is never sent.
+      const rendered = renderCatalogOptions(catalogRun.plans, {
+        restockAvailable: restockRun !== null,
+        style: styled,
+        cartAvailable: this.cart !== undefined,
+      });
+      traceLog(
+        this.logger,
+        `minimal_catalog catalog_options rendered=application sections=${catalogRun.plans.length} shown=${rendered.shown.length} restock_offer=${rendered.restockOffer !== null} trace=${traceId}`,
+      );
+      const reply = rendered.text;
+      const media = photoFor(reply);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          ...withApplicationReply(result.responseMessages, reply),
+        ],
+        [...currentIds],
+        persistedCartContext(),
+        persistedImages(),
+        rendered.restockOffer === null
+          ? {}
+          : {
+              catalogRestockOffer: {
+                ...rendered.restockOffer,
+                acceptsYes: rendered.restockAcceptsYes,
+              },
+            },
+      );
+      return media === undefined ? { reply } : { reply, media };
+    }
     let text = result.text;
     let responseMessages: ModelMessage[] = result.responseMessages;
     if (text.trim() === '') {
@@ -2338,15 +2513,7 @@ export class MinimalCatalogAgentService {
       );
       return { reply };
     }
-    // S3: exactly one product presented by this run's catalog reads (the
-    // only hit, or the only one the text names) carries its photo.
-    const named =
-      imageRun.presented.size === 1
-        ? [...imageRun.presented.keys()]
-        : [...imageRun.presented].flatMap(([productId, name]) =>
-            matchable(text).includes(matchable(name)) ? [productId] : [],
-          );
-    const media = named.length === 1 ? productImage(named[0]) : undefined;
+    const media = photoFor(text);
     this.recordTurn(
       input.senderId,
       [{ role: 'user', content: input.text }, ...responseMessages],
@@ -2709,6 +2876,7 @@ export class MinimalCatalogAgentService {
       interactiveChoice?: InteractiveChoiceContext;
       reorderOffer?: ReorderOfferContext;
       paymentOffer?: { saleId: string };
+      catalogRestockOffer?: CatalogRestockOffer & { acceptsYes: boolean };
     } = {},
   ): void {
     const turns = this.sessionStore.read(senderId);
@@ -2737,6 +2905,9 @@ export class MinimalCatalogAgentService {
         ...(interactive.paymentOffer === undefined
           ? {}
           : { paymentOffer: interactive.paymentOffer }),
+        ...(interactive.catalogRestockOffer === undefined
+          ? {}
+          : { catalogRestockOffer: interactive.catalogRestockOffer }),
       },
     ]);
   }
@@ -2853,6 +3024,7 @@ export class MinimalCatalogAgentService {
     checkoutRun: CheckoutRun | null = null,
     imageRun: ProductImageRun | null = null,
     reorderRun: ReorderRun | null = null,
+    catalogRun: CatalogRun | null = null,
   ) {
     const chatbotApi = this.chatbotApi;
     const restock = this.restock;
@@ -2985,7 +3157,20 @@ export class MinimalCatalogAgentService {
             // S11/S12: agotado products go last BEFORE the cap, so an agotado
             // product never displaces an available match from the 3.
             const limited = limitCatalogOptions(preferInStock(items));
-            const offered = limited.offered;
+            // S13b: when the items are classifiable the application picks
+            // (available first, exact → same type → brand only, ≤ 3) and
+            // renders the options; otherwise the model answers as before.
+            const plan = planCatalogOptions(q, items);
+            const offered =
+              plan === null
+                ? limited.offered
+                : plan.options.map((option) => option.item);
+            const moreResults =
+              plan === null ? limited.moreResults : plan.moreResults;
+            if (plan !== null && catalogRun !== null) {
+              catalogRun.plans.push(plan);
+              catalogRun.stockAfter = false;
+            }
             // S12: availability labels come from the search payload (live
             // backend evidence, zero extra calls): simple/not-managed -> own
             // status; with variants -> each variant's status, never the
@@ -3004,6 +3189,7 @@ export class MinimalCatalogAgentService {
             const availabilityNote = availabilityInstruction(
               availability,
               run !== null,
+              plan !== null,
             );
             for (const item of offered) {
               allowedIds.add(item.productId);
@@ -3032,9 +3218,7 @@ export class MinimalCatalogAgentService {
               );
             trace(
               `tool searchCatalog result=ok searchResultCount=${items.length}` +
-                (limited.moreResults > 0
-                  ? ` offeredCount=${offered.length}`
-                  : '') +
+                (moreResults > 0 ? ` offeredCount=${offered.length}` : '') +
                 (broadened === null
                   ? ''
                   : ` broadenedCalls=${broadened.attempted.length}`),
@@ -3050,12 +3234,15 @@ export class MinimalCatalogAgentService {
               ...(availabilityNote === null
                 ? {}
                 : { availability_instruction: availabilityNote }),
-              ...(limited.moreResults > 0
+              ...(moreResults > 0
                 ? {
-                    more_results: limited.moreResults,
+                    more_results: moreResults,
                     narrowing_instruction: CATALOG_NARROWING_INSTRUCTION,
                   }
                 : {}),
+              ...(plan === null
+                ? {}
+                : { presented_by_application: CATALOG_PRESENTED_NOTE }),
               ...(limited.flagged &&
               offered.some((item) => item.match === 'partial')
                 ? {
@@ -3083,6 +3270,9 @@ export class MinimalCatalogAgentService {
             trace('tool checkStock result=denied code=unknown_product');
             return toolError('unknown_product');
           }
+          // S13: a stock read after a search is the model's to answer.
+          if (catalogRun !== null && catalogRun.plans.length > 0)
+            catalogRun.stockAfter = true;
           // G1: a repeated identical read in one run reuses the first answer.
           const cached = stockReads.get(productId);
           if (cached !== undefined) {

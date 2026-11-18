@@ -1782,10 +1782,9 @@ describe('private selection-stage rejection diagnostics', () => {
         senderId: SENDER,
         text: 'Busca croquetas',
       });
-      expect(reply).toMatchObject({
-        kind: 'handled',
-        reply: 'Productos encontrados',
-      });
+      // S13: the search turn's reply is the application's options message.
+      if (reply.kind !== 'handled') throw new Error('expected handled');
+      expect(reply.reply).toContain('Encontré estas opciones:');
       expect(f.api.searchCatalog).toHaveBeenCalledTimes(1);
       expect(f.api.getStock).not.toHaveBeenCalled();
       expect(f.api.evaluateCart).not.toHaveBeenCalled();

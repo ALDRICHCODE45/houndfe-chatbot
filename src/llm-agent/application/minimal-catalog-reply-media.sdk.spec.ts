@@ -62,6 +62,13 @@ const adjust = (
     continuation: false,
   });
 
+// S13: a search turn's reply is the application's options message.
+const KONG_OPTIONS = [
+  'Encontré estas opciones:',
+  '• *Juguete Kong Classic para Perro*: Juguete de hule resistente rellenable con premios. Juguete Kong Classic para Perro Chico $249.00 MXN, Juguete Kong Classic para Perro Mediano $329.00 MXN, Juguete Kong Classic para Perro Grande $429.00 MXN (agotada)',
+  '',
+  '¿Cuál le gustaría llevar?',
+].join('\n');
 const KONG_TEXT =
   'Encontré el Juguete Kong Classic para Perro en nuestro catálogo, desde $249.00. ¿Qué tamaño busca?';
 const BOTH_ARENAS =
@@ -152,7 +159,7 @@ describe('S3 product photo in replies', () => {
       call('searchCatalog', { q: 'kong' }),
       say(KONG_TEXT),
     ]);
-    expect(result.reply).toBe(KONG_TEXT);
+    expect(result.reply).toBe(KONG_OPTIONS);
     expect(result.media).toEqual([
       {
         kind: 'image',
@@ -186,8 +193,12 @@ describe('S3 product photo in replies', () => {
 
   it('one product presented out of several search hits carries only its photo', async () => {
     const h = harness();
+    // S13: a pure search turn is rendered by the application (all shown
+    // options named); the model text — and this name rule — applies when the
+    // model answers a stock read after the search.
     const result = await h.turn('¿Tienen arena de sílice?', [
       call('searchCatalog', { q: 'arena de sílice para gato' }),
+      call('checkStock', { productId: product(SILICE) }),
       say(
         'Encontré Arena para Gato de Sílice 3.8 L en nuestro catálogo, $179.00. ¿Se la agrego al carrito?',
       ),
@@ -215,7 +226,7 @@ describe('S3 product photo in replies', () => {
       call('searchCatalog', { q: 'kong' }),
       say(KONG_TEXT),
     ]);
-    expect(result.reply).toBe(KONG_TEXT);
+    expect(result.reply).toBe(KONG_OPTIONS);
     expect(result.media).toBeUndefined();
   });
 

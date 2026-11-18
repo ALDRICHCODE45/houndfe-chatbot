@@ -60,6 +60,18 @@ export type MinimalCatalogTurn = {
   reorderOffer?: ReorderOfferContext;
   /** The payment offer THIS turn made (never inherited, like `reorderOffer`). */
   paymentOffer?: { saleId: string };
+  /**
+   * S13d: the ONE agotado product THIS turn's options message offered to ask
+   * the team about (never inherited, so only the reply right after it can
+   * accept it). Absent in turns stored before S13.
+   */
+  catalogRestockOffer?: {
+    productId: string;
+    variantId?: string;
+    name: string;
+    /** A bare "sí" accepts it (the closing asked nothing else yes/no). */
+    acceptsYes?: boolean;
+  };
 };
 
 /**

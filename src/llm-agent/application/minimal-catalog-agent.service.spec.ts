@@ -65,6 +65,9 @@ const variant = {
 const variantItem = { ...simpleItem, variants: [variant] };
 const variantStock = { ...simpleStock, variants: [variant] };
 const variantFixtures = { item: variantItem, stock: variantStock };
+// S13: a search turn's reply is the application's options message.
+const IBUPROFENO_OPTIONS =
+  'Encontré estas opciones:\n• *Ibuprofeno 400 mg*: $99.00 MXN\n\n¿Cuál le gustaría llevar?';
 const flow = [
   call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
   say('¿Buscaba esa presentación?'),
@@ -192,7 +195,7 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       service.tryHandle({ senderId: SENDER, text: 'tienen ibuprofeno' }),
     ).resolves.toEqual({
       kind: 'handled',
-      reply: '¿Buscaba esa presentación?',
+      reply: IBUPROFENO_OPTIONS, // S13: rendered by the application
     });
     await expect(
       service.tryHandle({ senderId: SENDER, text: 'sí, esa' }),
@@ -214,6 +217,8 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     expect(system).toContain('needs_human_review');
     expect(system).toContain('no prueba');
     expect(system).toContain('reservación');
+    // S13: the model's own text is replaced by the rendered reply; the tool
+    // call and result stay in history (verified identity for later turns).
     expect(captured[1].messages!.map((m) => m.role)).toEqual([
       'user',
       'assistant',
@@ -221,6 +226,12 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       'assistant',
       'user',
     ]);
+    expect(JSON.stringify(captured[1].messages)).not.toContain(
+      '¿Buscaba esa presentación?',
+    );
+    expect(JSON.stringify(captured[1].messages)).toContain(
+      'Encontré estas opciones:',
+    );
     expect(costGuard.currentAggregate).toBe(25);
     const stopWhen = captured[0].stopWhen!;
     const ref = stepCountIs(4) as unknown as (state: {
@@ -378,17 +389,16 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     const resultIds = (out: Record<string, unknown>) =>
       (out.results as Array<{ productId: string }>).map((r) => r.productId);
 
-    it('brand rule (owner 2026-11-17): the brand is kept when it has the product type; otherwise the same type of another brand, labelled, comes before the same brand of another type', async () => {
+    it('brand rule (owner 2026-11-17) is now applied by the S13 renderer: the prompt no longer tells the model how to order or label options', async () => {
       const { service, captured } = build(flow);
       await service.tryHandle({ senderId: SENDER, text: 'busca' });
       const system = JSON.stringify(captured[0].system);
-      expect(system).toContain(
+      expect(system).not.toContain(
         'Marca: si la marca pedida tiene productos del tipo pedido, ofrece SOLO esa marca',
       );
-      expect(system).toContain('de otra marca');
-      expect(system).toContain(
-        'el mismo tipo de producto de otra marca va ANTES que otro tipo de producto de la misma marca',
-      );
+      expect(system).not.toContain('enumera las reales');
+      expect(system).toContain('presented_by_application');
+      expect(system).toContain('no escribas la lista ni el cierre');
     });
 
     it('S10a/c: prompt requires every stated attribute, alternatives only separately, plain no-match', async () => {
@@ -412,14 +422,13 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       expect(system).toContain('la alternativa más cercana');
     });
 
-    it('S10b: prompt says at most 3 options and one narrowing question, not 5', async () => {
+    it('S10b: prompt says never more than 3 options and not to list hidden results (the S13 renderer asks the narrowing question)', async () => {
       const { service, captured } = build(flow);
       await service.tryHandle({ senderId: SENDER, text: 'busca' });
       const system = JSON.stringify(captured[0].system);
-      expect(system).toContain('máximo 3');
+      expect(system).toContain('Nunca ofrezcas más de 3 opciones');
       expect(system).not.toContain('máximo 5');
       expect(system).toContain('more_results');
-      expect(system).toContain('UNA sola pregunta');
     });
 
     it('S10a: the tool result carries the stated query, descriptions and a relevance check', async () => {
@@ -487,7 +496,7 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       expect(out).toHaveProperty('broadened_search');
     });
 
-    it('S10d: partial matches go after full ones, labelled as alternatives, outside the 3 matches', async () => {
+    it('S10d/S13b: partial matches never displace full ones; ≤ 3 options in total (S13 replaced the extra 4th partial slot)', async () => {
       const { out } = await search([
         product(1, { match: 'partial' }),
         product(2, { match: 'all' }),
@@ -496,15 +505,17 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
         product(5, { match: 'all' }),
         product(6, { match: 'partial' }),
       ]);
-      expect(resultIds(out)).toEqual([pid(2), pid(3), pid(4), pid(1)]);
-      const results = out.results as Array<{ match?: string }>;
-      expect(results.map((r) => r.match)).toEqual([
-        'all',
-        'all',
-        'all',
-        'partial',
+      expect(resultIds(out)).toEqual([pid(2), pid(3), pid(4)]);
+      expect(out.more_results).toBe(3);
+      expect(out).not.toHaveProperty('match_note');
+    });
+
+    it('S10d: a partial match shown next to full ones still carries the alternative note', async () => {
+      const { out } = await search([
+        product(1, { match: 'partial' }),
+        product(2, { match: 'all' }),
       ]);
-      expect(out.more_results).toBe(1);
+      expect(resultIds(out)).toEqual([pid(2), pid(1)]);
       expect(out.match_note).toEqual(expect.stringContaining('partial'));
       expect(out.match_note).toEqual(expect.stringContaining('alternativa'));
     });
@@ -699,26 +710,23 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       expect(withRestock.out.availability_instruction).toContain(
         'prepareRestock',
       );
-      expect(withRestock.out.availability_instruction).toContain('equipo');
+      // S13d: the offer itself is the application's rendered closing.
+      expect(withRestock.out.availability_instruction).toContain(
+        'La aplicación ya le ofrece',
+      );
     });
 
-    it('with available options next to an agotado one, the closing question sells the available ones and offers restock only for the agotado product (owner choice «Vendedor»)', async () => {
+    it('«Vendedor» closing (owner 2026-11-17) is now rendered by the application (S13d): the tool result no longer dictates a closing to the model', async () => {
       const mixed = await search([product(1, AVAILABLE), product(2, OUT)], {
         restock: true,
       });
-      expect(mixed.out.availability_instruction).toContain(
-        'La pregunta principal del cierre es sobre las opciones DISPONIBLES',
-      );
-      expect(mixed.out.availability_instruction).toContain(
-        '«¿Cuál le gustaría llevar? Y si la que busca es {producto agotado}, con gusto le averiguo cuándo nos vuelve a llegar.»',
-      );
-      expect(mixed.out.availability_instruction).toContain(
-        'nunca preguntes por la reposición de «estas opciones»',
-      );
-      const onlyAgotado = await search([product(1, OUT)], { restock: true });
-      expect(onlyAgotado.out.availability_instruction).not.toContain(
+      expect(mixed.out.availability_instruction).not.toContain(
         'La pregunta principal del cierre',
       );
+      expect(mixed.out.availability_instruction).not.toContain(
+        '¿Cuál le gustaría llevar?',
+      );
+      expect(mixed.out).toHaveProperty('presented_by_application');
     });
 
     it('available matches come first: an agotado product does not displace an available one from the 3', async () => {
@@ -752,12 +760,12 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       expect(out.results[1].availability.status).toBe('out_of_stock');
     });
 
-    it('a full match that is agotado still precedes a partial alternative', async () => {
+    it('S13b available first: an available partial alternative precedes an agotado full match (shown on its own agotado line)', async () => {
       const { out } = await search([
         product(1, AVAILABLE, { match: 'partial' }),
         product(2, OUT, { match: 'all' }),
       ]);
-      expect(ids(out)).toEqual([pid(2), pid(1)]);
+      expect(ids(out)).toEqual([pid(1), pid(2)]);
     });
 
     it('caps at 3 offered products with no stock reads for any of them', async () => {
@@ -816,6 +824,358 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       expect(system).toContain('agotado');
       expect(system).toContain('nunca lo agregues al carrito');
       expect(system).toContain('cuáles presentaciones');
+    });
+  });
+
+  describe('S13 code-rendered catalog options', () => {
+    const pid = (n: number) =>
+      `cccccccc-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const priced = (cents: number) => ({
+      priceCents: cents,
+      fromPriceCents: null,
+      promoPriceCents: null,
+      promotionEvaluationStatus: 'needs_human_review',
+    });
+    const AVAILABLE = { status: 'available', quantity: 7 };
+    const OUT = { status: 'out_of_stock', quantity: 0 };
+    // Production evidence (2026-11-17), "croquetas pedigree manejan?".
+    const dentastix = {
+      productId: pid(1),
+      name: 'Pedigree Dentastix Premios Dentales Perro Mediano 7 pzas',
+      brand: 'Pedigree',
+      imageUrl: null,
+      description: 'Premios para la limpieza dental de su perro.',
+      price: priced(8900),
+      stock: AVAILABLE,
+      variants: [],
+    };
+    const naturales = {
+      productId: pid(2),
+      name: '[PRUEBA] Croquetas Naturales sin Grano Salmón y Camote 2 kg',
+      brand: 'Naturales',
+      imageUrl: null,
+      description: 'Croquetas para perros adultos de raza grande. Sin granos.',
+      price: priced(45000),
+      stock: AVAILABLE,
+      variants: [],
+    };
+    const LATA = 'Pedigree Adulto Trozos de Res en Salsa Lata 375 g';
+    const lata = {
+      productId: pid(3),
+      name: LATA,
+      brand: 'Pedigree',
+      imageUrl: null,
+      description: 'Alimento húmedo para perro adulto.',
+      price: priced(4900),
+      stock: OUT,
+      variants: [],
+    };
+    const lataStock = {
+      productId: pid(3),
+      name: LATA,
+      stock: OUT,
+      variants: [],
+    };
+    const PROD_REPLY = [
+      'Croquetas Pedigree no tengo, pero tengo estas opciones:',
+      '• *[PRUEBA] Croquetas Naturales sin Grano Salmón y Camote 2 kg* (de otra marca): Croquetas para perros adultos de raza grande. $450.00 MXN',
+      '• *Pedigree Dentastix Premios Dentales Perro Mediano 7 pzas*: Premios para la limpieza dental de su perro. $89.00 MXN',
+      `Además, tengo ${LATA}, pero está agotado.`,
+      '',
+      `¿Cuál le gustaría llevar? Y si la que busca es ${LATA}, con gusto le averiguo cuándo nos vuelve a llegar.`,
+    ].join('\n');
+    // The production model text this change makes impossible to send.
+    const MODEL_TEXT =
+      'Tengo Pedigree Dentastix y [PRUEBA] Croquetas Naturales. Si buscas las croquetas de Pedigree, con gusto averiguo cuándo nos vuelve a llegar.';
+    const inbound = (n: number) => ({
+      receivingPhoneNumberId: '123456789012345',
+      senderId: SENDER,
+      messageId: `wamid.S13.${n}`,
+    });
+    const restockWiring = (api: ChatbotApiClient) =>
+      new MinimalRestockRequestService({
+        chatbotApi: api,
+        store: { get: jest.fn(async () => null) } as never,
+        restock: {
+          markers: {
+            readForSender: jest.fn(async () => ({
+              legacyRequestPending: false,
+              restockIntentPresent: false,
+            })),
+          },
+          coordinator: { coordinate: jest.fn() },
+          recovery: { recover: jest.fn() },
+        },
+      });
+    const prodTurn = async (
+      steps: unknown[],
+      opts: { restock?: boolean; text?: string } = {},
+    ) => {
+      const built = build(
+        steps,
+        opts.restock === false ? {} : { restock: restockWiring },
+        { item: dentastix, stock: lataStock },
+      );
+      built.chatbotApi.searchCatalog.mockResolvedValue([
+        dentastix,
+        naturales,
+        lata,
+      ] as never);
+      const first = await built.service.tryHandle({
+        senderId: SENDER,
+        text: opts.text ?? 'croquetas pedigree manejan?',
+        inboundEvent: inbound(1),
+      });
+      return { ...built, first };
+    };
+
+    it('prod case: the options message is rendered by code — other-brand croquetas first, Dentastix after, the lata as agotado, exact restock closing', async () => {
+      const { first, captured } = await prodTurn([
+        call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+        say(MODEL_TEXT),
+      ]);
+      expect(first).toEqual({ kind: 'handled', reply: PROD_REPLY });
+      if (first.kind !== 'handled') throw new Error('expected handled');
+      expect(
+        first.reply.startsWith(
+          'Croquetas Pedigree no tengo, pero tengo estas opciones:',
+        ),
+      ).toBe(true);
+      const closing = first.reply.split('\n').at(-1)!.toLowerCase();
+      expect(closing).not.toContain('croquetas pedigree');
+      expect(closing).not.toContain('croquetas de pedigree');
+      expect(first.reply).not.toContain('Si buscas');
+      // One model run: the rendered reply needs no extra render call.
+      expect(captured).toHaveLength(1);
+    });
+
+    it('the model cannot override the rendered message in that turn, even with empty or competing text', async () => {
+      const competing = await prodTurn([
+        call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+        say('Encontré estas opciones:\n• *Croquetas Pedigree* $1 MXN'),
+      ]);
+      expect(competing.first).toEqual({ kind: 'handled', reply: PROD_REPLY });
+      // A step budget ending on the tool call (no text) is not re-rendered
+      // by the model either.
+      const empty = await prodTurn([
+        call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+        call('s2', 'searchCatalog', { q: 'croquetas pedigree' }),
+        call('s3', 'searchCatalog', { q: 'croquetas pedigree' }),
+        call('s4', 'searchCatalog', { q: 'croquetas pedigree' }),
+      ]);
+      expect(empty.first).toEqual({ kind: 'handled', reply: PROD_REPLY });
+      expect(empty.captured).toHaveLength(1);
+    });
+
+    it('the search result tells the model the application presents the options, and the prompt says not to write them', async () => {
+      const { captured } = await prodTurn([
+        call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+        say(MODEL_TEXT),
+      ]);
+      const out = (await captured[0].tools!.searchCatalog.execute(
+        { q: 'croquetas pedigree' },
+        {},
+      )) as { results: Array<{ productId: string }> };
+      expect(out).toHaveProperty('presented_by_application');
+      // The registry keeps exactly the rendered products, in rendered order.
+      expect(out.results.map((r) => r.productId)).toEqual([
+        pid(2),
+        pid(1),
+        pid(3),
+      ]);
+      expect(String(captured[0].system)).toContain(
+        'no escribas la lista ni el cierre',
+      );
+    });
+
+    it('tú styling applies to the fixed copy', async () => {
+      const { first } = await prodTurn(
+        [call('s1', 'searchCatalog', { q: 'croquetas pedigree' }), say('x')],
+        { text: '¿tienes croquetas pedigree? ¿me ayudas?' },
+      );
+      if (first.kind !== 'handled') throw new Error('expected handled');
+      expect(first.reply).toContain(
+        `¿Cuál te gustaría llevar? Y si la que buscas es ${LATA}, con gusto te averiguo cuándo nos vuelve a llegar.`,
+      );
+    });
+
+    it('without the restock capability the message makes no restock promise', async () => {
+      const { first } = await prodTurn(
+        [call('s1', 'searchCatalog', { q: 'croquetas pedigree' }), say('x')],
+        { restock: false },
+      );
+      if (first.kind !== 'handled') throw new Error('expected handled');
+      expect(first.reply).toContain(
+        `Además, tengo ${LATA}, pero está agotado.`,
+      );
+      expect(first.reply.endsWith('\n\n¿Cuál le gustaría llevar?')).toBe(true);
+      expect(first.reply).not.toContain('averiguo');
+    });
+
+    it('a later plain "sí" prepares the restock for the agotado productId only, without a model run', async () => {
+      const { service, chatbotApi, captured } = await prodTurn([
+        call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+        say(MODEL_TEXT),
+      ]);
+      const second = await service.tryHandle({
+        senderId: SENDER,
+        text: 'sí',
+        inboundEvent: inbound(2),
+      });
+      if (second.kind !== 'handled') throw new Error('expected handled');
+      expect(second.reply).toContain(`«${LATA}»`);
+      expect(second.onSent).toEqual(expect.any(Function));
+      expect(chatbotApi.getStock).toHaveBeenCalledTimes(1);
+      expect(chatbotApi.getStock).toHaveBeenCalledWith(pid(3));
+      expect(captured).toHaveLength(1);
+    });
+
+    it('the restock offer belongs to the rendered turn only: after another turn a "sí" goes to the model', async () => {
+      const { service, chatbotApi, captured } = await prodTurn([
+        call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+        say(MODEL_TEXT),
+        say('Claro.'),
+        say('De acuerdo.'),
+      ]);
+      await service.tryHandle({
+        senderId: SENDER,
+        text: 'gracias, lo pienso',
+        inboundEvent: inbound(2),
+      });
+      await service.tryHandle({
+        senderId: SENDER,
+        text: 'sí',
+        inboundEvent: inbound(3),
+      });
+      expect(chatbotApi.getStock).not.toHaveBeenCalled();
+      expect(captured).toHaveLength(3);
+    });
+
+    it('a non-plain acceptance reaches the model with the offered productId and the history keeps the verified tool result', async () => {
+      const { service, captured } = await prodTurn([
+        call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+        say(MODEL_TEXT),
+        say('Claro.'),
+      ]);
+      await service.tryHandle({
+        senderId: SENDER,
+        text: 'sí, averigüeme cuándo llega la lata',
+        inboundEvent: inbound(2),
+      });
+      const system = String(captured[1].system);
+      expect(system).toContain('Oferta de reposición del mensaje anterior');
+      expect(system).toContain(pid(3));
+      expect(system).not.toContain(`productId ${pid(1)}`);
+      const history = JSON.stringify(captured[1].messages);
+      expect(history).toContain(pid(3));
+      expect(history).toContain('Croquetas Pedigree no tengo');
+      expect(history).not.toContain('Si buscas las croquetas de Pedigree');
+    });
+
+    it('checkStock and the rendered products stay usable on the next turn (registry unchanged)', async () => {
+      const { service, captured } = await prodTurn([
+        call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+        say(MODEL_TEXT),
+        call('c1', 'checkStock', { productId: pid(2) }),
+        say('Sí, lo tenemos disponible.'),
+      ]);
+      const second = await service.tryHandle({
+        senderId: SENDER,
+        text: 'quiero las croquetas naturales',
+        inboundEvent: inbound(2),
+      });
+      // A checkStock after the options is the model's to answer.
+      expect(second).toEqual({
+        kind: 'handled',
+        reply: 'Sí, lo tenemos disponible.',
+      });
+      expect(captured).toHaveLength(2);
+    });
+
+    it('a stock read after a search in the SAME turn leaves that turn to the model', async () => {
+      const { first } = await prodTurn([
+        call('s1', 'searchCatalog', { q: 'croquetas pedigree' }),
+        call('c1', 'checkStock', { productId: pid(2) }),
+        say('Las croquetas naturales están disponibles.'),
+      ]);
+      expect(first).toEqual({
+        kind: 'handled',
+        reply: 'Las croquetas naturales están disponibles.',
+      });
+    });
+
+    it('S10 prod case: "croquetas para cachorro" renders only the cachorro product; the adult croquetas are neither shown nor registered', async () => {
+      const nupec = {
+        ...dentastix,
+        productId: pid(10),
+        name: 'Nupec Cachorro Razas Medianas y Grandes',
+        brand: 'Nupec',
+        description:
+          'Alimento seco premium para cachorros de razas medianas y grandes.',
+      };
+      const adult = {
+        ...naturales,
+        productId: pid(11),
+        name: '[PRUEBA] Croquetas Naturales sin Grano Salmón y Camote para Perros Adultos de Raza Grande',
+      };
+      const built = build(
+        [
+          call('s1', 'searchCatalog', { q: 'croquetas para cachorro' }),
+          say('Tengo Nupec y las croquetas Naturales para adulto.'),
+        ],
+        {},
+        { item: nupec, stock: lataStock },
+      );
+      built.chatbotApi.searchCatalog.mockResolvedValue([adult, nupec] as never);
+      const first = await built.service.tryHandle({
+        senderId: SENDER,
+        text: 'croquetas para cachorro',
+      });
+      if (first.kind !== 'handled') throw new Error('expected handled');
+      expect(first.reply).toContain(
+        '*Nupec Cachorro Razas Medianas y Grandes*',
+      );
+      expect(first.reply).not.toContain('Naturales');
+      await expect(
+        built.captured[0].tools!.checkStock.execute({ productId: pid(11) }, {}),
+      ).resolves.toEqual({ ok: false, error: 'unknown_product' });
+    });
+
+    it('S10: only contradicting results → «{lo pedido} no tengo.», nothing listed', async () => {
+      const built = build(
+        [
+          call('s1', 'searchCatalog', { q: 'croquetas para cachorro' }),
+          say('Tengo croquetas para adulto.'),
+        ],
+        {},
+        { item: naturales, stock: lataStock },
+      );
+      built.chatbotApi.searchCatalog.mockResolvedValue([
+        {
+          ...naturales,
+          name: 'Croquetas Naturales para Perros Adultos',
+        },
+      ] as never);
+      await expect(
+        built.service.tryHandle({
+          senderId: SENDER,
+          text: 'croquetas para cachorro',
+        }),
+      ).resolves.toEqual({
+        kind: 'handled',
+        reply: 'Croquetas para cachorro no tengo.',
+      });
+    });
+
+    it('nothing classifiable keeps the model reply (current behaviour)', async () => {
+      const { first } = await prodTurn([
+        call('s1', 'searchCatalog', { q: 'arena' }),
+        say('No encontré arena; ¿qué producto busca?'),
+      ]);
+      expect(first).toEqual({
+        kind: 'handled',
+        reply: 'No encontré arena; ¿qué producto busca?',
+      });
     });
   });
 
@@ -985,7 +1345,7 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       service.tryHandle({ senderId: SENDER, text: 'tienen ibuprofeno' }),
     ).resolves.toEqual({
       kind: 'handled',
-      reply: '¿Buscaba esa presentación?',
+      reply: IBUPROFENO_OPTIONS,
     });
     await expect(
       service.tryHandle({ senderId: SENDER, text: 'sí, esa' }),
@@ -1397,7 +1757,7 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
       });
       expect(first).toMatchObject({
         kind: 'handled',
-        reply: '¿Buscaba esa presentación?',
+        reply: IBUPROFENO_OPTIONS, // S13: rendered by the application
       });
       expect(w.coordinate).not.toHaveBeenCalled();
       // Turn 2: the product-selection SÍ. The model checks stock, sees agotado
@@ -1554,10 +1914,18 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     });
 
     it('never auto-prepares a variantful product from a depleted parent read', async () => {
+      // S13d: an agotado search label would arm the rendered restock offer
+      // and a plain "SÍ" would accept it; the search payload says available
+      // here so this test keeps isolating the checkStock proactive gate.
       const { w, prepare, second } = await proactive(
         { ...oos, variants: [variant] },
         [say('El producto está agotado.')],
-        variantItem,
+        {
+          ...variantItem,
+          variants: [
+            { ...variant, stock: { status: 'available', quantity: 3 } },
+          ],
+        },
       );
       expect(second).toEqual({
         kind: 'handled',
