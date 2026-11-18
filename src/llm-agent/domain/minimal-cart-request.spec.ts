@@ -2,9 +2,11 @@ import { groundCartQuantity } from './minimal-cart-quantity';
 import {
   addRequestForm,
   conversationalAddForm,
+  countOutsidePresentations,
   mentionsPhrase,
   nameCoverage,
   offersCartAdd,
+  presentationMentions,
   presentationPickForm,
   statedUnitCount,
 } from './minimal-cart-request';
@@ -180,5 +182,93 @@ describe('a presentation number is never the cited count (retest S5)', () => {
       kind: 'ready',
       intent: { productId: 'p', operation: 'add', quantity: 2 },
     });
+  });
+});
+
+describe('presentationMentions (presentation pick grounding S2)', () => {
+  const WHISKAS = ['Sobre 85 g', 'Caja 12 sobres'];
+  const named = (text: string, labels: string[], short = true) =>
+    presentationMentions(text, labels, short).map(({ index }) => labels[index]);
+
+  it.each([
+    ['quisiera whiskas, la caja de 12 sobres por favor.', 'Caja 12 sobres'],
+    ['Quisiera la caja de 12 sobres de whiskas', 'Caja 12 sobres'],
+    ['una CAJA de 12 SOBRES', 'Caja 12 sobres'],
+    ['el sobre de 85 gramos', 'Sobre 85 g'],
+    ['el sobre de 85 gr', 'Sobre 85 g'],
+    ['la de 12', 'Caja 12 sobres'],
+    ['el sobre', 'Sobre 85 g'],
+    ['la caja', 'Caja 12 sobres'],
+  ])('"%s" names %s', (text, label) => {
+    expect(named(text, WHISKAS)).toEqual([label]);
+  });
+
+  it.each([
+    ['la de 2 kilos', ['2 kg', '8 kg', '20 kg'], '2 kg'],
+    ['el de 20 kilogramos', ['2 kg', '8 kg', '20 kg'], '20 kg'],
+    ['la de 7 piezas', ['7 piezas', '14 piezas'], '7 piezas'],
+    ['la de 7 pzas', ['7 piezas', '14 piezas'], '7 piezas'],
+  ])('"%s" names one of %j', (text, labels, label) => {
+    expect(named(text, labels)).toEqual([label]);
+  });
+
+  it('two presentations matching a short reference stay ambiguous', () => {
+    expect(
+      named('la de 12', ['Caja 12 sobres', 'Paquete 12 latas']),
+    ).toHaveLength(2);
+  });
+
+  it.each(['quiero el de whiskas', 'quiero whiskas', 'quiero 12'])(
+    '"%s" names no presentation',
+    (text) => {
+      expect(named(text, WHISKAS)).toEqual([]);
+    },
+  );
+
+  it('short references only when asked (the bot listing uses full labels)', () => {
+    expect(named('la de 12', WHISKAS, false)).toEqual([]);
+  });
+});
+
+describe('countOutsidePresentations', () => {
+  const WHISKAS = ['Sobre 85 g', 'Caja 12 sobres'];
+  it.each([
+    ['quiero 2 cajas de 12 sobres', WHISKAS, 2],
+    ['dos cajas de 12 sobres', WHISKAS, 2],
+    ['quiero 2 bolsas de 8 kg', ['2 kg', '8 kg'], 2],
+    ['dos bolsas de 2 kg', ['2 kg', '8 kg'], 2],
+  ])('"%s" → %d', (text, labels, value) => {
+    expect(countOutsidePresentations(text, labels)).toEqual({
+      status: 'ok',
+      value,
+    });
+  });
+
+  it.each([
+    ['la de 12', WHISKAS],
+    ['quisiera whiskas, la caja de 12 sobres por favor.', WHISKAS],
+    ['el sobre de 85 gramos', WHISKAS],
+    ['quiero 12 sobres', WHISKAS],
+  ])('"%s" states no count', (text, labels) => {
+    expect(countOutsidePresentations(text, labels)).toEqual({ status: 'none' });
+  });
+});
+
+describe('presentationPickForm with natural wordings', () => {
+  it.each([
+    ['quisiera whiskas, la caja de 12 sobres por favor.', 'Caja 12 sobres'],
+    ['quiero el sobre de 85 gramos', 'Sobre 85 g'],
+    ['quiero la de 12', 'Caja 12 sobres'],
+  ])('"%s" is a one-unit pick of %s', (text, label) => {
+    expect(presentationPickForm(text, label, null)).toBe('singular');
+  });
+
+  it.each([
+    ['quiero las cajas de 12 sobres', 'Caja 12 sobres'],
+    ['quiero cajas de 12 sobres', 'Caja 12 sobres'],
+    ['¿la caja de 12 sobres cuánto cuesta?', 'Caja 12 sobres'],
+    ['no quiero la caja de 12 sobres', 'Caja 12 sobres'],
+  ])('"%s" is not a one-unit pick', (text, label) => {
+    expect(presentationPickForm(text, label, null)).toBeNull();
   });
 });

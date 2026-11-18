@@ -1301,14 +1301,17 @@ describe('Minimal cart singular "otra unidad" add phrasing (S4)', () => {
   );
 });
 
-// Retest 2026-11-18 S5 (N14): the countless pick adds the default ONE unit
-// (`one`); a model-guessed count or the presentation number (500) is never
-// adopted: the count is asked and nothing is written (`ask`).
+// Retest 2026-11-18 S5 (N14) + presentation-pick-grounding S2: the countless
+// pick adds the default ONE unit (`one`), also when the model cites the
+// presentation's own number (500); that number is never adopted. A
+// model-guessed count is not adopted either: the count is asked (`ask`).
 describe('reported presentation-only confirmation after the full cart sequence', () => {
   it.each([
     ['adjustCartItem', { delta: 1, quantityText: '500mg' }, 'one'],
     ['adjustCartItem', { delta: 1, quantityText: null }, 'one'],
-    ['adjustCartItem', { delta: 500, quantityText: '500mg' }, 'ask'],
+    // odd/tasks/presentation-pick-grounding.md S2: the presentation's own
+    // number proposed as the count, with no count said, is a one-unit pick.
+    ['adjustCartItem', { delta: 500, quantityText: '500mg' }, 'one'],
     ['adjustCartItem', { delta: 2, quantityText: null }, 'ask'],
     ['setCartItem', { quantity: 0, quantityText: null }, 'ask'],
   ])(
