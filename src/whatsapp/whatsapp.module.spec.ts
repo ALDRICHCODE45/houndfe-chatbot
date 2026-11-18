@@ -23,6 +23,12 @@ import { PostgresReceiptOutboxStore } from '../receipt-media/infrastructure/post
 import { ReceiptMediaIngestionWorker } from '../receipt-media/infrastructure/receipt-media-ingestion.worker';
 import { ReceiptMediaNotificationWorker } from '../receipt-media/infrastructure/receipt-media-notification.worker';
 import { ReceiptMediaModule } from '../receipt-media/receipt-media.module';
+import { PostgresReceiptMediaStore } from '../receipt-media/infrastructure/postgres-receipt-media.store';
+import { MinimalPaymentService } from '../llm-agent/application/minimal-payment.service';
+import {
+  RECEIPT_REVIEW_STATUS,
+  ReceiptReviewStatusRegistry,
+} from '../llm-agent/domain/receipt-review-status';
 import { bindRestockInboundEvidence } from '../human-decisions/domain/restock-inbound-evidence';
 import { RestockInboundCapture } from './application/restock-inbound-capture';
 import {
@@ -340,6 +346,19 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
         (dispatcher as unknown as { humanRequestDelivery?: unknown })
           .humanRequestDelivery,
       ).toBe(moduleRef.get(HumanRequestDeliveryService));
+    });
+  });
+
+  it('retest S3: wires the receipt-in-review read into the payment step (no module cycle)', async () => {
+    await withHostModule(RECEIPT_ENABLED_ENV, (moduleRef) => {
+      const registry = moduleRef.get(ReceiptReviewStatusRegistry);
+      const receipts = moduleRef.get<unknown>(RECEIPT_REVIEW_STATUS);
+      expect(receipts).toBeInstanceOf(PostgresReceiptMediaStore);
+      expect((registry as unknown as { port: unknown }).port).toBe(receipts);
+      const payment = moduleRef.get(MinimalPaymentService);
+      expect((payment as unknown as { receipts: unknown }).receipts).toBe(
+        registry,
+      );
     });
   });
 

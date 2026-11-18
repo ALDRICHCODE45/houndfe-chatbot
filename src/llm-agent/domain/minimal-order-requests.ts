@@ -55,6 +55,30 @@ const PAYMENT_QUESTION: readonly RegExp[] = [
   /^(?:pagar\s+)?(?:por|con)?\s*transferencia$/,
 ];
 
+/**
+ * Retest S3 (N19): the customer says they still owe part of the order or
+ * want to pay another amount («me faltó pagar el resto», «la diferencia»,
+ * «otro pago»). Such a message gets the bank details even while a receipt
+ * is in review.
+ */
+const PAY_MORE: readonly RegExp[] = [
+  /\b(?:el|lo)\s+(?:resto|restante|faltante)\b/,
+  /\blo\s+que\s+(?:me\s+|le\s+|te\s+)?falt\w*\b/,
+  /\bfalt\w*\s+(?:por\s+)?(?:pagar|depositar|transferir|abonar)\b/,
+  /\bla\s+diferencia\b/,
+  /\b(?:otro|segundo)\s+(?:pago|deposito|abono)\b/,
+  /\b(?:otra|segunda)\s+(?:transferencia|cantidad)\b/,
+  /\botro\s+monto\b/,
+  /\b(?:pagar|depositar|transferir|abonar)\s+(?:mas|lo\s+demas)\b/,
+  /\bcomplet\w*\s+(?:el|mi|su)\s+pago\b/,
+];
+
+export function isPayRemainderRequest(text: unknown): boolean {
+  if (typeof text !== 'string' || text.length > MAX_LENGTH) return false;
+  const rest = normalize(text);
+  return rest !== '' && PAY_MORE.some((pattern) => pattern.test(rest));
+}
+
 /** A payment-method or "how do I pay" message after an order exists. */
 export function isPaymentQuestion(text: unknown): boolean {
   if (typeof text !== 'string' || text.length > MAX_LENGTH) return false;

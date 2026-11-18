@@ -35,6 +35,7 @@ import type {
   ReceiptOutcomeStore,
 } from '../domain/receipt-outcome';
 import { RECEIPT_SHA256_BYTES } from '../domain/receipt-media.types';
+import type { ReceiptReviewStatusPort } from '../../llm-agent/domain/receipt-review-status';
 
 type Row = Record<string, unknown>;
 type Media = ReceiptMediaRow;
@@ -446,6 +447,13 @@ const OUTCOME_DUE_SQL = `SELECT id, sender_id, backend_receipt_id, sale_folio,
   ORDER BY outcome_polled_at NULLS FIRST, attached_at, id
   LIMIT $1`;
 
+/** Retest S3: an attached receipt of this sender and sale without an outcome
+ * (served by the partial `receipt_media_outcome_due_idx`). */
+const RECEIPT_IN_REVIEW_SQL = `SELECT EXISTS (SELECT 1 FROM receipt_media
+  WHERE status = 'ATTACHED' AND outcome_notified_at IS NULL
+    AND outcome_status IS NULL
+    AND sender_id = $1 AND captured_sale_id = $2::uuid) AS in_review`;
+
 const OUTCOME_POLLED_SQL = `UPDATE receipt_media SET outcome_polled_at = now(),
     updated_at = now()
   WHERE id = $1 AND status = 'ATTACHED' AND outcome_notified_at IS NULL`;
@@ -495,7 +503,7 @@ const isOutcomeCommit = (input: ReceiptOutcomeCommitInput): boolean => {
 };
 
 export class PostgresReceiptMediaStore
-  implements ReceiptMediaStorePort, ReceiptOutcomeStore
+  implements ReceiptMediaStorePort, ReceiptOutcomeStore, ReceiptReviewStatusPort
 {
   private readonly logger = new Logger(PostgresReceiptMediaStore.name);
 
@@ -1205,6 +1213,19 @@ export class PostgresReceiptMediaStore
       attachedAt: r.attached_at as Date,
       outcomePolledAt: (r.outcome_polled_at as Date | null) ?? null,
     }));
+  }
+
+  /** Retest S3 (N19): the sender's receipt for this sale is attached to the
+   * backend sale and still waits for its human outcome (none recorded). A
+   * malformed sale id is `false`; a database failure throws. */
+  async hasReceiptInReview(senderId: string, saleId: string): Promise<boolean> {
+    if (typeof senderId !== 'string' || senderId === '') return false;
+    if (typeof saleId !== 'string' || !UUID.test(saleId)) return false;
+    const { rows } = await this.pool.query<{ in_review: boolean }>(
+      RECEIPT_IN_REVIEW_SQL,
+      [senderId, saleId],
+    );
+    return rows[0]?.in_review === true;
   }
 
   /** R5: stamps a PENDING (or failed) outcome read for the backoff. */

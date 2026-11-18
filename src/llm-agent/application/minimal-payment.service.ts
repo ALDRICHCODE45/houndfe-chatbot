@@ -17,6 +17,11 @@ import {
   paymentMethodButtons,
   type CustomerReplyInteractive,
 } from '../domain/customer-reply';
+import { isPayRemainderRequest } from '../domain/minimal-order-requests';
+import {
+  ReceiptReviewStatusRegistry,
+  type ReceiptReviewStatusPort,
+} from '../domain/receipt-review-status';
 import {
   parseMinimalCart,
   type MinimalCartState,
@@ -36,6 +41,14 @@ export const MINIMAL_PAYMENT_ALREADY_PAID_REPLY = 'Su pedido ya está pagado.';
  */
 export const MINIMAL_PAYMENT_NEW_ORDER_REPLY =
   'Su pedido anterior ya está pagado. Los datos de pago de su nuevo pedido se los comparto en cuanto lo confirme.';
+/**
+ * Retest S3 (N19): the placed order already has a receipt in review. No bank
+ * details (a second transfer is the risk) and no team request.
+ */
+export function minimalReceiptInReviewReply(folio: string | null): string {
+  const order = folio === null ? 'del pedido' : `del pedido ${folio}`;
+  return `Ya recibimos su comprobante ${order} y lo estamos revisando; no hace falta que vuelva a pagar. Le aviso en cuanto quede confirmado.`;
+}
 export const MINIMAL_PAYMENT_UNAVAILABLE_REPLY =
   'No pude obtener los datos en este momento; ya le avisé al equipo y se los comparto en cuanto estén.';
 
@@ -93,6 +106,10 @@ export class MinimalPaymentService {
     @Optional()
     @Inject(HumanRequestCreateService)
     private readonly team?: Pick<HumanRequestCreateService, 'askTeam'>,
+    // Retest S3: a receipt already in review withholds the bank details.
+    @Optional()
+    @Inject(ReceiptReviewStatusRegistry)
+    private readonly receipts?: ReceiptReviewStatusPort,
   ) {}
 
   /** The sender's last placed order, or `null`. */
@@ -125,20 +142,44 @@ export class MinimalPaymentService {
   }
 
   /**
+   * Retest S3: the in-review reply when the sender's unpaid placed order has
+   * a receipt waiting for review; `null` otherwise (no placed order, paid,
+   * no receipt in review, or the receipt state could not be read).
+   */
+  async receiptInReviewReply(
+    senderId: string,
+  ): Promise<MinimalPaymentReply | null> {
+    const sale = (await this.read(senderId))?.cart.placedSale;
+    if (sale === undefined || sale.paid === true) return null;
+    return (await this.receiptInReview(senderId, sale))
+      ? { reply: minimalReceiptInReviewReply(sale.folio) }
+      : null;
+  }
+
+  /**
    * Bank details for the sender's placed order (`null`: no placed order).
    * A paid order answers that it is paid: no details, marker or request.
+   * A receipt already in review answers that it is being reviewed (S3),
+   * unless `customerText` says the customer must pay the rest or another
+   * amount.
    * A failed read tells the customer the team was notified, persists the
    * marker and creates ONE request per sale; a later success clears it.
    */
   async paymentDetails(
     senderId: string,
     trigger: MinimalPaymentTrigger = {},
+    customerText?: string,
   ): Promise<MinimalPaymentReply | null> {
     const read = await this.read(senderId);
     const sale = read?.cart.placedSale;
     if (sale === undefined) return null;
     if (sale.paid === true)
       return { reply: MINIMAL_PAYMENT_ALREADY_PAID_REPLY };
+    if (
+      !isPayRemainderRequest(customerText) &&
+      (await this.receiptInReview(senderId, sale))
+    )
+      return { reply: minimalReceiptInReviewReply(sale.folio) };
     let detail: PaymentDetail;
     try {
       detail = await this.api.getPaymentDetails();
@@ -199,6 +240,22 @@ export class MinimalPaymentService {
       await this.setMarker(senderId, sale.saleId, false);
     }
     return reply;
+  }
+
+  /** Fails open: an unreadable receipt state never withholds the details. */
+  private async receiptInReview(
+    senderId: string,
+    sale: PlacedSale,
+  ): Promise<boolean> {
+    if (this.receipts === undefined) return false;
+    try {
+      return (
+        (await this.receipts.hasReceiptInReview(senderId, sale.saleId)) === true
+      );
+    } catch {
+      this.logger.warn('receipt review status unavailable');
+      return false;
+    }
   }
 
   private async read(senderId: string) {

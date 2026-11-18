@@ -325,7 +325,8 @@ export class MinimalShippingService {
   /**
    * Record store pickup (S4) for the verified cart under one cart CAS. Needs
    * no delivery data or backend quote and replaces any stored quote; a cart
-   * change drops it like a quote.
+   * change drops it like a quote. Pickup dismisses a delivery-data summary
+   * still waiting for SÍ (retest S2): the order summary is the next question.
    */
   async chooseStorePickup(senderId: string): Promise<MinimalPickupResult> {
     const refused = (
@@ -352,7 +353,9 @@ export class MinimalShippingService {
         structuredClone({ ...stored, shipping: pickup }),
         new Date(this.now()).toISOString(),
       );
-      return committed ? { kind: 'pickup' } : refused('cart_changed');
+      if (!committed) return refused('cart_changed');
+      this.checkout.dismissPendingConfirmation(senderId);
+      return { kind: 'pickup' };
     } catch {
       return refused('cart_unverified');
     }

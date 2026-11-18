@@ -103,6 +103,13 @@ export class DurableCheckoutConfirmation {
     this.gates.touch(senderId);
   }
 
+  /** Drops the pending offer (durably) without answering it. */
+  dismissPending(senderId: string): void {
+    if (this.confirmation.exportPending(senderId) === null) return;
+    this.confirmation.dismissPending(senderId);
+    this.gates.touch(senderId);
+  }
+
   confirmedDraft(
     senderId: string,
     rawDraft: unknown,

@@ -40,6 +40,7 @@ import { MinimalCartService } from './application/minimal-cart.service';
 import { MinimalCheckoutService } from './application/minimal-checkout.service';
 import { MinimalOrderService } from './application/minimal-order.service';
 import { MinimalPaymentService } from './application/minimal-payment.service';
+import { ReceiptReviewStatusRegistry } from './domain/receipt-review-status';
 import { MinimalShippingService } from './application/minimal-shipping.service';
 import { DeliveryZonesModule } from '../delivery-zones/delivery-zones.module';
 import { DeliveryZoneResumeRegistry } from '../delivery-zones/domain/delivery-zone-resume';
@@ -149,6 +150,9 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
     MinimalOrderService,
     // Payment step after an order: bank details on demand.
     MinimalPaymentService,
+    // Retest S3: "receipt in review" read, registered late by WhatsappModule
+    // (the receipt-media module is never imported here).
+    ReceiptReviewStatusRegistry,
     {
       // Always on: backend-signed quotes back every delivery order (S9).
       provide: MinimalShippingService,
@@ -255,6 +259,7 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
     MinimalCatalogAgentService,
     MinimalRestockRequestService,
     MinimalExpirationRequestService,
+    ReceiptReviewStatusRegistry,
   ],
 })
 export class LlmAgentModule {}

@@ -38,6 +38,7 @@ import {
 } from './domain/receipt-extraction.port';
 import { ReceiptIngestionProcessor } from './application/receipt-ingestion.processor';
 import { ReceiptIngressService } from './application/receipt-ingress.service';
+import { RECEIPT_REVIEW_STATUS } from '../llm-agent/domain/receipt-review-status';
 import { META_MEDIA } from './domain/meta-media.port';
 import type { ReceiptMediaRow } from './domain/receipt-media.types';
 import { MetaMediaClient } from './infrastructure/meta-media.client';
@@ -536,7 +537,11 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
       LlmCoreModule,
     ])
       expect(meta('imports')).toContain(required);
-    expect(meta('exports')).toEqual([ReceiptIngressService, RECEIPT_TELEMETRY]);
+    expect(meta('exports')).toEqual([
+      ReceiptIngressService,
+      RECEIPT_TELEMETRY,
+      RECEIPT_REVIEW_STATUS,
+    ]);
   });
 
   it('registers neither receipt worker nor the receipt outbox composition', async () => {

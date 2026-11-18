@@ -85,6 +85,7 @@ import {
   MINIMAL_PAYMENT_QUESTION,
   MINIMAL_PAYMENT_UNAVAILABLE_REPLY,
   minimalPaymentInstructions,
+  minimalReceiptInReviewReply,
 } from './minimal-payment.service';
 import {
   MINIMAL_RESTOCK_AMBIGUOUS_REPLY,
@@ -249,6 +250,8 @@ const REPLIES: Record<string, string> = {
   MINIMAL_PAYMENT_BUTTONS_PROMPT,
   MINIMAL_PAYMENT_UNAVAILABLE_REPLY,
   MINIMAL_PAYMENT_NEW_ORDER_REPLY,
+  receiptInReview: minimalReceiptInReviewReply('A-12'),
+  receiptInReviewNoFolio: minimalReceiptInReviewReply(null),
   ...Object.fromEntries(
     Object.entries(MINIMAL_ORDER_INELIGIBLE_REPLIES).map(([k, v]) => [
       `ineligible_${k}`,

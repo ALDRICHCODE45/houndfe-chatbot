@@ -42,6 +42,7 @@ import {
   type GenerateTextFn,
 } from '../llm-agent/infrastructure/generate-text.provider';
 import { LlmCoreModule } from '../llm-agent/infrastructure/llm-core.module';
+import { RECEIPT_REVIEW_STATUS } from '../llm-agent/domain/receipt-review-status';
 import { WHATSAPP_SENDER } from '../whatsapp/domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../whatsapp/domain/whatsapp-sender.port';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
@@ -273,6 +274,12 @@ class ReceiptOutcomeLifecycle
       inject: [PG_POOL],
     },
     {
+      // Retest S3 (N19): read-only "receipt in review" for the payment step;
+      // registered into the LLM agent's late-bound registry by WhatsappModule.
+      provide: RECEIPT_REVIEW_STATUS,
+      useExisting: PostgresReceiptMediaStore,
+    },
+    {
       provide: META_MEDIA,
       useFactory: (config: ConfigService): MetaMediaPort =>
         createMetaMediaClient(config),
@@ -359,6 +366,6 @@ class ReceiptOutcomeLifecycle
       inject: [ConfigService],
     },
   ],
-  exports: [ReceiptIngressService, RECEIPT_TELEMETRY],
+  exports: [ReceiptIngressService, RECEIPT_TELEMETRY, RECEIPT_REVIEW_STATUS],
 })
 export class ReceiptMediaModule {}

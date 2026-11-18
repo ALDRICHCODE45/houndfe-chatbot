@@ -169,6 +169,48 @@ ddescribe('R5 receipt outcome store (Testcontainers)', () => {
     await expect(store.listOutcomeDue(10, POLICY)).resolves.toHaveLength(2);
   });
 
+  it('retest S3: an attached receipt without outcome is in review for its sender and sale only', async () => {
+    const { sender } = await attached();
+    await expect(store.hasReceiptInReview(sender, SALE)).resolves.toBe(true);
+    await expect(
+      store.hasReceiptInReview(sender, '33333333-3333-4333-8333-333333333333'),
+    ).resolves.toBe(false);
+    await expect(store.hasReceiptInReview('5210000000001', SALE)).resolves.toBe(
+      false,
+    );
+    await expect(store.hasReceiptInReview(sender, 'not-a-uuid')).resolves.toBe(
+      false,
+    );
+  });
+
+  it('retest S3: a receipt still being processed (not attached) is not in review', async () => {
+    await store.admit({
+      id: randomUUID(),
+      webhookMessageId: `wamid.${randomUUID()}`,
+      providerMediaId: `media-${randomUUID()}`,
+      senderId: '5210000000002',
+      capturedSaleId: SALE,
+      declaredMimeType: 'image/jpeg',
+    });
+    await expect(store.hasReceiptInReview('5210000000002', SALE)).resolves.toBe(
+      false,
+    );
+  });
+
+  it.each([
+    ['REJECTED', 'RECEIPT_PAYMENT_REJECTED', 'Ilegible'],
+    ['CONFIRMED', 'RECEIPT_PAYMENT_CONFIRMED', null],
+  ] as const)(
+    'retest S3: after a %s outcome the receipt is no longer in review',
+    async (status, templateKey, customerReason) => {
+      const { id, sender } = await attached();
+      await store.commitOutcome(
+        commit(id, { status, templateKey, customerReason, templateArgs: {} }),
+      );
+      await expect(store.hasReceiptInReview(sender, SALE)).resolves.toBe(false);
+    },
+  );
+
   it('records the outcome and queues the text exactly once', async () => {
     const { id, sender } = await attached();
     const first = await store.commitOutcome(commit(id));

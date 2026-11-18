@@ -94,9 +94,16 @@ import { PAYMENT_METHODS, matchPaymentMethod } from '../domain/payment-methods';
 import {
   isOrderSummaryRequest,
   isPaymentQuestion,
+  isPayRemainderRequest,
 } from '../domain/minimal-order-requests';
-import { MINIMAL_ORDER_SUMMARY_HEADING } from '../domain/minimal-order-confirmation';
-import { MINIMAL_CHECKOUT_SUMMARY_HEADING } from '../domain/minimal-checkout-confirmation';
+import {
+  MINIMAL_ORDER_CONFIRMATION_TTL_MS,
+  MINIMAL_ORDER_SUMMARY_HEADING,
+} from '../domain/minimal-order-confirmation';
+import {
+  MINIMAL_CHECKOUT_CONFIRMATION_TTL_MS,
+  MINIMAL_CHECKOUT_SUMMARY_HEADING,
+} from '../domain/minimal-checkout-confirmation';
 import {
   GENERATE_TEXT,
   type GenerateTextFn,
@@ -1148,7 +1155,13 @@ export class MinimalCatalogAgentService {
         if (answered !== null) return answered;
       }
       if (this.checkoutAvailable()) {
-        let delivery = await this.checkout!.consume(input);
+        // Retest S2 (N17): an order summary presented after the pending
+        // delivery-data summary is the current question; its SÍ / ✅
+        // Confirmar pedido is never answered by the older delivery-data
+        // summary (only that summary's own button is).
+        let delivery = this.orderSupersedesCheckout(input)
+          ? null
+          : await this.checkout!.consume(input);
         if (delivery !== null) this.order?.dismiss(input.senderId);
         // F1: confirmed delivery data continue straight to the order summary.
         if (delivery?.confirmed === true && this.orderAvailable())
@@ -1195,6 +1208,30 @@ export class MinimalCatalogAgentService {
       }
       return this.decision(await this.runTurn(input, pick));
     }
+  }
+
+  /**
+   * Retest S2: both summaries pending and the order summary is the newer one
+   * (each gate's expiry is its presentation time plus its TTL). A tie keeps
+   * the delivery-data summary first, as before.
+   */
+  private orderSupersedesCheckout(input: {
+    senderId: string;
+    interactiveReplyId?: string;
+  }): boolean {
+    if (
+      !this.orderAvailable() ||
+      parseInteractiveReplyId(input.interactiveReplyId)?.kind ===
+        'checkout_confirm'
+    )
+      return false;
+    const order = this.order!.offerStatus(input.senderId);
+    const checkout = this.checkout!.confirmationStatus(input.senderId);
+    if (order === null || checkout?.stage !== 'pending') return false;
+    return (
+      order.expiresAt - MINIMAL_ORDER_CONFIRMATION_TTL_MS >
+      checkout.expiresAt - MINIMAL_CHECKOUT_CONFIRMATION_TTL_MS
+    );
   }
 
   private decision(
@@ -1523,6 +1560,18 @@ export class MinimalCatalogAgentService {
       // summary for the new order stays untouched.
       return answer({ reply: MINIMAL_PAYMENT_NEW_ORDER_REPLY });
     }
+    // Retest S3 (N19): a receipt for the unpaid placed order is in review;
+    // a payment question gets the in-review text, never the details again
+    // (paying the rest / another amount still gets them).
+    if (
+      paymentAsked &&
+      placed !== null &&
+      placed.paid !== true &&
+      !isPayRemainderRequest(text)
+    ) {
+      const inReview = await this.payment?.receiptInReviewReply(senderId);
+      if (inReview !== undefined && inReview !== null) return answer(inReview);
+    }
     if (!summaryAsked) return null;
     // Without a pending summary or a placed order the model keeps the turn.
     if (!pendingSummary && placed === null) return null;
@@ -1577,6 +1626,7 @@ export class MinimalCatalogAgentService {
     const result = await payment.paymentDetails(
       senderId,
       this.paymentTrigger(input),
+      input.text,
     );
     if (result === null) return null;
     const reply = applyCustomerStyle(
@@ -2743,7 +2793,12 @@ export class MinimalCatalogAgentService {
 
   /** One payment-details answer per run; the reply is application-owned. */
   private paymentTools(
-    input: { senderId: string; inboundEvent?: unknown; inboundAt?: string },
+    input: {
+      senderId: string;
+      text: string;
+      inboundEvent?: unknown;
+      inboundAt?: string;
+    },
     run: PaymentRun | null,
     traceId: string,
   ): ToolSet {
@@ -2762,6 +2817,7 @@ export class MinimalCatalogAgentService {
           const result = await payment.paymentDetails(
             input.senderId,
             this.paymentTrigger(input),
+            input.text,
           );
           if (result === null) return toolError('no_placed_order');
           run.value = result;

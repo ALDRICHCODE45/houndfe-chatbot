@@ -314,6 +314,11 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['Su PDF está protegido', 'Tu PDF está protegido'],
   ['¿Nos envía una captura', '¿Nos envías una captura'],
   ['Confirmamos su pago', 'Confirmamos tu pago'],
+  // Retest S3 (N19): payment request while a receipt is in review.
+  [
+    'no hace falta que vuelva a pagar. Le aviso en cuanto quede confirmado.',
+    'no hace falta que vuelvas a pagar. Te aviso en cuanto quede confirmado.',
+  ],
   ['Gracias por su compra', 'Gracias por tu compra'],
   // Third-person verbs that read as usted markers in the tú copy.
   ['en cuanto se confirme.', 'en cuanto quede confirmado.'],
