@@ -77,6 +77,16 @@ describe('receipt notices in the stored customer style (S1)', () => {
     expect(text).toBe(renderNotificationText(intent()));
   });
 
+  it('follow-ups S7: the expired-hold text in tú', () => {
+    const row = intent({
+      templateKey: 'RECEIPT_SALE_NOT_PAYABLE',
+      templateArgs: { folio: 'F-1', payInStoreHold: true },
+    });
+    expect(renderNotificationText(row, TU)).toBe(
+      'Tu pedido F-1 se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante. Si todavía lo quieres, con gusto te ayudo a pedirlo de nuevo.',
+    );
+  });
+
   it('never rewrites the backend rejection reason', () => {
     const row = intent({
       templateKey: 'RECEIPT_PAYMENT_REJECTED',

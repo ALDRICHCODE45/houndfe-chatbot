@@ -48,6 +48,10 @@ const placedSaleSchema = z.strictObject({
     .strictObject({
       checkoutKey: z.uuid(),
       location: CheckoutPickupLocationSchema.nullable(),
+      // Follow-ups S7: the customer held the order to pay in store (the
+      // PATCH payment-intent succeeded). A later receipt refused with
+      // SALE_NOT_PAYABLE then explains the hold expiry. Absent: not held.
+      held: z.literal(true).optional(),
     })
     .optional(),
 });

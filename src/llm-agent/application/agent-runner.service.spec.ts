@@ -357,6 +357,113 @@ describe('AgentRunner', () => {
       expect(store.commitAgentTurn).not.toHaveBeenCalled();
     });
 
+    describe('follow-ups S2: ops resume with the budget spent', () => {
+      const spentRunner = () => {
+        const spent = new CostGuardService({
+          store: new InMemoryLlmSpendStore(),
+          dailyBudgetUsd: 1,
+        });
+        jest.spyOn(spent, 'llmAllowed').mockResolvedValue(false);
+        return AgentRunner.forTest(store, llm, tools, spent, {
+          systemPrompt: SYSTEM_PROMPT,
+          historyTurns: 4,
+          idleTimeoutMs: TEN_MIN_MS,
+        });
+      };
+
+      it('relays the staff answer verbatim under the team prefix, with no LLM call', async () => {
+        store.get.mockResolvedValue(null);
+        await expect(
+          spentRunner().handle({
+            senderId: 's',
+            text: '[Resolución del agente humano (HF-abc)] …',
+            staffAnswer: '  Sí, le llega el jueves 😊  ',
+          }),
+        ).resolves.toEqual({
+          reply:
+            'Le comparto la respuesta del equipo:\nSí, le llega el jueves 😊',
+        });
+        expect(llm.run).not.toHaveBeenCalled();
+        expect(store.commitAgentTurn).not.toHaveBeenCalled();
+      });
+
+      it('styles only the prefix for a tú customer (the staff text is never restyled)', async () => {
+        store.get.mockResolvedValue(null);
+        await expect(
+          spentRunner().handle({
+            senderId: 's',
+            text: 'x',
+            staffAnswer: 'Su pedido sale hoy.',
+            style: { register: 'tu', emojis: false, tone: 'neutral' },
+          }),
+        ).resolves.toEqual({
+          reply: 'Te comparto la respuesta del equipo:\nSu pedido sale hoy.',
+        });
+      });
+
+      it.each([
+        'YES_RESTOCK_IN_X_DAYS:3',
+        'NO_RESTOCK',
+        'APPROVED_PROMO: 1000',
+        'no_restock',
+        'Gracias. YES_RESTOCK_IN_X_DAYS:3',
+        'expiration: vence el 20',
+      ])(
+        'never relays a structured staff keyword (%p) to the customer; keeps the budget reply',
+        async (keyword) => {
+          store.get.mockResolvedValue(null);
+          await expect(
+            spentRunner().handle({
+              senderId: 's',
+              text: 'x',
+              staffAnswer: keyword,
+            }),
+          ).resolves.toEqual({ reply: LLM_BUDGET_EXHAUSTED_REPLY });
+          expect(llm.run).not.toHaveBeenCalled();
+        },
+      );
+
+      it.each(['OK', 'NO: ya no hay', 'LISTO'])(
+        'relays a short free staff answer (%p) the bot does not read as a decision',
+        async (answer) => {
+          store.get.mockResolvedValue(null);
+          await expect(
+            spentRunner().handle({
+              senderId: 's',
+              text: 'x',
+              staffAnswer: answer,
+            }),
+          ).resolves.toEqual({
+            reply: `Le comparto la respuesta del equipo:\n${answer}`,
+          });
+        },
+      );
+
+      it('keeps the budget reply when there is no staff text to relay', async () => {
+        store.get.mockResolvedValue(null);
+        await expect(
+          spentRunner().handle({ senderId: 's', text: 'x', staffAnswer: '  ' }),
+        ).resolves.toEqual({ reply: LLM_BUDGET_EXHAUSTED_REPLY });
+      });
+
+      it('budget available: the staff answer is ignored and the model phrases the reply', async () => {
+        store.get.mockResolvedValue(null);
+        llm.run.mockResolvedValue({
+          reply: 'Claro, llega el jueves.',
+          messages: [],
+          usage: { promptTokens: 1, completionTokens: 1 },
+        });
+        await expect(
+          runner.handle({
+            senderId: 's',
+            text: 'x',
+            staffAnswer: 'Sí, el jueves.',
+          }),
+        ).resolves.toEqual({ reply: 'Claro, llega el jueves.' });
+        expect(llm.run).toHaveBeenCalledTimes(1);
+      });
+    });
+
     it('books the ops resume run under its own source', async () => {
       store.get.mockResolvedValue(null);
       llm.run.mockResolvedValue({

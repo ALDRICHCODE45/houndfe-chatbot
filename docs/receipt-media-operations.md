@@ -206,15 +206,28 @@ as multipart to `POST /chatbot-api/sales/:saleId/receipts` with
 `docs/contracts/transfer-receipts.md`). The upload has a 90 s HTTP timeout and
 the worker renews its 60 s lease while it runs.
 
-| Backend answer                                                                                                                                   | Durable result                                                                  | Customer message                                                        |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| 201                                                                                                                                              | `ATTACHED`                                                                      | received + in review, with the folio (and the amount mismatch sentence) |
-| 409 `SALE_ALREADY_PAID`                                                                                                                          | `FAILED` / `ATTACH_DEFINITE`                                                    | the order is already paid                                               |
-| 409 `SALE_NOT_PAYABLE`                                                                                                                           | `FAILED` / `ATTACH_DEFINITE`                                                    | the order no longer accepts payments                                    |
-| 413 / 415                                                                                                                                        | `FAILED` / `ATTACH_DEFINITE`                                                    | send a JPEG, PNG or PDF under 10 MB                                     |
-| other 400/404/409/422                                                                                                                            | `FAILED` / `ATTACH_DEFINITE`                                                    | generic "write to us"                                                   |
-| timeout, network, 5xx (incl. 502 `RECEIPT_STORAGE_FAILED`), invalid 201, 429 (rate limit), 401/403 (credential or scope, fixable by an operator) | stays `DOWNLOADED`, retried                                                     | "registering" message, once                                             |
-| 201 whose `receiptId` is not a UUID                                                                                                              | `ATTACH_OUTCOME_UNKNOWN` (`RECEIPT_ID_INVALID`), terminal, logged by shape only | "registering" message, once                                             |
+| Backend answer                                                                                                                                   | Durable result                                                                  | Customer message                                                         |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| 201                                                                                                                                              | `ATTACHED`                                                                      | received + in review, with the folio (and the amount mismatch sentence)  |
+| 409 `SALE_ALREADY_PAID`                                                                                                                          | `FAILED` / `ATTACH_DEFINITE`                                                    | the order is already paid                                                |
+| 409 `SALE_NOT_PAYABLE`                                                                                                                           | `FAILED` / `ATTACH_DEFINITE`                                                    | the order no longer accepts payments; for a pay-in-store hold, see below |
+| 413 / 415                                                                                                                                        | `FAILED` / `ATTACH_DEFINITE`                                                    | send a JPEG, PNG or PDF under 10 MB                                      |
+| other 400/404/409/422                                                                                                                            | `FAILED` / `ATTACH_DEFINITE`                                                    | generic "write to us"                                                    |
+| timeout, network, 5xx (incl. 502 `RECEIPT_STORAGE_FAILED`), invalid 201, 429 (rate limit), 401/403 (credential or scope, fixable by an operator) | stays `DOWNLOADED`, retried                                                     | "registering" message, once                                              |
+| 201 whose `receiptId` is not a UUID                                                                                                              | `ATTACH_OUTCOME_UNKNOWN` (`RECEIPT_ID_INVALID`), terminal, logged by shape only | "registering" message, once                                              |
+
+Receipt on an expired pay-in-store hold (odd/tasks/cost-and-pay-followups.md
+S7): the backend hold sweep cancels an unpaid held order (`HOLD_EXPIRED`) and a
+later receipt for it gets 409 `SALE_NOT_PAYABLE`. When the placed order was held
+by the customer's «Pagar en tienda» tap (`placedSale.pickup.held`, read as
+`PlacedOrder.payInStoreHold`), the refusal intent carries
+`templateArgs.payInStoreHold: true` and the customer gets «Su pedido {folio} se
+canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no
+pudimos aplicar este comprobante. Si todavía lo quiere, con gusto le ayudo a
+pedirlo de nuevo.» (tú styled; «Su pedido se canceló…» without a folio). Every
+other `SALE_NOT_PAYABLE` keeps the text above. The store accepts
+`payInStoreHold` only as `true` (any other value is fenced, like any invalid
+argument).
 
 An unknown outcome is safe to retry because the key is the media id: the
 backend returns the same receipt for the same key and file. The first attempt

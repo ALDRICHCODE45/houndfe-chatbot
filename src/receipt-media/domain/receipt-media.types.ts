@@ -133,8 +133,9 @@ export interface ReceiptMediaOutboxRow {
   sourceWebhookMessageId: string;
   recipientId: string;
   templateKey: ReceiptTemplateKey;
-  /** Bounded arguments: integer cents, the order folio, backend status. */
-  templateArgs: Record<string, number | string>;
+  /** Bounded arguments: integer cents, the order folio, backend status,
+   * and the follow-ups S7 `payInStoreHold: true` flag. */
+  templateArgs: Record<string, number | string | boolean>;
   status: ReceiptOutboxStatus;
   attempts: number;
   nextAttemptAt: Date;

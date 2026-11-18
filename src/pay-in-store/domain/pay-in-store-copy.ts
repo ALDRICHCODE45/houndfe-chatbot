@@ -82,7 +82,8 @@ export function payInStoreHeldReply(input: {
 }
 
 /**
- * sale.pickup_reminder: "hasta hoy a las {hora}". The reminder fires 3 h
+ * sale.pickup_reminder: "hasta hoy a las {hora}" ("a la 1:…" at 1 o'clock,
+ * follow-ups S5). The reminder fires 3 h
  * before the deadline, normally the same local day; a deadline on another
  * day says "mañana" / the date instead of a wrong "hoy".
  */
@@ -93,9 +94,10 @@ export function pickupReminderText(input: {
   now: Date;
 }): string {
   const day = formatDay(input.holdUntil, PAY_IN_STORE_TIME_ZONE, input.now);
-  const clock = formatClock(input.holdUntil, PAY_IN_STORE_TIME_ZONE);
+  // Follow-ups S5: «a la 1:00» (singular) / «a las 2:00».
+  const at = atTime(formatClock(input.holdUntil, PAY_IN_STORE_TIME_ZONE));
   return (
-    `${endSentence(`Le recordamos que ${order(input.folio)} está apartado hasta ${day} a las ${clock}`)} ` +
+    `${endSentence(`Le recordamos que ${order(input.folio)} está apartado hasta ${day} ${at}`)} ` +
     `Páselo a recoger y pagar en ${payInStoreStoreText(input.location)}.`
   );
 }

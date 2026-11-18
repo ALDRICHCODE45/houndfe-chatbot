@@ -422,12 +422,16 @@ const isUploadFence = (input: LeaseFenceInput): boolean =>
 const isCents = (value: unknown): boolean =>
   Number.isSafeInteger(value) && (value as number) >= 0;
 
-/** Exactly the three optional keys, each bounded. */
+/** Exactly the four optional keys, each bounded. Follow-ups S7:
+ * `payInStoreHold` is only `true`. */
 const isUploadTemplateArgs = (args: UploadTemplateArgs): boolean =>
   isRecord(args) &&
   Object.keys(args).every((k) =>
-    ['folio', 'extractedAmountCents', 'totalCents'].includes(k),
+    ['folio', 'extractedAmountCents', 'totalCents', 'payInStoreHold'].includes(
+      k,
+    ),
   ) &&
+  (args.payInStoreHold === undefined || args.payInStoreHold === true) &&
   (args.folio === undefined ||
     (typeof args.folio === 'string' &&
       args.folio.length > 0 &&

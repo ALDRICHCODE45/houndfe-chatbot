@@ -209,7 +209,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
   describe('R2/S9 receipt outcome messages', () => {
     const render = (
       templateKey: ReceiptMediaOutboxRow['templateKey'],
-      templateArgs: Record<string, number | string> = {},
+      templateArgs: ReceiptMediaOutboxRow['templateArgs'] = {},
     ) => renderNotificationText({ templateKey, templateArgs });
 
     it('says received and in review with the folio, without any amount prompt', () => {
@@ -244,6 +244,22 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
         'RECEIPT_SALE_NOT_PAYABLE',
         {},
         'Ese pedido ya no admite pagos; si cree que es un error, escríbanos.',
+      ],
+      [
+        'RECEIPT_SALE_NOT_PAYABLE',
+        { folio: 'F-0042' },
+        'Ese pedido ya no admite pagos; si cree que es un error, escríbanos.',
+      ],
+      // Follow-ups S7: the placed sale was a pay-in-store hold.
+      [
+        'RECEIPT_SALE_NOT_PAYABLE',
+        { folio: 'F-0042', payInStoreHold: true },
+        'Su pedido F-0042 se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante. Si todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.',
+      ],
+      [
+        'RECEIPT_SALE_NOT_PAYABLE',
+        { payInStoreHold: true },
+        'Su pedido se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante. Si todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.',
       ],
       [
         'RECEIPT_UNSUPPORTED_FORMAT',

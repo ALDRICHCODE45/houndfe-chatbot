@@ -12,6 +12,7 @@ import {
 import {
   HumanHandoffService,
   PENDING_HUMAN_REQUEST_REPLY,
+  staffAnswerText,
 } from '../../human-handoff/application/human-handoff.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../sale-flow/infrastructure/real-tool-registry';
 import { AgentRunner } from '../../llm-agent/application/agent-runner.service';
@@ -108,7 +109,9 @@ const WINDOW_REOPENING_MIRROR_TYPES: ReadonlySet<string> = new Set([
  *          (S7); otherwise inject the synthetic user turn into
  *          `AgentRunner.handle` with `senderId = customerId` (NOT the ops phone) so the customer's
  *          resume gets the right transcript context. The runner's reply
- *          is then sent to the customer (NOT the ops phone).
+ *          is then sent to the customer (NOT the ops phone). With the LLM
+ *          budget spent the runner relays the staff's own text (ref
+ *          stripped) under the styled team prefix (follow-ups S2).
  *        - `{ kind: 'no_pending', reply }` → reply to the ops phone with
  *          the ASK_FOR_REF message.
  *        - The hook `continue`s past the pending-marker short-circuit +
@@ -130,7 +133,10 @@ const WINDOW_REOPENING_MIRROR_TYPES: ReadonlySet<string> = new Set([
  *      otherwise it is a product photo (S5): download + vision describer,
  *      then a synthetic agent turn (caption + compact description), a
  *      label-photo request, a product-name request, or — for a receipt with
- *      no order — a customer reply asking for the product first.
+ *      no order — a customer reply asking for the product first. With no
+ *      placed sale the photo is admitted (budget + per-number limit) before
+ *      vision; with one it is not (follow-ups S3): a receipt, or a spent
+ *      budget, goes to receipt intake.
  *   5. `MinimalCatalogAgentService.tryHandle({ senderId, text })` — every
  *      customer turn runs through the minimal SDK route (no sender
  *      allowlist, no legacy fallback). `AgentRunner` is used only for the
@@ -148,6 +154,11 @@ const WINDOW_REOPENING_MIRROR_TYPES: ReadonlySet<string> = new Set([
  * Spec: `openspec/changes/human-handoff/specs/whatsapp-webhook/delta.md`.
  * Test: `webhook-dispatcher.service.spec.ts`.
  */
+/** R1-001: the cost-guard admission of a product photo (see admitPhotoTurn). */
+type PhotoAdmission =
+  | { kind: 'admitted' | 'ungated' }
+  | { kind: 'refused'; decision: MinimalCatalogAgentDecision };
+
 @Injectable()
 export class WebhookDispatcherService {
   private readonly logger = new Logger(WebhookDispatcherService.name);
@@ -317,9 +328,14 @@ export class WebhookDispatcherService {
             // (ADR-29) does NOT suppress this turn; the customer resumes
             // normally and the runner's reply is sent to the customer
             // (NOT the ops phone).
+            // Follow-ups S2: with the LLM budget spent the runner relays
+            // the staff's own text (ref stripped) under the team prefix in
+            // the customer's style, instead of the budget reply.
             const { reply } = await this.agentRunner.handle({
               senderId: result.customerId,
               text: result.syntheticUserText,
+              staffAnswer: staffAnswerText(message.text),
+              style: this.styleOf(result.customerId),
             });
             // Rule 2: a claim may have landed during the turn.
             if (await this.isHumanMode(result.customerId)) {
@@ -447,14 +463,29 @@ export class WebhookDispatcherService {
           // a refused photo gets the same reply/silence as a text turn and
           // never reaches vision. The admitted agent turn is not counted
           // again. Receipts of a placed sale (above) are never gated.
-          const admission = await this.admitPhotoTurn(message, media);
+          //
+          // Follow-ups S3: with a placed sale awaiting payment there is no
+          // photo admission. A captioned receipt must reach the receipt flow
+          // even from a limited sender or with the budget spent, and
+          // receipts never count toward the per-number limit. Vision stays
+          // budget-gated (a spent budget sends the photo to receipt intake,
+          // which uploads without extraction); a product photo runs the
+          // agent turn unadmitted, so the agent applies the limit once.
+          const admission: PhotoAdmission = awaitingPayment
+            ? { kind: 'ungated' }
+            : await this.admitPhotoTurn(message, media);
           if (admission.kind === 'refused') {
             await this.deliverCustomerDecision(message, admission.decision);
             continue;
           }
 
           const recognition = await this.recognizeProductImage(media);
-          if (recognition.kind === 'receipt' && awaitingPayment) {
+          if (
+            awaitingPayment &&
+            (recognition.kind === 'receipt' ||
+              (recognition.kind === 'unavailable' &&
+                recognition.reason === 'budget'))
+          ) {
             await this.admitReceipt(message, media);
             continue;
           }
@@ -788,6 +819,20 @@ export class WebhookDispatcherService {
     }
   }
 
+  /** Follow-ups S2: a customer's session style for a relay addressed to
+   * them from another sender (the ops phone). Never throws; usted default. */
+  private styleOf(customerId: string): CustomerStyle {
+    const agent = this
+      .minimalCatalogAgent as Partial<MinimalCatalogAgentService>;
+    if (typeof agent.customerStyle !== 'function')
+      return DEFAULT_CUSTOMER_STYLE;
+    try {
+      return agent.customerStyle(customerId);
+    } catch {
+      return DEFAULT_CUSTOMER_STYLE;
+    }
+  }
+
   /** S2: the sender's session style for a fixed media/handoff reply. Never
    * throws; without a readable style the copy stays in usted. */
   private customerStyle(message: InboundMessage): CustomerStyle {
@@ -869,10 +914,7 @@ export class WebhookDispatcherService {
   private async admitPhotoTurn(
     message: InboundMessage,
     media: InboundMedia,
-  ): Promise<
-    | { kind: 'admitted' | 'ungated' }
-    | { kind: 'refused'; decision: MinimalCatalogAgentDecision }
-  > {
+  ): Promise<PhotoAdmission> {
     if (this.productImage === undefined) return { kind: 'ungated' };
     const agent = this
       .minimalCatalogAgent as Partial<MinimalCatalogAgentService>;
