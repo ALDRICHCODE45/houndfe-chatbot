@@ -470,6 +470,25 @@ export type ScheduledConversationItem =
   | ScheduledReminderItem
   | ConversationRescheduledItem;
 
+// ------------------------------------------------------ sale items (pay in store)
+
+/** Pay in store (backend `feat/pay-in-store-hold`, contract
+ *  docs/chatbot-handoff/pay-in-store-hold-bot-contract.md): feed items that
+ *  belong to a sale, not to a request. */
+export const SALE_PICKUP_TYPES = [
+  'sale.pickup_reminder',
+  'sale.pickup_expired',
+  'sale.pickup_extended',
+] as const;
+export type SalePickupType = (typeof SALE_PICKUP_TYPES)[number];
+
+/** Sale items carry `requestId: null` and a `saleId`, so they are not a
+ *  request item: the parser surfaces every `sale.*` item as `unknown`
+ *  (never a rejected page) and the delivery service ACKs it STALE with no
+ *  customer message until the pay-in-store flow (S3) handles them. */
+export const isSalePickupType = (type: string): type is SalePickupType =>
+  (SALE_PICKUP_TYPES as readonly string[]).includes(type);
+
 /** A type this bot does not know (or a malformed known one): ACK or skip
  *  it by `deliveryId`, never crash. */
 export interface UnknownFeedItem {
@@ -1018,6 +1037,9 @@ export function parseFeedItem(item: unknown): FeedItem | null {
         raw: item,
       }
     );
+  // Every other type, sale.* included (pay in store: `requestId` null and a
+  // `saleId`), is unknown: ACKed STALE, never a rejected page. Only
+  // request.answered / request.cancelled below require a requestId.
   if (item.type !== 'request.answered' && item.type !== 'request.cancelled')
     return {
       type: 'unknown',

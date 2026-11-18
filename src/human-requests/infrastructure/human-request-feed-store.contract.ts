@@ -296,6 +296,40 @@ export function runHumanRequestFeedStoreContract(
       });
     });
 
+    it('stores a pay-in-store sale item (requestId null) once, keyed by deliveryId', async () => {
+      const raw = {
+        cursor: '000000002210',
+        deliveryId: 'sale-d1',
+        type: 'sale.pickup_reminder',
+        requestId: null,
+        saleId: '8c1d0000-1111-4222-8333-444455556666',
+        conversationRef: REF,
+        payload: { holdVersion: 1 },
+        notBefore: null,
+        expiresAt: null,
+      };
+      const item: FeedItem = {
+        type: 'unknown',
+        rawType: 'sale.pickup_reminder',
+        cursor: raw.cursor,
+        deliveryId: raw.deliveryId,
+        raw,
+      };
+      const first = await store.insertDelivery(item);
+      expect(first.inserted).toBe(true);
+      expect(first.row).toMatchObject({
+        type: 'sale.pickup_reminder',
+        requestId: null,
+        conversationRef: null,
+        messageId: null,
+        localState: 'RECEIVED',
+      });
+      expect(first.row.item).toEqual(item);
+      const again = await store.insertDelivery(item);
+      expect(again.inserted).toBe(false);
+      expect(again.duplicateOf).toBeUndefined();
+    });
+
     it.each([
       [startedItem('lv-s'), 'conversation.started', null],
       [staffMessageItem('lv-m'), 'conversation.staff_message', 'msg-lv-m'],

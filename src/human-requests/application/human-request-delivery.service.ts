@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { HumanRequestsClient } from '../../chatbot-api/domain/chatbot-api.client';
 import {
   isLiveConversationItem,
+  isSalePickupType,
   isScheduledConversationItem,
   normalizeDeliveryOutcome,
   type FeedItem,
@@ -901,6 +902,15 @@ export class HumanRequestDeliveryService {
         // Never log the raw item: it carries the customer's conversationRef.
         this.logger.warn(
           `feed item ${row.deliveryId} request.merged was malformed: ACK STALE; the merged request may stay open in the registry`,
+        );
+        return { action: 'stale', decision: 'UNKNOWN_TYPE' };
+      }
+      if (isSalePickupType(item.rawType)) {
+        // Pay in store S2: expected items, not an anomaly. Nothing is sent
+        // until the S3 flow handles them (never log the raw item: it
+        // carries the customer's conversationRef).
+        this.logger.log(
+          `feed item ${row.deliveryId} ${item.rawType}: pay in store notices are not enabled: STALE`,
         );
         return { action: 'stale', decision: 'UNKNOWN_TYPE' };
       }
