@@ -161,6 +161,7 @@ import {
   type MinimalCartVariantDiagnostic,
 } from './minimal-cart.service';
 import { ConversationGates } from '../../conversation-gates/application/conversation-gates';
+import { DurablePaymentOffer } from './gates/payment-offer.gate';
 import {
   minimalCheckoutReply,
   reviewMinimalCheckout,
@@ -983,6 +984,8 @@ export class MinimalCatalogAgentService {
   // run's order summary must not outlive the interruption.
   private readonly interrupted = new Set<string>();
   private readonly logger = new Logger(MinimalCatalogAgentService.name);
+  /** Durable copy of the payment offer; `undefined` without gates. */
+  private readonly paymentOffers?: DurablePaymentOffer;
 
   constructor(
     @Inject(CHATBOT_API_CLIENT) private readonly chatbotApi: ChatbotApiClient,
@@ -1026,6 +1029,9 @@ export class MinimalCatalogAgentService {
       maxOutputTokens?: number;
       inboundTextMaxChars?: number;
     }>('llm')!;
+    // The payment offer outlives the in-memory session through the gates.
+    this.paymentOffers =
+      gates === undefined ? undefined : new DurablePaymentOffer(gates);
     this.model = llm.model;
     this.maxSteps = llm.maxSteps;
     this.historyTurns = llm.historyTurns;
@@ -1136,7 +1142,7 @@ export class MinimalCatalogAgentService {
       // A bare yes picks the method only when the question shows a single
       // one; with two or more it asks the question again (no LLM).
       if (input.interactiveReplyId === undefined) {
-        const offer = this.pendingPaymentOffer(input.senderId);
+        const offer = await this.pendingPaymentOffer(input.senderId);
         const methods =
           offer === null
             ? PAYMENT_METHODS
@@ -2039,9 +2045,23 @@ export class MinimalCatalogAgentService {
     };
   }
 
-  /** The payment offer of the bot's latest message, if any. */
-  private pendingPaymentOffer(senderId: string): { saleId: string } | null {
-    return this.sessionStore.read(senderId).at(-1)?.paymentOffer ?? null;
+  /**
+   * The payment offer of the bot's latest message, if any. A live session
+   * answers it as before. With no retained turn (a restarted process) the
+   * durable offer stands in, but only while it still names the placed sale
+   * and that sale is unpaid.
+   */
+  private async pendingPaymentOffer(
+    senderId: string,
+  ): Promise<{ saleId: string } | null> {
+    const last = this.sessionStore.read(senderId).at(-1);
+    if (last !== undefined) return last.paymentOffer ?? null;
+    const durable = this.paymentOffers?.read(senderId) ?? null;
+    if (durable === null) return null;
+    const sale = await this.payment?.placedSale(senderId);
+    return sale?.saleId === durable.saleId && sale.paid !== true
+      ? { saleId: durable.saleId }
+      : null;
   }
 
   /**
@@ -3486,6 +3506,15 @@ export class MinimalCatalogAgentService {
       catalogRestockOffer?: CatalogRestockOffer & { acceptsYes: boolean };
     } = {},
   ): void {
+    // The offer answers only the next message: any other turn spends it.
+    if (this.paymentOffers !== undefined) {
+      const had = this.paymentOffers.read(senderId) !== null;
+      if (interactive.paymentOffer !== undefined)
+        this.paymentOffers.offer(senderId, interactive.paymentOffer.saleId);
+      else this.paymentOffers.clear(senderId);
+      if (had || interactive.paymentOffer !== undefined)
+        this.gates?.touch(senderId);
+    }
     const turns = this.sessionStore.read(senderId);
     const prior = this.historyTurns > 0 ? turns.slice(-this.historyTurns) : [];
     // Carry the owned cart context forward unless this turn produced a new one,

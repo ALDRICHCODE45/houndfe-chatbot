@@ -172,6 +172,10 @@ ddescribe('conversation_gates migration 4200 + store (real PostgreSQL)', () => {
     await expect(
       insert({ payload: JSON.stringify({ big: 'x'.repeat(70_000) }) }),
     ).rejects.toMatchObject({ code: '23514' });
+    await insert({ gate_kind: 'payment_offer', payload: '{"saleId":"s"}' });
+    await pool.query(
+      "DELETE FROM conversation_gates WHERE gate_kind = 'payment_offer'",
+    );
     await insert({});
     await expect(insert({})).rejects.toMatchObject({ code: '23505' });
     const indexes = await pool.query<{ indexdef: string }>(

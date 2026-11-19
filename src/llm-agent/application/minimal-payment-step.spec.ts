@@ -7,6 +7,9 @@ import {
   ChatbotApiError,
   UpstreamError,
 } from '../../chatbot-api/domain/errors';
+import { ConversationGates } from '../../conversation-gates/application/conversation-gates';
+import type { ConversationGateStore } from '../../conversation-gates/domain/conversation-gate.store';
+import { InMemoryConversationGateStore } from '../../conversation-gates/infrastructure/in-memory-conversation-gate.store';
 import { FakeShippingQuoteClient } from '../../chatbot-api/infrastructure/fake-shipping-quote.client';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import type { AskTeamOutcome } from '../../human-requests/application/human-request-create.service';
@@ -19,6 +22,7 @@ import { MinimalCheckoutService } from './minimal-checkout.service';
 import { MinimalOrderService } from './minimal-order.service';
 import { markPlacedSalePaid } from './minimal-paid-sale';
 import { MinimalPaymentService } from './minimal-payment.service';
+import { MINIMAL_PAYMENT_OFFER_TTL_MS } from './gates/payment-offer.gate';
 import { MinimalShippingService } from './minimal-shipping.service';
 
 const SENDER = '5215550001111';
@@ -73,8 +77,18 @@ const bankDetails = () => ({
   updatedAt: '2026-10-01T00:00:00.000Z',
 });
 
-function setup() {
-  const store = new InMemoryConversationStore();
+/**
+ * `shared` boots another process over the same durable stores: the cart
+ * store and the gate store survive, the session store and the agent do not.
+ */
+function setup(
+  shared: {
+    store?: InMemoryConversationStore;
+    gateStore?: ConversationGateStore;
+    clock?: () => number;
+  } = {},
+) {
+  const store = shared.store ?? new InMemoryConversationStore();
   const api = {
     searchCatalog: jest.fn(() =>
       Promise.resolve([
@@ -219,7 +233,9 @@ function setup() {
     order,
     undefined,
     undefined,
-    undefined,
+    shared.gateStore === undefined
+      ? undefined
+      : new ConversationGates(shared.gateStore, shared.clock),
     team,
     payment,
   );
@@ -317,6 +333,115 @@ const tap = (h: Harness, saleId = SALE) =>
     interactiveReplyId: `pay:transfer:${saleId}`,
   });
 const reply = (decision: unknown) => (decision as { reply: string }).reply;
+
+const T0 = Date.parse('2026-11-16T12:00:00.000Z');
+
+/** A restartable world: durable cart + gate stores, one shared clock. */
+function durableWorld() {
+  let now = T0;
+  const clock = () => now;
+  const gateStore = new InMemoryConversationGateStore(() => new Date(now));
+  const first = setup({ gateStore, clock });
+  return {
+    first,
+    advance: (ms: number) => {
+      now += ms;
+    },
+    /** A new agent and session store over the same durable stores. */
+    restart: () => setup({ store: first.store, gateStore, clock }),
+  };
+}
+
+describe('payment offer survives a restart', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('a yes after the restart sends the bank details without the model', async () => {
+    const w = durableWorld();
+    await w.first.placeOrder();
+    const restarted = w.restart();
+    const decision = await restarted.turn('sí');
+    expect(reply(decision)).toBe(`${LEAD}\n\n${INSTRUCTIONS}`);
+    expect(restarted.api.getPaymentDetails).toHaveBeenCalledTimes(1);
+    expect(restarted.seen).toHaveLength(0);
+  });
+
+  it('a typed method after the restart sends the bank details without the model', async () => {
+    const w = durableWorld();
+    await w.first.placeOrder();
+    const restarted = w.restart();
+    const decision = await restarted.turn('Por transferencia');
+    expect(reply(decision)).toBe(`${LEAD}\n\n${INSTRUCTIONS}`);
+    expect(restarted.seen).toHaveLength(0);
+  });
+
+  it('is spent by the answer: a second yes after the restart goes to the model', async () => {
+    const w = durableWorld();
+    await w.first.placeOrder();
+    const restarted = w.restart();
+    await restarted.turn('sí');
+    await restarted.turn('sí', [say('Claro.')]);
+    expect(restarted.seen).toHaveLength(1);
+    expect(restarted.api.getPaymentDetails).toHaveBeenCalledTimes(1);
+  });
+
+  it('a yes after another turn spent the offer before the restart goes to the model', async () => {
+    const w = durableWorld();
+    await w.first.placeOrder();
+    await w.first.turn('Gracias', [say('De nada.')]);
+    const restarted = w.restart();
+    await restarted.turn('sí', [say('Claro.')]);
+    expect(restarted.seen).toHaveLength(1);
+    expect(restarted.api.getPaymentDetails).not.toHaveBeenCalled();
+  });
+
+  it('a yes after the offer expired goes to the model', async () => {
+    const w = durableWorld();
+    await w.first.placeOrder();
+    w.advance(MINIMAL_PAYMENT_OFFER_TTL_MS);
+    const restarted = w.restart();
+    await restarted.turn('sí', [say('Claro.')]);
+    expect(restarted.seen).toHaveLength(1);
+    expect(restarted.api.getPaymentDetails).not.toHaveBeenCalled();
+  });
+
+  it('a yes after the order was paid goes to the model, not the payment block', async () => {
+    const w = durableWorld();
+    await w.first.placeOrder();
+    expect(await markPlacedSalePaid(w.first.store, SENDER, SALE)).toBe(true);
+    const restarted = w.restart();
+    await restarted.turn('sí', [say('Claro.')]);
+    expect(restarted.seen).toHaveLength(1);
+    expect(restarted.api.getPaymentDetails).not.toHaveBeenCalled();
+  });
+
+  it('a yes after the placed sale became another sale goes to the model', async () => {
+    const w = durableWorld();
+    await w.first.placeOrder();
+    const state = await w.first.store.get(SENDER);
+    const cart = parseMinimalCart(state?.data.minimalCart);
+    if (state === null || cart?.placedSale === undefined)
+      throw new Error('placed sale');
+    await w.first.store.commitMinimalCart(
+      SENDER,
+      state.data.minimalCart,
+      { ...cart, placedSale: { ...cart.placedSale, saleId: OTHER_SALE } },
+      state.lastMessageAt,
+    );
+    const restarted = w.restart();
+    await restarted.turn('sí', [say('Claro.')]);
+    expect(restarted.seen).toHaveLength(1);
+    expect(restarted.api.getPaymentDetails).not.toHaveBeenCalled();
+  });
+
+  it('without gates a restart still forgets the offer (today)', async () => {
+    const first = setup();
+    await first.placeOrder();
+    const restarted = setup({ store: first.store });
+    await restarted.turn('sí', [say('Claro.')]);
+    expect(restarted.seen).toHaveLength(1);
+    expect(restarted.api.getPaymentDetails).not.toHaveBeenCalled();
+  });
+});
 
 describe('payment step after the order (S3)', () => {
   afterEach(() => jest.restoreAllMocks());

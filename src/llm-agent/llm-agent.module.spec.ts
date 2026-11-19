@@ -341,6 +341,7 @@ describe('LlmAgentModule integration', () => {
       'checkout_confirmation',
       'checkout_confirmed',
       'order_confirmation',
+      'payment_offer',
       'restock_pending',
     ]);
     await moduleRef.close();
