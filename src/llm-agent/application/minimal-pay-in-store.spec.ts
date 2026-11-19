@@ -477,14 +477,41 @@ describe('pay in store: the offer (S3)', () => {
     expect(reply(decision)).toContain(ALREADY_PAID);
   });
 
-  it('with two methods offered, a bare yes no longer picks transfer by itself', async () => {
+  it.each(['sí', 'claro', 'ok'])(
+    'with two methods offered, a bare %p asks the payment question again with both buttons (no LLM)',
+    async (text) => {
+      const h = setup();
+      await h.placeOrder();
+      const llmCalls = h.seen.length;
+      const decision = await h.turn(text);
+      expect(reply(decision)).toBe(`${LEAD}\n\n${QUESTION}`);
+      expect(buttons(decision)).toEqual([
+        { id: `pay:transfer:${SALE}`, title: 'Transferencia' },
+        { id: `pay:in_store:${SALE}`, title: 'Pagar en tienda' },
+      ]);
+      expect(h.api.getPaymentDetails).not.toHaveBeenCalled();
+      expect(h.api.setPayInStoreIntent).not.toHaveBeenCalled();
+      expect(h.seen.length).toBe(llmCalls);
+      // The re-asked offer is still pending: a typed method answers it.
+      expect(reply(await h.turn('transferencia'))).toContain(
+        'CLABE: 012180001234567891',
+      );
+    },
+  );
+
+  it('with [Pagar en tienda] hidden by a receipt in review, a bare yes gets the in-review text (single shown method, no LLM)', async () => {
     const h = setup();
     await h.placeOrder();
+    h.receipts.hasReceiptInReview.mockResolvedValue(true);
     const llmCalls = h.seen.length;
-    await h.turn('sí');
+    const decision = await h.turn('sí');
+    expect(reply(decision)).toContain(
+      'Ya recibimos su comprobante del pedido B-0042',
+    );
+    expect(buttons(decision)).toBeUndefined();
     expect(h.api.getPaymentDetails).not.toHaveBeenCalled();
     expect(h.api.setPayInStoreIntent).not.toHaveBeenCalled();
-    expect(h.seen.length).toBe(llmCalls + 1);
+    expect(h.seen.length).toBe(llmCalls);
   });
 
   it('typing «transferencia» after the two-button offer still sends the bank details', async () => {

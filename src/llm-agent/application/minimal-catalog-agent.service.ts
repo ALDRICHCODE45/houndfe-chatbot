@@ -1133,7 +1133,8 @@ export class MinimalCatalogAgentService {
         }
       }
       // Payment step: the reply right after the payment offer answers it.
-      // A bare yes picks the method only when the offer had a single one.
+      // A bare yes picks the method only when the question shows a single
+      // one; with two or more it asks the question again (no LLM).
       if (input.interactiveReplyId === undefined) {
         const offer = this.pendingPaymentOffer(input.senderId);
         const methods =
@@ -1141,14 +1142,21 @@ export class MinimalCatalogAgentService {
             ? PAYMENT_METHODS
             : ((await this.payment?.offeredMethods(input.senderId)) ??
               PAYMENT_METHODS);
-        const chosen =
-          offer === null
-            ? null
-            : (matchPaymentMethod(input.text, methods) ??
-              (methods.length === 1 &&
-              classifyConfirmationReply(input.text) === 'accept'
-                ? methods[0]
-                : null));
+        let chosen =
+          offer === null ? null : matchPaymentMethod(input.text, methods);
+        if (
+          offer !== null &&
+          chosen === null &&
+          classifyConfirmationReply(input.text) === 'accept'
+        ) {
+          const shown =
+            (await this.payment?.shownMethods(input.senderId)) ?? methods;
+          if (shown.length === 1) chosen = shown[0];
+          else {
+            const again = await this.askPaymentMethodAgain(input, offer.saleId);
+            if (again !== null) return again;
+          }
+        }
         if (offer !== null && chosen !== null) {
           const decision =
             chosen.id === PAY_IN_STORE_METHOD.id
@@ -1990,6 +1998,45 @@ export class MinimalCatalogAgentService {
     if (status === undefined || status === null) return null;
     this.order?.dismiss(senderId);
     return answer(status, status.paymentOffer);
+  }
+
+  /**
+   * A bare yes to a payment question with two or more methods: the same
+   * question and buttons again, still bound to `saleId`. `null` when the
+   * placed order is no longer that sale (the turn goes on as before).
+   */
+  private async askPaymentMethodAgain(
+    input: { senderId: string; text: string },
+    saleId: string,
+  ): Promise<MinimalCatalogAgentDecision | null> {
+    const status = await this.payment?.placedOrderStatus(input.senderId);
+    if (
+      status === undefined ||
+      status === null ||
+      status.paymentOffer?.saleId !== saleId
+    )
+      return null;
+    this.order?.dismiss(input.senderId);
+    const style = this.customerStyle(input.senderId, input.text);
+    const reply = applyCustomerStyle(status.reply, style);
+    this.recordTurn(
+      input.senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+      undefined,
+      undefined,
+      { paymentOffer: status.paymentOffer },
+    );
+    return {
+      kind: 'handled',
+      reply,
+      ...(status.interactive === undefined
+        ? {}
+        : { interactive: styleInteractivePrompt(status.interactive, style) }),
+    };
   }
 
   /** The payment offer of the bot's latest message, if any. */

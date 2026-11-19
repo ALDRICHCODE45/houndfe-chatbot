@@ -333,18 +333,22 @@ describe('payment step after the order (S3)', () => {
     expect(h.team.askTeam).not.toHaveBeenCalled();
   });
 
-  it.each(['sí', 'Si, por favor', 'transferencia', 'Por transferencia'])(
-    'answering %p to the pending offer sends the details',
-    async (text) => {
-      const h = setup();
-      await h.placeOrder();
-      const llmCalls = h.seen.length;
-      const decision = await h.turn(text);
-      expect(reply(decision)).toBe(`${LEAD}\n\n${INSTRUCTIONS}`);
-      expect(h.api.getPaymentDetails).toHaveBeenCalledTimes(1);
-      expect(h.seen).toHaveLength(llmCalls);
-    },
-  );
+  it.each([
+    'sí',
+    'Si, por favor',
+    'claro',
+    'ok',
+    'transferencia',
+    'Por transferencia',
+  ])('answering %p to the pending offer sends the details', async (text) => {
+    const h = setup();
+    await h.placeOrder();
+    const llmCalls = h.seen.length;
+    const decision = await h.turn(text);
+    expect(reply(decision)).toBe(`${LEAD}\n\n${INSTRUCTIONS}`);
+    expect(h.api.getPaymentDetails).toHaveBeenCalledTimes(1);
+    expect(h.seen).toHaveLength(llmCalls);
+  });
 
   it('a yes after the offer was spent by another turn does not fetch the details', async () => {
     const h = setup();

@@ -152,6 +152,31 @@ export class MinimalPaymentService {
   }
 
   /**
+   * The methods the payment question shows as buttons for the sender's
+   * placed order: like `offeredMethods`, minus «Pagar en tienda» while a
+   * receipt of the order is in review (follow-ups S6). A bare yes to the
+   * question picks a method only when exactly one is shown.
+   */
+  async shownMethods(senderId: string): Promise<readonly PaymentMethod[]> {
+    const sale = (await this.read(senderId))?.cart.placedSale;
+    return sale === undefined
+      ? PAYMENT_METHODS
+      : paymentMethodsFor({
+          payInStore: await this.showsPayInStore(senderId, sale),
+        });
+  }
+
+  /** «Pagar en tienda» is shown: offered and no receipt in review (fails open). */
+  private async showsPayInStore(
+    senderId: string,
+    sale: PlacedSale,
+  ): Promise<boolean> {
+    return (
+      this.canPayInStore(sale) && !(await this.receiptInReview(senderId, sale))
+    );
+  }
+
+  /**
    * Pay in store S3: «Pagar en tienda» for the sender's placed order
    * `saleId`. Exactly one PATCH payment-intent per call (the backend is
    * idempotent: a re-tap gets the current hold and the same text). The
@@ -221,8 +246,7 @@ export class MinimalPaymentService {
     // order is in review (a tap or a typed «en tienda» still gets the
     // in-review reply). Read only when the button could be shown; an
     // unreadable receipt state keeps today's offer (fails open).
-    const payInStore =
-      this.canPayInStore(sale) && !(await this.receiptInReview(senderId, sale));
+    const payInStore = await this.showsPayInStore(senderId, sale);
     return {
       reply: `${paymentLead(sale)}\n\n${MINIMAL_PAYMENT_QUESTION}`,
       interactive: paymentMethodButtons(
