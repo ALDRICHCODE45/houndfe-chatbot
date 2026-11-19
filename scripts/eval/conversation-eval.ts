@@ -18,6 +18,7 @@ import { MinimalCartService } from '../../src/llm-agent/application/minimal-cart
 import { MinimalCatalogAgentService } from '../../src/llm-agent/application/minimal-catalog-agent.service';
 import { MinimalCheckoutService } from '../../src/llm-agent/application/minimal-checkout.service';
 import { MinimalOrderService } from '../../src/llm-agent/application/minimal-order.service';
+import { MinimalPaymentService } from '../../src/llm-agent/application/minimal-payment.service';
 import { MinimalShippingService } from '../../src/llm-agent/application/minimal-shipping.service';
 import type { GenerateTextFn } from '../../src/llm-agent/infrastructure/generate-text.provider';
 import type { CustomerReplyInteractive } from '../../src/llm-agent/domain/customer-reply';
@@ -260,6 +261,10 @@ function buildHarness(
     order,
     shipping,
     profileService,
+    undefined,
+    undefined,
+    // The payment step after an order (bank details from the fake backend).
+    new MinimalPaymentService(api, store),
   );
   return { api, agent };
 }
