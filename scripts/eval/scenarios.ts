@@ -57,6 +57,19 @@ export function imageTurn(
   );
 }
 
+/**
+ * Retest S4: a bare «quiero comprar» first asks «¿Se lo enviamos a su
+ * dirección o prefiere recogerlo en tienda?» (buttons «Envío a domicilio» /
+ * «Recoger en tienda»). Turns answering it are sent only when it was asked;
+ * the eval types the button title, which reaches the model as text.
+ */
+const FULFILMENT_QUESTION = /recoger(?:lo)? en tienda/i;
+
+const deliveryAnswer = (text: string): ScenarioTurn => ({
+  text,
+  onlyIfPreviousReply: FULFILMENT_QUESTION,
+});
+
 const existing = (zip: '03100' | '04000' | '12000'): FixtureCustomer => ({
   kind: 'existing',
   firstName: 'Mariana',
@@ -146,9 +159,10 @@ export const SCENARIOS: Scenario[] = [
       'Hola, quiero las croquetas de salmón y camote de 18 kg para perro grande',
       'Agrégueme 1 al carrito, por favor',
       'Quiero comprar',
+      deliveryAnswer('Envío a domicilio'),
       'Sí, a mi dirección de casa',
       'Sí, por favor 🙏',
-      'Envío a domicilio',
+      deliveryAnswer('Envío a domicilio'),
       'claro',
       'va',
       'ok',
@@ -164,9 +178,10 @@ export const SCENARIOS: Scenario[] = [
       'hola! 🐶 quiero 2 kong mediano',
       'sí ese, agrégamelos porfa',
       'quiero comprar 🙌',
+      deliveryAnswer('a domicilio porfa'),
       'Soy Laura Méndez, Av. Coyoacán 1200, Col. Del Valle Centro, Benito Juárez, CDMX, CP 03100',
       'sí 👍',
-      'a domicilio porfa',
+      deliveryAnswer('a domicilio porfa'),
       'Sí, por favor 🙏',
       'ok',
     ],
@@ -180,9 +195,10 @@ export const SCENARIOS: Scenario[] = [
       'Buenas, ¿tienen arena para gato aglomerante de 10 kg?',
       'Agregue una al carrito, por favor',
       'Quiero comprar',
+      deliveryAnswer('Envío a domicilio'),
       'Sí, a esa dirección',
       'Sí',
-      'Envío a domicilio',
+      deliveryAnswer('Envío a domicilio'),
       'no gracias',
       'mejor lo dejo para después',
     ],
@@ -197,9 +213,10 @@ export const SCENARIOS: Scenario[] = [
       'Hola, busco un collar de nylon para perro talla mediana',
       'Agrégame uno',
       'quiero comprar',
+      deliveryAnswer('envío a domicilio'),
       'sí, a la de casa',
       'sí',
-      'envío a domicilio',
+      deliveryAnswer('envío a domicilio'),
       'sí pero cambia la cantidad a 2',
       'sí',
       'claro',
@@ -215,13 +232,11 @@ export const SCENARIOS: Scenario[] = [
       'Hola, quiero lo mismo de la vez pasada',
       'sí',
       'quiero comprar',
+      deliveryAnswer('Envío a domicilio'),
       'Sí, a mi dirección de casa',
       'Sí',
-      // Natural answers if the bot asks how to receive it, then the summary.
-      {
-        text: 'Envío a domicilio',
-        onlyIfPreviousReply: /domicilio|recoger/i,
-      },
+      // Natural answer if the bot asks how to receive it again, then the summary.
+      deliveryAnswer('Envío a domicilio'),
       'sí',
       { text: 'sí', onlyIfPreviousReply: /^Resumen de su pedido/m },
     ],
@@ -240,7 +255,8 @@ export const SCENARIOS: Scenario[] = [
         onlyIfPreviousReply: /a cu[aá]l producto/i,
       },
       'Quiero comprar.',
-      'Prefiero recogerlo en tienda.',
+      // Answers the S4 question (or says it unasked); typed, so the model routes it.
+      'Recoger en tienda',
       'Sí.',
       'Sí, confirmo.',
     ],
@@ -254,9 +270,10 @@ export const SCENARIOS: Scenario[] = [
       '¿Tienen croquetas Royal Canin Indoor para gato?',
       'Agréguelo al carrito, por favor',
       'Quiero comprar',
+      deliveryAnswer('A domicilio, por favor'),
       'Sí, a mi casa',
       'Sí',
-      'A domicilio, por favor',
+      deliveryAnswer('A domicilio, por favor'),
       '¿Entonces qué opciones tengo?',
     ],
   },
