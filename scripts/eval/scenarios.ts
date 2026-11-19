@@ -216,7 +216,8 @@ export const SCENARIOS: Scenario[] = [
       deliveryAnswer('envío a domicilio'),
       'sí, a la de casa',
       'sí',
-      deliveryAnswer('envío a domicilio'),
+      // Unconditional: the SDK specs replay this scenario's fixed turns by index.
+      'envío a domicilio',
       'sí pero cambia la cantidad a 2',
       'sí',
       'claro',
