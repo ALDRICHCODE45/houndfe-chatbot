@@ -2944,6 +2944,19 @@ export class MinimalCatalogAgentService {
         this.logger,
         `minimal_catalog catalog_options rendered=application sections=${catalogRun.plans.length} shown=${rendered.shown.length} restock_offer=${rendered.restockOffer !== null} trace=${traceId}`,
       );
+      // A count stated with the search («quiero 2 kong mediano») carries to
+      // the pick only through a pending request, and only when exactly one
+      // product was shown and nothing was written to the cart in this run.
+      if (
+        cartConversation !== null &&
+        cartReply.mutated !== true &&
+        rendered.shown.length === 1 &&
+        cartConversation.armStatedCount(rendered.shown[0].productId)
+      )
+        traceLog(
+          this.logger,
+          `minimal_catalog cart_pending armed=stated_count trace=${traceId}`,
+        );
       // L31: one emoji on the closing only when the customer uses them.
       const reply = limitCustomerEmojis(rendered.text, style);
       const media = photoFor(reply);

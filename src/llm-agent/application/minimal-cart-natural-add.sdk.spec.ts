@@ -289,6 +289,95 @@ describe('F7 prepareCartItem on a resolved selection is a real add', () => {
   });
 });
 
+describe('a count stated with a search carries to the pick after code-rendered options', () => {
+  const QUANTITY_QUESTION = /¿Cuántas unidades/;
+
+  it.each([
+    ['a null delta', adjust(ref(KONG), null)],
+    ['the stated delta on the presentation', adjust(ref(KONG, 2), 2)],
+  ])(
+    '"quiero 2 kong mediano" then "sí ese, agrégamelos" adds two Mediano (%s)',
+    async (_label, toolCall) => {
+      const h = harness('new');
+      await h.turn('hola! 🐶 quiero 2 kong mediano', [
+        call('searchCatalog', { q: 'kong mediano' }),
+        say('ok'),
+      ]);
+      expect(await h.lines()).toEqual([]);
+      const reply = await h.turn('sí ese, agrégamelos porfa', [
+        toolCall,
+        say(),
+      ]);
+      expect(await h.lines()).toEqual([
+        { productId: product(KONG), variantId: variant(KONG, 2), quantity: 2 },
+      ]);
+      expect(reply).not.toMatch(QUANTITY_QUESTION);
+    },
+  );
+
+  it('without a stated count, "agrégamelos" still asks how many', async () => {
+    const h = harness('new');
+    await h.turn('hola, busco kong mediano', [
+      call('searchCatalog', { q: 'kong mediano' }),
+      say('ok'),
+    ]);
+    const reply = await h.turn('sí ese, agrégamelos porfa', [
+      adjust(ref(KONG), null),
+      say(),
+    ]);
+    expect(await h.lines()).toEqual([]);
+    expect(reply).toMatch(QUANTITY_QUESTION);
+  });
+
+  it.each([
+    'busco kong mediano de 300 pesos',
+    'quiero kong mediano de $300',
+    'busco kong mediano para perro de 10 años',
+    'kong mediano para cachorro de 3 meses',
+    'kong mediano, tengo 2',
+  ])(
+    'a price, an age or a number without a request to buy ("%s") is never carried as the count',
+    async (text) => {
+      const h = harness('new');
+      await h.turn(text, [call('searchCatalog', { q: 'kong' }), say('ok')]);
+      const reply = await h.turn('sí ese, agrégamelos porfa', [
+        adjust(ref(KONG), null),
+        say(),
+      ]);
+      expect(await h.lines()).toEqual([]);
+      expect(reply).toMatch(QUANTITY_QUESTION);
+    },
+  );
+
+  it('a presentation number is never carried as the count', async () => {
+    const h = harness('new');
+    await h.turn('quiero el aglomerante de 10 kg', [
+      call('searchCatalog', { q: 'aglomerante' }),
+      say('ok'),
+    ]);
+    const reply = await h.turn('sí ese, agrégamelos porfa', [
+      adjust(ref(AGLOMERANTE), null),
+      say(),
+    ]);
+    expect(await h.lines()).toEqual([]);
+    expect(reply).toMatch(QUANTITY_QUESTION);
+  });
+
+  it('several products shown arm nothing: the pick still asks', async () => {
+    const h = harness('new');
+    await h.turn('quiero 2 collares', [
+      call('searchCatalog', { q: 'collar' }),
+      say('ok'),
+    ]);
+    const reply = await h.turn('sí ese, agrégamelos porfa', [
+      adjust(ref(COLLAR, 2), null),
+      say(),
+    ]);
+    expect(await h.lines()).toEqual([]);
+    expect(reply).toMatch(/¿A cuál producto|¿Cuántas unidades/);
+  });
+});
+
 describe('F6 natural add replies after a product was shown', () => {
   it.each([
     ['Sí, agréguela por favor.', adjust(ref(SILICE), 1)],

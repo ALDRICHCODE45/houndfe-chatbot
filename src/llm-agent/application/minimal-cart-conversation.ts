@@ -51,6 +51,23 @@ import {
   type MinimalCartPendingRequest,
 } from '../domain/minimal-cart-quantity';
 
+/** Words that ask to buy or add («quiero 2 kong», «me da 3», «agrégame 2»). */
+const BUY_REQUEST =
+  /\b(?:quiero|quisiera|deseo|necesito|ocupo|busco|dame|deme|denme|me (?:da|das|dan|manda|mandas|mandan|pasa|pasas)|agreg\w*|pon\w*|llevo|me llevo|compro|comprar\w*|mand\w*|env[ií]\w*)\b/i;
+/** A number that is a price, an age or a time span, never a unit count. */
+const NON_COUNT_NUMBER =
+  /\$\s*\d|\d+\s*(?:pesos?|mxn|varos|años?|anos?|meses?|semanas?|d[ií]as?)\b/i;
+
+/**
+ * True when a message that states a count also asks to buy and the number is
+ * not a price, an age or a time span («quiero 2 kong mediano»; never «kong de
+ * 300 pesos», «perro de 10 años», «tengo 2»). Used only to carry a count
+ * across turns.
+ */
+function statesCountToBuy(text: string): boolean {
+  return BUY_REQUEST.test(text) && !NON_COUNT_NUMBER.test(text);
+}
+
 /** Only existing cart lines to retain; an empty-cart command is not supported. */
 export const cartKeepOnlyToolInput = z.strictObject({
   keepSelectionRefs: z.array(z.string().min(1)).min(1).max(20),
@@ -797,6 +814,59 @@ export class MinimalCartConversation {
       };
     }
     return result;
+  }
+
+  /**
+   * Arm a pending add for the one product the application just showed when
+   * the customer's message stated a unit count with the search («quiero 2
+   * kong mediano»), so the pick that follows («sí ese, agrégamelos») keeps
+   * that count (two or more). Presentation numbers and measures are never
+   * counts, a pet statement arms nothing, and an already armed request is
+   * kept. The presentation is fixed only when the message names exactly one;
+   * otherwise the pick resolves it. Returns whether a request was armed.
+   */
+  armStatedCount(productId: string): boolean {
+    if (this.pending !== null || this.isPetStatementOnly()) return false;
+    const parent = this.selections
+      .snapshot()
+      .selections.find(
+        (entry) =>
+          entry.productId === productId && entry.variantId === undefined,
+      );
+    if (parent === undefined) return false;
+    const variants = this.variantsOf(productId);
+    const presentationNumbers = new Set(
+      variants.flatMap((variant) =>
+        cartWords(presentationLabel(variant)).filter((word) =>
+          /^\d+$/.test(word),
+        ),
+      ),
+    );
+    const count = statedUnitCount(this.text, presentationNumbers);
+    // «un/una» is an article as often as a count, and one unit is already
+    // the countless singular default: only a count of two or more is carried.
+    if (count.status !== 'ok' || count.value < 2) return false;
+    if (!statesCountToBuy(this.text)) return false;
+    const named = this.namedLabels(productId, this.text);
+    const variant =
+      named.length === 1
+        ? variants.find((entry) => presentationLabel(entry) === named[0])
+        : undefined;
+    const chosen = variant ?? parent;
+    this.pending = {
+      productId,
+      operation: 'add',
+      quantity: count.value,
+      productName: chosen.productName,
+      ...(chosen.variantId === undefined
+        ? {}
+        : { variantId: chosen.variantId }),
+      ...(chosen.variantName === undefined
+        ? {}
+        : { variantName: chosen.variantName }),
+      reference: chosen.reference,
+    };
+    return true;
   }
 
   /** Disarm the pending intent; called after an actual mutation attempt. */
