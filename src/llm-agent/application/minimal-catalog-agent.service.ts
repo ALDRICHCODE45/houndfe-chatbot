@@ -3041,6 +3041,19 @@ export class MinimalCatalogAgentService {
       );
       return { reply };
     }
+    // Same carry when the model wrote the offer itself (a stock check after
+    // the search skips the rendered options): exactly one product presented
+    // by this run's catalog reads and nothing written to the cart.
+    if (
+      cartConversation !== null &&
+      cartReply.mutated !== true &&
+      imageRun.presented.size === 1 &&
+      cartConversation.armStatedCount([...imageRun.presented.keys()][0])
+    )
+      traceLog(
+        this.logger,
+        `minimal_catalog cart_pending armed=stated_count trace=${traceId}`,
+      );
     const media = photoFor(text);
     this.recordTurn(
       input.senderId,

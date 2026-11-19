@@ -315,6 +315,26 @@ describe('a count stated with a search carries to the pick after code-rendered o
     },
   );
 
+  it('a model-written offer after a stock check ("¿Le agrego 2?") also keeps the count (live eval 2026-11-19)', async () => {
+    const h = harness('new');
+    await h.turn('hola! 🐶 quiero 2 kong mediano', [
+      call('searchCatalog', { q: 'kong mediano' }),
+      call('checkStock', { productId: product(KONG) }),
+      say(
+        '¡Hola! 🐶 Encontré el Juguete Kong Classic para Perro Mediano. ¿Le gustaría que le agregue 2 al carrito?',
+      ),
+    ]);
+    expect(await h.lines()).toEqual([]);
+    const reply = await h.turn('sí ese, agrégamelos porfa', [
+      setItem(ref(KONG), null),
+      say(),
+    ]);
+    expect(await h.lines()).toEqual([
+      { productId: product(KONG), variantId: variant(KONG, 2), quantity: 2 },
+    ]);
+    expect(reply).not.toMatch(QUANTITY_QUESTION);
+  });
+
   it('without a stated count, "agrégamelos" still asks how many', async () => {
     const h = harness('new');
     await h.turn('hola, busco kong mediano', [
