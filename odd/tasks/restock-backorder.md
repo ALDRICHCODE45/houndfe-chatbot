@@ -32,7 +32,7 @@ Cross-repo feature: houndfe-backend (model, stock-back event, matching, feed, /c
 | T5a | S4, S6, S9, S12, S13, S15 | Chatbot: backorder feed handler (reserved/reminder/expired/lost notices with buttons, templates outside the window behind a flag, PROVIDER_REJECTED persisted locally, recovery cursor) | done: verify PASS; Docker 82/82 | 5544784 |
 | T5b | S2, S6, S11 | Chatbot: Confirm (tap or yes) puts the reserved backorder line in the cart at finalPriceCents and runs the normal checkout with backorderId and the §7 total; checkout errors; reschedule after expiry when sourceDecisionId is available | done: verify PASS except same-product delivery case (fixed on backend); delivery reprice and uncertain-attempt refusal fixed; full suite 11779 passed | f67192e |
 | T6 | S7, S8 | Chatbot: ETA slip re-estimate and notice, customer cancel | done: S8 6e9c839; S7 eta_updated/eta_unavailable notices + [Seguir esperando] + phone fallback for conversationRef null (verify PASS, full suite 11835 passed) | 6e9c839, see L18 |
-| T7 | S1-S9 | Eval scenario + live verification | pending | — |
+| T7 | S1-S9 | Eval scenario + live verification | rehearsal script written (lint/tsc clean, guards verified); live run pending: owner runs `pnpm e2e:backorder` (agents cannot read .env) | 3d6f57d |
 | T8 | S15 | Chatbot: feed consumer tolerates backorder items, PROVIDER_REJECTED outcome (deploy prerequisite of backend T2) | done: independent verify PASS S15a-d; Docker ledger spec 70/70 (recovery cursor and local PROVIDER_REJECTED persistence left for T5) | 63bbab4 |
 
 ## Log
