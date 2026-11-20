@@ -10,6 +10,8 @@ import {
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
 import type { CartItem, CartState } from '../../sale-flow/domain/cart-state';
+import type { BackorderBot } from '../../backorders/domain/backorder';
+import { backorderDateTime } from '../domain/backorder-copy';
 import type { CartEvaluationResult } from '../../chatbot-api/domain/dtos/pricing.dto';
 import { CheckoutPickupLocationSchema } from '../../chatbot-api/domain/dtos/checkout.dto';
 import { ChatbotApiError } from '../../chatbot-api/domain/errors';
@@ -20,15 +22,27 @@ import {
   minimalShippingQuoteSchema,
 } from '../domain/minimal-shipping';
 import {
+  minimalBackorderSuffix,
   minimalLineLabel,
   minimalPromotionSuffix,
 } from '../domain/minimal-order-confirmation';
 
+// Restock backorder T5b: what a backorder line remembers of its reservation.
+const backorderRefSchema = z.strictObject({
+  id: z.uuid(),
+  folio: z.string().min(1),
+  productName: z.string().min(1),
+  variantName: z.string().nullable(),
+  reservedUntil: z.iso.datetime({ offset: true }),
+});
 const lineSchema = z.strictObject({
   productId: z.uuid(),
   variantId: z.uuid().optional(),
   quantity: z.number().int().positive(),
   unitPriceCents: z.number().int().nonnegative(),
+  // Present only on the line of a RESERVED backorder (priced at its final
+  // price); absent on every ordinary line.
+  backorder: backorderRefSchema.optional(),
 });
 // Last order created by the minimal route; informational, never a sale input.
 const placedSaleSchema = z.strictObject({
@@ -89,7 +103,7 @@ export function parseMinimalCart(raw: unknown): MinimalCartState | null {
   return parsed.data;
 }
 export const minimalCartInput = lineSchema
-  .omit({ unitPriceCents: true })
+  .omit({ unitPriceCents: true, backorder: true })
   .extend({
     quantity: z.number().int().nonnegative(),
   });
@@ -119,6 +133,11 @@ export type MinimalCartResult =
       items: QuotedItem[];
       totalCents: number;
       promotionEvaluationStatus: 'fully_evaluated' | 'needs_human_review';
+      /**
+       * Restock backorder T5b: set only by a write that removed a backorder
+       * line; the backorder itself stays reserved until `reservedUntil`.
+       */
+      removedBackorders?: Array<{ folio: string; reservedUntil: string }>;
     };
 /** Synchronous, observational-only callback; never returned to the model or stored. */
 export type MinimalCartVariantDiagnostic = {
@@ -130,10 +149,36 @@ export type MinimalCartVariantDiagnostic = {
 };
 type VariantDiagnosticObserver = (event: MinimalCartVariantDiagnostic) => void;
 
+/**
+ * The same cart line. A backorder line is never the same line as an ordinary
+ * one of the same product (and two backorder lines differ by backorder), so
+ * an ordinary request never merges into it or changes it.
+ */
 const sameLine = (
+  a: Pick<CartItem, 'productId' | 'variantId' | 'backorder'>,
+  b: Pick<CartItem, 'productId' | 'variantId' | 'backorder'>,
+) =>
+  a.productId === b.productId &&
+  a.variantId === b.variantId &&
+  a.backorder?.id === b.backorder?.id;
+const sameProduct = (
   a: Pick<CartItem, 'productId' | 'variantId'>,
   b: Pick<CartItem, 'productId' | 'variantId'>,
 ) => a.productId === b.productId && a.variantId === b.variantId;
+/** The stored shape of a quoted line; a backorder line keeps its reservation. */
+const storedLine = ({
+  productId,
+  variantId,
+  quantity,
+  unitPriceCents,
+  backorder,
+}: QuotedItem): CartItem => ({
+  productId,
+  ...(variantId ? { variantId } : {}),
+  quantity,
+  unitPriceCents,
+  ...(backorder ? { backorder } : {}),
+});
 const money = (value: number) => Number.isSafeInteger(value) && value >= 0;
 
 /** Cart only: no reservation, sale or payment calls. Prices are server-derived. */
@@ -233,14 +278,7 @@ export class MinimalCartService {
         return { quote, repriced: false };
       const next: MinimalCartState = structuredClone({
         ...cart,
-        items: quote.items.map(
-          ({ productId, variantId, quantity, unitPriceCents }) => ({
-            productId,
-            ...(variantId ? { variantId } : {}),
-            quantity,
-            unitPriceCents,
-          }),
-        ),
+        items: quote.items.map(storedLine),
         expectedTotalCents: quote.totalCents,
       });
       if (!this.store.commitMinimalCart)
@@ -313,24 +351,18 @@ export class MinimalCartService {
       if (
         keep.length === 0 ||
         keep.some(
-          (identity) => !cart.items.some((line) => sameLine(line, identity)),
+          (identity) => !cart.items.some((line) => sameProduct(line, identity)),
         )
       )
         return { ok: false, error: 'unknown_cart_line' };
       const items = cart.items.filter((line) =>
-        keep.some((identity) => sameLine(line, identity)),
+        keep.some((identity) => sameProduct(line, identity)),
       );
+      const dropped = cart.items.filter((line) => !items.includes(line));
       const quote = await this.quote(senderId, items);
       if (!quote.ok || items.length === cart.items.length) return quote;
       const next: CartState = {
-        items: quote.items.map(
-          ({ productId, variantId, quantity, unitPriceCents }) => ({
-            productId,
-            ...(variantId ? { variantId } : {}),
-            quantity,
-            unitPriceCents,
-          }),
-        ),
+        items: quote.items.map(storedLine),
         idempotencyKey: '',
         expectedTotalCents: quote.totalCents,
       };
@@ -342,7 +374,9 @@ export class MinimalCartService {
         next,
         new Date().toISOString(),
       );
-      return saved ? quote : { ok: false, error: 'cart_changed' };
+      return saved
+        ? withRemovedBackorders(quote, dropped)
+        : { ok: false, error: 'cart_changed' };
     } catch {
       return { ok: false, error: 'cart_unavailable' };
     }
@@ -413,14 +447,87 @@ export class MinimalCartService {
       const quote = await this.quote(senderId, items);
       if (!quote.ok) return quote;
       const next: CartState = {
-        items: quote.items.map(
-          ({ productId, variantId, quantity, unitPriceCents }) => ({
-            productId,
-            ...(variantId ? { variantId } : {}),
-            quantity,
-            unitPriceCents,
-          }),
-        ),
+        items: quote.items.map(storedLine),
+        idempotencyKey: '',
+        expectedTotalCents: quote.totalCents,
+      };
+      if (!this.store.commitMinimalCart)
+        return { ok: false, error: 'cart_unavailable' };
+      const saved = await this.store.commitMinimalCart(
+        senderId,
+        raw,
+        next,
+        new Date().toISOString(),
+      );
+      return saved ? quote : { ok: false, error: 'cart_changed' };
+    } catch {
+      return { ok: false, error: 'cart_unavailable' };
+    }
+  }
+
+  /**
+   * Restock backorder T5b: put the customer's RESERVED backorder in the cart
+   * as its own line, priced at the backorder's `finalPriceCents` with the
+   * quantity it was reserved for. Never merges into an ordinary line of the
+   * same product. Adding the same backorder twice keeps one line (no write).
+   * One CAS, never retried; an outstanding order key blocks it like any cart
+   * change.
+   */
+  async addBackorderLine(
+    senderId: string,
+    backorder: Pick<
+      BackorderBot,
+      | 'id'
+      | 'folio'
+      | 'productId'
+      | 'productName'
+      | 'variantId'
+      | 'variantName'
+      | 'quantity'
+      | 'finalPriceCents'
+      | 'reservedUntil'
+    >,
+  ): Promise<MinimalCartResult> {
+    try {
+      const { finalPriceCents, reservedUntil } = backorder;
+      if (
+        finalPriceCents === null ||
+        reservedUntil === null ||
+        !money(finalPriceCents) ||
+        !money(finalPriceCents * backorder.quantity)
+      )
+        return { ok: false, error: 'invalid_quantity_or_identity' };
+      const raw = structuredClone(
+        (await this.store.get(senderId))?.data.minimalCart,
+      );
+      const cart = this.read(raw);
+      if (!cart) return { ok: false, error: 'invalid_cart' };
+      if (cart.idempotencyKey !== '')
+        return { ok: false, error: 'order_unresolved' };
+      if (cart.items.some((item) => item.backorder?.id === backorder.id))
+        return await this.quote(senderId, cart.items);
+      const line: CartItem = {
+        productId: backorder.productId,
+        ...(backorder.variantId === null
+          ? {}
+          : { variantId: backorder.variantId }),
+        quantity: backorder.quantity,
+        unitPriceCents: finalPriceCents,
+        backorder: {
+          id: backorder.id,
+          folio: backorder.folio,
+          productName: backorder.productName,
+          variantName: backorder.variantName,
+          reservedUntil,
+        },
+      };
+      const parsed = lineSchema.safeParse(line);
+      if (!parsed.success)
+        return { ok: false, error: 'invalid_quantity_or_identity' };
+      const quote = await this.quote(senderId, [...cart.items, parsed.data]);
+      if (!quote.ok) return quote;
+      const next: CartState = {
+        items: quote.items.map(storedLine),
         idempotencyKey: '',
         expectedTotalCents: quote.totalCents,
       };
@@ -465,6 +572,47 @@ export class MinimalCartService {
       const existing = cart.items.find((i) => sameLine(i, request));
       if (!existing && !allowedIds.has(request.productId))
         return { ok: false, error: 'unknown_product' };
+      // Restock backorder T5b: the product is in the cart only as a reserved
+      // backorder line. Removing it is allowed (the backorder stays
+      // reserved); more units are another, ordinary line; any other change
+      // of its quantity is refused, and its price is never editable.
+      const backorderLine = existing
+        ? undefined
+        : cart.items.find(
+            (i) => i.backorder !== undefined && sameProduct(i, request),
+          );
+      if (backorderLine !== undefined) {
+        const removal = 'delta' in request ? false : request.quantity === 0;
+        const addition = 'delta' in request && request.delta > 0;
+        if (!removal && !addition)
+          return { ok: false, error: 'backorder_line_locked' };
+        if (removal) {
+          const rest = cart.items.filter((i) => i !== backorderLine);
+          const quote = await this.quote(
+            senderId,
+            rest,
+            onInvalidVariant,
+            request,
+          );
+          if (!quote.ok) return quote;
+          const next: CartState = {
+            items: quote.items.map(storedLine),
+            idempotencyKey: '',
+            expectedTotalCents: quote.totalCents,
+          };
+          if (!this.store.commitMinimalCart)
+            return { ok: false, error: 'cart_unavailable' };
+          const saved = await this.store.commitMinimalCart(
+            senderId,
+            raw,
+            next,
+            new Date().toISOString(),
+          );
+          return saved
+            ? withRemovedBackorders(quote, [backorderLine])
+            : { ok: false, error: 'cart_changed' };
+        }
+      }
       if (
         !existing &&
         ('delta' in request ? request.delta < 0 : request.quantity === 0)
@@ -492,14 +640,7 @@ export class MinimalCartService {
       );
       if (!quote.ok) return quote;
       const next: CartState = {
-        items: quote.items.map(
-          ({ productId, variantId, quantity, unitPriceCents }) => ({
-            productId,
-            ...(variantId ? { variantId } : {}),
-            quantity,
-            unitPriceCents,
-          }),
-        ),
+        items: quote.items.map(storedLine),
         idempotencyKey: '',
         expectedTotalCents: quote.totalCents,
       };
@@ -539,6 +680,20 @@ export class MinimalCartService {
       'finalPriceCents' | 'appliedPromotionTitle' | 'discountAmountCents'
     >[] = [];
     for (const [index, line] of items.entries()) {
+      if (line.backorder !== undefined) {
+        // Restock backorder T5b: a reserved line is not sellable stock and
+        // is priced at its frozen final price, never from the catalog.
+        if (!money(line.unitPriceCents * line.quantity))
+          return { ok: false, error: 'price_unavailable' };
+        trusted.push({
+          ...line,
+          name: line.backorder.productName,
+          ...(line.backorder.variantName === null
+            ? {}
+            : { variantName: line.backorder.variantName }),
+        });
+        continue;
+      }
       const stock = await this.api.getStock(line.productId);
       if (stock.productId !== line.productId)
         return { ok: false, error: 'unknown_product' };
@@ -598,7 +753,10 @@ export class MinimalCartService {
         ...(variant ? { variantName: variant.name } : {}),
       });
     }
-    const evaluationItems = trusted.map(
+    // Backorder lines are outside the promotion base: only the ordinary
+    // lines are evaluated (contract §7).
+    const ordinary = trusted.filter((line) => line.backorder === undefined);
+    const evaluationItems = ordinary.map(
       ({ productId, variantId, quantity, unitPriceCents }) => ({
         productId,
         ...(variantId ? { variantId } : {}),
@@ -609,9 +767,15 @@ export class MinimalCartService {
     const customer = parseMexicanWhatsAppPhone(senderId);
     let evaluation: CartEvaluationResult;
     try {
-      evaluation = customer
-        ? await this.api.evaluateCart(evaluationItems, customer)
-        : await this.api.evaluateCart(evaluationItems);
+      evaluation =
+        evaluationItems.length === 0
+          ? {
+              items: [],
+              promotionEvaluationStatus: 'fully_evaluated',
+            }
+          : customer
+            ? await this.api.evaluateCart(evaluationItems, customer)
+            : await this.api.evaluateCart(evaluationItems);
     } catch (error) {
       if (
         error instanceof ChatbotApiError &&
@@ -630,13 +794,27 @@ export class MinimalCartService {
         !['unique', 'not_found', 'ambiguous', 'not_provided'].includes(
           evaluation.customerResolution,
         )) ||
-      evaluation.items.length !== trusted.length
+      evaluation.items.length !== ordinary.length
     )
       return { ok: false, error: 'invalid_evaluation' };
     let totalCents = 0;
     const quoted: QuotedItem[] = [];
-    for (const [index, expected] of trusted.entries()) {
-      const actual = evaluation.items[index];
+    let evaluated = 0;
+    for (const expected of trusted) {
+      if (expected.backorder !== undefined) {
+        const lineTotal = expected.unitPriceCents * expected.quantity;
+        totalCents += lineTotal;
+        if (!money(totalCents))
+          return { ok: false, error: 'invalid_evaluation' };
+        quoted.push({
+          ...expected,
+          finalPriceCents: lineTotal,
+          appliedPromotionTitle: null,
+          discountAmountCents: 0,
+        });
+        continue;
+      }
+      const actual = evaluation.items[evaluated++];
       if (
         actual.productId !== expected.productId ||
         (actual.variantId ?? undefined) !== expected.variantId ||
@@ -674,10 +852,16 @@ export class MinimalCartService {
 
 /** Stable short digest of cart lines; order-independent. */
 export function minimalCartFingerprint(
-  items: ReadonlyArray<Pick<CartItem, 'productId' | 'variantId' | 'quantity'>>,
+  items: ReadonlyArray<
+    Pick<CartItem, 'productId' | 'variantId' | 'quantity' | 'backorder'>
+  >,
 ): string {
   const lines = items
-    .map((item) => `${item.productId}|${item.variantId ?? ''}|${item.quantity}`)
+    .map(
+      (item) =>
+        `${item.productId}|${item.variantId ?? ''}|${item.quantity}` +
+        (item.backorder === undefined ? '' : `|${item.backorder.id}`),
+    )
     .sort();
   return createHash('sha256')
     .update(JSON.stringify(lines))
@@ -700,15 +884,60 @@ export function minimalCartReply(result: MinimalCartResult): string {
       return '¿Qué presentación desea agregar al carrito?';
     if (result.error === 'insufficient_stock')
       return 'No hay existencias suficientes para esa cantidad. Su carrito no fue modificado.';
+    if (result.error === 'backorder_line_locked')
+      return 'Esa pieza viene de su pedido apartado y no puedo cambiar su cantidad ni su precio; si quiere más, agrego otra línea. Su carrito no fue modificado.';
     if (result.error === 'order_unresolved')
       return 'Tengo un pedido suyo pendiente de confirmar. Para no duplicarlo no puedo cambiar el carrito: pida de nuevo el resumen y responda SÍ para reintentar ese mismo pedido, o comuníquese con la tienda. Su carrito no fue modificado.';
     return 'No pude completar esa operación del carrito. No confirmé ningún cambio; por favor, intente de nuevo.';
   }
-  if (result.items.length === 0) return 'Su carrito está vacío.';
+  const kept = removedBackorderNote(result.removedBackorders);
+  if (result.items.length === 0) return `Su carrito está vacío.${kept}`;
   const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
   const lines = result.items.map(
     (i) =>
-      `• ${minimalLineLabel(i.name, i.variantName)}: ${i.quantity} × ${mxn(i.unitPriceCents)}; importe ${mxn(i.finalPriceCents)}${minimalPromotionSuffix(i)}`,
+      `• ${minimalLineLabel(i.name, i.variantName)}: ${i.quantity} × ${mxn(i.unitPriceCents)}; importe ${mxn(i.finalPriceCents)}${minimalPromotionSuffix(i)}${minimalBackorderSuffix(i)}`,
   );
-  return `Su carrito:\n${lines.join('\n')}\nTotal de productos: ${mxn(result.totalCents)}.${result.promotionEvaluationStatus === 'needs_human_review' ? '\nLas promociones requieren revisión del equipo.' : ''}\n${MINIMAL_CART_SUMMARY_TAIL}`;
+  return `Su carrito:\n${lines.join('\n')}\nTotal de productos: ${mxn(result.totalCents)}.${result.promotionEvaluationStatus === 'needs_human_review' ? '\nLas promociones requieren revisión del equipo.' : ''}\n${MINIMAL_CART_SUMMARY_TAIL}${kept}`;
+}
+
+/** The result of a write, naming the backorder lines it removed (if any). */
+function withRemovedBackorders(
+  quote: MinimalCartResult,
+  dropped: readonly CartItem[],
+): MinimalCartResult {
+  const removed = dropped.flatMap((line) =>
+    line.backorder === undefined
+      ? []
+      : [
+          {
+            folio: line.backorder.folio,
+            reservedUntil: line.backorder.reservedUntil,
+          },
+        ],
+  );
+  return quote.ok && removed.length > 0
+    ? { ...quote, removedBackorders: removed }
+    : quote;
+}
+
+/**
+ * Restock backorder T5b: removing the line from the cart does not cancel the
+ * backorder; say it stays reserved until its deadline.
+ */
+function removedBackorderNote(
+  removed: Array<{ folio: string; reservedUntil: string }> | undefined,
+): string {
+  if (removed === undefined || removed.length === 0) return '';
+  const now = new Date();
+  return removed
+    .map(({ folio, reservedUntil }) => {
+      const until =
+        Date.parse(reservedUntil) > now.getTime()
+          ? backorderDateTime(reservedUntil, now)
+          : null;
+      return until === null
+        ? `\nSu pedido apartado ${folio} no se canceló al quitarlo del carrito.`
+        : `\nSu pedido apartado ${folio} sigue apartado ${until}; no se canceló al quitarlo del carrito.`;
+    })
+    .join('');
 }

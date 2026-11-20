@@ -36,6 +36,21 @@ export interface MinimalOrderLine {
   /** Display-only evaluation metadata; absent in older snapshots. */
   readonly appliedPromotionTitle?: string | null;
   readonly discountAmountCents?: number;
+  /**
+   * Restock backorder T5b: the line confirms this RESERVED backorder
+   * (`unitPriceCents` = its final price, no promotion). Absent on ordinary
+   * lines, so their snapshots are unchanged.
+   */
+  readonly backorder?: MinimalOrderBackorder;
+}
+
+/** The reservation a backorder line carries into the order. */
+export interface MinimalOrderBackorder {
+  readonly id: string;
+  readonly folio: string;
+  readonly productName: string;
+  readonly variantName: string | null;
+  readonly reservedUntil: string;
 }
 
 /** A fresh, server-derived cart quote (shape of a successful cart view). */
@@ -212,6 +227,7 @@ function canonicalize(snapshot: MinimalOrderSnapshot): string {
       item.finalPriceCents,
       item.appliedPromotionTitle ?? null,
       item.discountAmountCents ?? 0,
+      ...(item.backorder === undefined ? [] : [item.backorder.id]),
     ]),
     snapshot.totalCents,
     snapshot.shipping === undefined
@@ -279,6 +295,18 @@ export function minimalPromotionSuffix(
     ? `promoción: ${item.appliedPromotionTitle}, ahorro`
     : 'descuento: ahorro';
   return ` (${label} ${mxn(discount)})`;
+}
+
+/**
+ * Restock backorder T5b: « (pedido apartado BO-000012)» after the line of a
+ * confirmed backorder; empty for every ordinary line.
+ */
+export function minimalBackorderSuffix(
+  item: Pick<MinimalOrderLine, 'backorder'>,
+): string {
+  return item.backorder === undefined
+    ? ''
+    : ` (pedido apartado ${item.backorder.folio})`;
 }
 
 function deliveryLine(snapshot: MinimalOrderSnapshot): string {
@@ -353,7 +381,7 @@ export function renderMinimalOrderSummary(
     MINIMAL_ORDER_SUMMARY_HEADING,
     ...snapshot.items.map(
       (item) =>
-        `• ${minimalLineLabel(item.name, item.variantName)}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}`,
+        `• ${minimalLineLabel(item.name, item.variantName)}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}${minimalBackorderSuffix(item)}`,
     ),
     `Total de productos: ${mxn(snapshot.totalCents)}`,
     pickup

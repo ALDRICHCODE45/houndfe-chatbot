@@ -21,6 +21,16 @@ const line = z.strictObject({
   finalPriceCents: cents,
   appliedPromotionTitle: z.string().nullable().optional(),
   discountAmountCents: cents.optional(),
+  // Restock backorder T5b: absent on ordinary lines.
+  backorder: z
+    .strictObject({
+      id: z.string().min(1),
+      folio: z.string().min(1),
+      productName: z.string().min(1),
+      variantName: z.string().nullable(),
+      reservedUntil: z.string().min(1),
+    })
+    .optional(),
 });
 const shipping = z.union([
   z.strictObject({

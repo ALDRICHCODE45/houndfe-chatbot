@@ -290,6 +290,114 @@ describe('backorder HTTP adapter', () => {
     });
   });
 
+  describe('sourceDecisionId (backend T4, optional)', () => {
+    it('is parsed when present (a reschedule needs it) and absent otherwise', async () => {
+      request.mockReturnValue(
+        of(
+          response({ backorder: { ...backorder, sourceDecisionId: DECISION } }),
+        ),
+      );
+      await expect(client.getBackorder(ID)).resolves.toMatchObject({
+        sourceDecisionId: DECISION,
+      });
+      request.mockReturnValue(of(response({ backorder })));
+      const without = await client.getBackorder(ID);
+      expect(without).toEqual(backorder);
+      expect(without).not.toHaveProperty('sourceDecisionId');
+      request.mockReturnValue(
+        of(response({ backorder: { ...backorder, sourceDecisionId: null } })),
+      );
+      await expect(client.getBackorder(ID)).resolves.toMatchObject({
+        sourceDecisionId: null,
+      });
+    });
+
+    it('a non-text sourceDecisionId is an invalid backorder', async () => {
+      request.mockReturnValue(
+        of(response({ backorder: { ...backorder, sourceDecisionId: 7 } })),
+      );
+      await expect(client.getBackorder(ID)).rejects.toBeInstanceOf(
+        UpstreamError,
+      );
+    });
+  });
+
+  describe('undeliveredResumeAfter (feed recovery, backend T2)', () => {
+    it('sends updatedSince and returns backorderUndeliveredResumeAfter', async () => {
+      request.mockReturnValue(
+        of(
+          response({
+            items: [backorder],
+            backorderUndeliveredResumeAfter: '000000004310',
+          }),
+        ),
+      );
+      await expect(
+        client.undeliveredResumeAfter('2026-11-20T10:00:00.000Z'),
+      ).resolves.toBe('000000004310');
+      expect(request).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: 'GET',
+          url: '/chatbot-api/backorders',
+          params: { updatedSince: '2026-11-20T10:00:00.000Z' },
+        }),
+      );
+    });
+
+    it('omits updatedSince when unknown; null and a missing key are null', async () => {
+      request.mockReturnValue(
+        of(response({ items: [], backorderUndeliveredResumeAfter: null })),
+      );
+      await expect(client.undeliveredResumeAfter(null)).resolves.toBeNull();
+      expect(request).toHaveBeenCalledWith(
+        expect.objectContaining({ params: {} }),
+      );
+      request.mockReturnValue(of(response({ items: [] })));
+      await expect(client.undeliveredResumeAfter(null)).resolves.toBeNull();
+    });
+
+    it('does not depend on the items being valid backorders', async () => {
+      request.mockReturnValue(
+        of(
+          response({
+            items: [{ unexpected: true }],
+            backorderUndeliveredResumeAfter: '000000000001',
+          }),
+        ),
+      );
+      await expect(client.undeliveredResumeAfter(null)).resolves.toBe(
+        '000000000001',
+      );
+    });
+
+    it.each([7, '', {}, 'abc'])(
+      'a malformed position (%p) is an UpstreamError',
+      async (value) => {
+        request.mockReturnValue(
+          of(response({ items: [], backorderUndeliveredResumeAfter: value })),
+        );
+        await expect(
+          client.undeliveredResumeAfter(null),
+        ).rejects.toBeInstanceOf(UpstreamError);
+      },
+    );
+
+    it('retries a 5xx like any safe GET; a 403 surfaces as ForbiddenError', async () => {
+      request
+        .mockReturnValueOnce(throwError(() => httpError(503, {})))
+        .mockReturnValueOnce(
+          of(response({ items: [], backorderUndeliveredResumeAfter: null })),
+        );
+      await expect(client.undeliveredResumeAfter(null)).resolves.toBeNull();
+      expect(request).toHaveBeenCalledTimes(2);
+      request.mockReset();
+      request.mockReturnValue(throwError(() => httpError(403, {})));
+      await expect(client.undeliveredResumeAfter(null)).rejects.toBeInstanceOf(
+        ForbiddenError,
+      );
+    });
+  });
+
   describe('cancelBackorder', () => {
     it('POSTs the optional reason once and returns the cancelled backorder', async () => {
       const cancelled = {

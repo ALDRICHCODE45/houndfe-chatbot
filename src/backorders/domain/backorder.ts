@@ -61,6 +61,10 @@ const backorderSchema = z.object({
   cancelReason: nullableText,
   branchName: nullableText,
   customerFirstName: nullableText,
+  /** The RESTOCK decision the backorder was scheduled from. Optional: the
+   *  backend adds it with its T4 (a reschedule after expiry needs it); an
+   *  older backend omits it. */
+  sourceDecisionId: z.string().nullish(),
 });
 
 export type BackorderBot = z.infer<typeof backorderSchema>;
@@ -86,6 +90,26 @@ export function parseBackorderList(body: unknown): BackorderBot[] | null {
     out.push(parsed.data);
   }
   return out;
+}
+
+/** A feed cursor (fixed-width digits, compared as text). */
+const FEED_CURSOR = /^[0-9]{1,64}$/;
+
+/**
+ * `backorderUndeliveredResumeAfter` of the list body: `string` (a cursor),
+ * `null` (nothing owed, or the key is absent), `undefined` when the body or
+ * the member is malformed.
+ */
+export function parseBackorderResumeAfter(
+  body: unknown,
+): string | null | undefined {
+  if (typeof body !== 'object' || body === null) return undefined;
+  const value = (body as { backorderUndeliveredResumeAfter?: unknown })
+    .backorderUndeliveredResumeAfter;
+  if (value === undefined || value === null) return null;
+  return typeof value === 'string' && FEED_CURSOR.test(value)
+    ? value
+    : undefined;
 }
 
 export type BackorderCustomerInput =
@@ -133,6 +157,22 @@ export interface BackorderClient {
   listBackorders(query?: ListBackordersQuery): Promise<BackorderBot[]>;
   /** `POST /chatbot-api/backorders/:id/cancel` (scope `backorders:cancel`). */
   cancelBackorder(id: string, reason?: string): Promise<BackorderBot>;
+}
+
+/**
+ * Feed recovery after `410 CURSOR_EXPIRED` (backend T2): kept apart from
+ * `BackorderClient` so its fakes stay valid.
+ */
+export const BACKORDER_RECOVERY_CLIENT = Symbol('BACKORDER_RECOVERY_CLIENT');
+
+export interface BackorderRecoveryClient {
+  /**
+   * `backorderUndeliveredResumeAfter` of `GET /chatbot-api/backorders`
+   * (scope `backorders:read`): the feed `after` re-serving the sucursal's
+   * oldest backorder item without a terminal ACK, `null` when none (or the
+   * backend does not report it). `updatedSince` is sent only when known.
+   */
+  undeliveredResumeAfter(updatedSince: string | null): Promise<string | null>;
 }
 
 /** The estimate date the backend derives: `resolvedAt + restockDays`. */

@@ -29,6 +29,15 @@ export interface HumanRequestFeedConsumerPorts {
   client: Pick<HumanRequestsClient, 'readFeed' | 'listOpenRequests'>;
   delivery: Pick<HumanRequestDeliveryService, 'accept' | 'abandon'>;
   lock: FeedConsumerLock;
+  /** Restock backorder recovery (T5a): the feed position re-serving the
+   *  oldest unacknowledged `backorder.*` item
+   *  (`backorderUndeliveredResumeAfter` of `GET /chatbot-api/backorders`),
+   *  `null` when there is none. `updatedSince` is the stored synced_at
+   *  (`null` when never saved). Rejects on a transient failure: the walk then
+   *  saves nothing. Optional: without it the position is not considered. */
+  backorders?: {
+    undeliveredResumeAfter(updatedSince: string | null): Promise<string | null>;
+  };
 }
 
 export interface HumanRequestFeedConsumerOptions {
@@ -192,8 +201,9 @@ export class HumanRequestFeedConsumer {
    * every page of the open requests route from the stored synced_at,
    * reconciles the registry, hands every pending delivery to the same path as
    * a feed item, and only then saves the smallest of `nextCursor`, every
-   * `undeliveredResumeAfter` and every `saleUndeliveredResumeAfter` (pay in
-   * store; plain fixed-width string comparison) with the
+   * `undeliveredResumeAfter`, every `saleUndeliveredResumeAfter` (pay in
+   * store) and the `backorderUndeliveredResumeAfter` (restock backorder;
+   * plain fixed-width string comparison) with the
    * walk start as synced_at. Any failure leaves the expired cursor in place,
    * so the next pass gets 410 again and walks from the first page.
    */
@@ -252,6 +262,17 @@ export class HumanRequestFeedConsumer {
       page = result.nextPage;
     }
     if (this.stopped) return { kind: 'stopped' };
+    // Restock backorder items belong to no request and never appear in the
+    // walk above: the backend names the feed position re-serving the oldest
+    // one without a terminal outcome. Fixed-width cursors: string compare.
+    if (this.ports.backorders !== undefined) {
+      const lookup = this.ports.backorders.undeliveredResumeAfter(updatedSince);
+      lookup.catch(() => undefined);
+      const backorder = await this.untilStopped(lookup);
+      if (backorder === STOPPED || this.stopped) return { kind: 'stopped' };
+      if (backorder !== null && (resume === undefined || backorder < resume))
+        resume = backorder;
+    }
     // Local OPEN rows the backend no longer lists as open are closed.
     const local = await this.ports.store.listOpenRequestIds(
       new Date(startedAt - this.recoveryGraceMs),

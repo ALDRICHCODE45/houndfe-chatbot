@@ -81,6 +81,11 @@ const FULFIL_DELIVERY = 'fulfil_delivery';
 const FULFIL_PICKUP = 'fulfil_pickup';
 const BACKORDER = 'backorder';
 const BACKORDER_CANCEL = 'backorder_cancel';
+// Restock backorder T5b: the notice's Confirm button and the reschedule pair
+// (the reference is the BACKORDER id; one segment, no action).
+const BACKORDER_CONFIRM = 'backorder_confirm';
+const BACKORDER_RESCHEDULE = 'backorder_reschedule';
+const BACKORDER_RESCHEDULE_DECLINE = 'backorder_reschedule_decline';
 const BACKORDER_REFERENCE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -90,6 +95,10 @@ export const INTERACTIVE_CONFIRM_TEXT = 'SÍ';
 export const INTERACTIVE_BACKORDER_DECLINE_TEXT = 'No, gracias';
 /** Restock backorder S8: what the «No» button of the cancel question stands for. */
 export const INTERACTIVE_BACKORDER_KEEP_TEXT = 'No';
+/** Restock backorder T5b: what the notice's Confirm button stands for. */
+export const INTERACTIVE_BACKORDER_CONFIRM_TEXT = 'Confirmo mi pedido apartado';
+/** Restock backorder T5b: «No, gracias» under the reschedule question. */
+export const INTERACTIVE_BACKORDER_RESCHEDULE_DECLINE_TEXT = 'No, gracias';
 /** Change intents: never an affirmative for the confirmation gates. */
 export const INTERACTIVE_ORDER_CHANGE_TEXT = 'Quiero cambiar algo';
 export const INTERACTIVE_CHECKOUT_CHANGE_TEXT = 'Quiero corregir mis datos';
@@ -134,6 +143,18 @@ export type InteractiveReplyIntent =
   | {
       kind: 'backorder_cancel';
       action: 'yes' | 'no' | 'pick';
+      reference: string;
+    }
+  /**
+   * Restock backorder T5b: the arrival / reminder notice's Confirm button and
+   * the reschedule question's buttons after an expiry; the reference is the
+   * BACKORDER id (re-verified against the customer's own backorders).
+   */
+  | {
+      kind:
+        | 'backorder_confirm'
+        | 'backorder_reschedule'
+        | 'backorder_reschedule_decline';
       reference: string;
     };
 
@@ -200,6 +221,12 @@ export function parseInteractiveReplyId(
         return null;
       return { kind: 'backorder_cancel', action, reference };
     }
+    case BACKORDER_CONFIRM:
+    case BACKORDER_RESCHEDULE:
+    case BACKORDER_RESCHEDULE_DECLINE:
+      return tail !== null && BACKORDER_REFERENCE.test(tail)
+        ? { kind: head, reference: tail }
+        : null;
     case PAYMENT_METHOD: {
       // Tail is `<method>:<saleId>`; both parts are required.
       const split = tail === null ? -1 : tail.indexOf(':');
@@ -249,6 +276,12 @@ export function interactiveReplyText(id: unknown, title: unknown): string {
       return intent.action === 'no'
         ? INTERACTIVE_BACKORDER_KEEP_TEXT
         : fallback;
+    case 'backorder_confirm':
+      return INTERACTIVE_BACKORDER_CONFIRM_TEXT;
+    case 'backorder_reschedule':
+      return INTERACTIVE_CONFIRM_TEXT;
+    case 'backorder_reschedule_decline':
+      return INTERACTIVE_BACKORDER_RESCHEDULE_DECLINE_TEXT;
     case 'order_change':
     case 'reorder_change':
       return INTERACTIVE_ORDER_CHANGE_TEXT;
@@ -582,5 +615,27 @@ export function boundProductImageContext(
   return {
     known: Object.fromEntries(Object.entries(context.known).slice(-KNOWN_MAX)),
     sent: context.sent.slice(-SENT_MAX),
+  };
+}
+
+/**
+ * Restock backorder T5b: «Sí, agendar» / «No, gracias» under the offer to
+ * schedule an expired backorder again, bound to the backorder. Titles are the
+ * same in usted and tú.
+ */
+export function backorderRescheduleButtons(
+  backorderId: string,
+  prompt: string,
+): CustomerReplyInteractive {
+  return {
+    type: 'buttons',
+    buttons: [
+      { id: `${BACKORDER_RESCHEDULE}:${backorderId}`, title: 'Sí, agendar' },
+      {
+        id: `${BACKORDER_RESCHEDULE_DECLINE}:${backorderId}`,
+        title: INTERACTIVE_BACKORDER_RESCHEDULE_DECLINE_TEXT,
+      },
+    ],
+    prompt,
   };
 }

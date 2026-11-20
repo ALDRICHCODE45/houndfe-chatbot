@@ -36,6 +36,7 @@ interface Row {
   attempted_at: Date | null;
   ack_state: AckState | null;
   ack_outcome: DeliveryOutcome | null;
+  ack_reason?: string | null;
   ack_attempts: number;
   next_ack_at: Date | null;
   created_at: Date;
@@ -89,6 +90,7 @@ const TRANSITION_SQL = `UPDATE human_request_deliveries SET
   provider_message_id = $8,
   ack_state = CASE WHEN $9::text IS NULL THEN NULL ELSE 'PENDING' END,
   ack_outcome = $9::text,
+  ack_reason = CASE WHEN $9::text = 'PROVIDER_REJECTED' THEN $10::text ELSE NULL END,
   ack_attempts = 0,
   next_ack_at = CASE WHEN $9::text IS NULL THEN NULL ELSE now() END,
   ack_error = NULL,
@@ -110,7 +112,8 @@ const ACK_RETRY_SQL = `UPDATE human_request_deliveries
       ack_error = left($4, 1000), updated_at = now()
   ${ACK_GUARD}`;
 const ACK_DROPPED_SQL = `UPDATE human_request_deliveries
-  SET ack_state = NULL, ack_outcome = NULL, next_ack_at = NULL, updated_at = now()
+  SET ack_state = NULL, ack_outcome = NULL, ack_reason = NULL, next_ack_at = NULL,
+      updated_at = now()
   ${ACK_GUARD}`;
 
 const DUE_ACKS_SQL = `SELECT * FROM human_request_deliveries
@@ -265,6 +268,7 @@ export class PostgresHumanRequestFeedStore implements HumanRequestFeedStore {
       next.attemptedAt,
       next.providerMessageId,
       next.ack,
+      next.ackReason ?? null,
     ]);
     return result.rows[0] ? toDelivery(result.rows[0]) : null;
   }
@@ -425,6 +429,7 @@ const toDelivery = (row: Row): DeliveryRow => ({
     row.attempted_at === null ? null : row.attempted_at.toISOString(),
   ackState: row.ack_state,
   ackOutcome: row.ack_outcome,
+  ackReason: row.ack_reason ?? null,
   ackAttempts: row.ack_attempts,
   nextAckAt: row.next_ack_at,
   createdAt: row.created_at,

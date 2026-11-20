@@ -71,6 +71,7 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
       attemptedAt: null,
       ackState: null,
       ackOutcome: null,
+      ackReason: null,
       ackAttempts: 0,
       nextAckAt: null,
       createdAt: now,
@@ -111,6 +112,8 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
       providerMessageId: next.providerMessageId,
       ackState: next.ack === null ? null : 'PENDING',
       ackOutcome: next.ack,
+      ackReason:
+        next.ack === 'PROVIDER_REJECTED' ? (next.ackReason ?? null) : null,
       ackAttempts: 0,
       nextAckAt: next.ack === null ? null : now,
       updatedAt: now,
@@ -143,6 +146,7 @@ export class InMemoryHumanRequestFeedStore implements HumanRequestFeedStore {
       case null:
         row.ackState = null;
         row.ackOutcome = null;
+        row.ackReason = null;
         row.nextAckAt = null;
         break;
     }

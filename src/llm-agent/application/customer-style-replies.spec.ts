@@ -42,6 +42,22 @@ import { minimalZoneResumeShippingSentence } from '../domain/minimal-shipping';
 import {
   BACKORDER_ASK_NAME_REPLY,
   BACKORDER_ASK_QUANTITY_REPLY,
+  BACKORDER_CANCELLED_ALREADY_REPLY,
+  BACKORDER_CONFIRMED_ALREADY_REPLY,
+  BACKORDER_CONFIRM_FAILED_REPLY,
+  BACKORDER_CONFIRM_NOT_FOUND_REPLY,
+  BACKORDER_MISMATCH_REPLY,
+  BACKORDER_REPRICE_FAILED_REPLY,
+  BACKORDER_RESCHEDULE_DECLINE_REPLY,
+  BACKORDER_RESCHEDULE_PROMPT,
+  BACKORDER_RESCHEDULE_QUESTION,
+  BACKORDER_RESCHEDULE_UNAVAILABLE_REPLY,
+  BACKORDER_RESERVATION_UNAVAILABLE_REPLY,
+  backorderAddedReply,
+  backorderExpiredReply,
+  backorderLineDroppedReply,
+  backorderNotReservedYetReply,
+  backorderRescheduleStateReply,
   BACKORDER_DECLINE_REPLY,
   BACKORDER_CANCEL_FAILED_REPLY,
   BACKORDER_CANCEL_PICK_PROMPT,
@@ -567,6 +583,49 @@ const REPLIES: Record<string, string> = {
     folio: 'BO-000012',
     status: 'CONFIRMED',
   }),
+  // Restock backorder T5b (S6): confirm, checkout refusals and reschedule.
+  backorderConfirmNotFound: BACKORDER_CONFIRM_NOT_FOUND_REPLY,
+  backorderConfirmFailed: BACKORDER_CONFIRM_FAILED_REPLY,
+  backorderConfirmedAlready: BACKORDER_CONFIRMED_ALREADY_REPLY,
+  backorderCancelledAlready: BACKORDER_CANCELLED_ALREADY_REPLY,
+  backorderExpired: backorderExpiredReply(BO),
+  backorderNotReservedYet: backorderNotReservedYetReply(BO),
+  backorderAdded: backorderAddedReply(
+    { ...BO_RESERVED, ...BO, finalPriceCents: 109900 },
+    BO_NOW,
+  ),
+  ...Object.fromEntries(
+    (
+      [
+        'expired',
+        'confirmed',
+        'cancelled',
+        'waiting',
+        'lost',
+        'not_found',
+        'unknown',
+      ] as const
+    ).map((why) => [
+      `backorderDropped_${why}`,
+      backorderLineDroppedReply(why, BO),
+    ]),
+  ),
+  backorderDroppedNoFolio: backorderLineDroppedReply('lost', null),
+  backorderReservationUnavailable: BACKORDER_RESERVATION_UNAVAILABLE_REPLY,
+  backorderMismatch: BACKORDER_MISMATCH_REPLY,
+  backorderRepriceFailed: BACKORDER_REPRICE_FAILED_REPLY,
+  backorderRescheduleQuestion: BACKORDER_RESCHEDULE_QUESTION,
+  backorderReschedulePrompt: BACKORDER_RESCHEDULE_PROMPT,
+  backorderRescheduleDecline: BACKORDER_RESCHEDULE_DECLINE_REPLY,
+  backorderRescheduleUnavailable: BACKORDER_RESCHEDULE_UNAVAILABLE_REPLY,
+  backorderRescheduleActive: backorderRescheduleStateReply({
+    folio: 'BO-000012',
+    status: 'WAITING',
+  }),
+  backorderRescheduleConfirmed: backorderRescheduleStateReply({
+    folio: 'BO-000012',
+    status: 'CONFIRMED',
+  }),
   restockUnavailable:
     '¡Gracias por la espera! 😊 Por ahora el equipo no pudo confirmar un estimado de reposición para «Collar».',
   // Fixed copy of prepareExpirationReply (unavailable branch).
@@ -705,6 +764,31 @@ describe('restock backorder copy in tú (S8 cancel and status)', () => {
     );
     expect(applyCustomerStyle(REPLIES.backorderInactiveCancelled, tu)).toBe(
       'Tu pedido BO-000012 ya estaba cancelado, así que no está agendado.',
+    );
+  });
+});
+
+describe('restock backorder copy in tú (T5b confirm, checkout and reschedule)', () => {
+  it('pins the confirmation lead, the refusals and the reschedule question', () => {
+    expect(applyCustomerStyle(REPLIES.backorderAdded, tu)).toBe(
+      'Listo, tu pedido apartado BO-000012 (2 × Collar) ya está en tu carrito a $1099.00 MXN c/u. Te lo tenemos apartado hasta el 21 de noviembre a las 9:00 a. m.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderExpired, tu)).toBe(
+      'Se venció el apartado de tu pedido BO-000012.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderRescheduleQuestion, tu)).toBe(
+      '¿Quieres que te lo agende de nuevo? Quedaría al final de la fila de espera.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderDropped_lost, tu)).toBe(
+      'Lo siento, el lote apartado de tu pedido BO-000012 venció y ya no te lo tenemos apartado. Sigues primero en la fila: te aviso en cuanto llegue de nuevo. Quité esa pieza de tu carrito y no se creó ningún pedido.',
+    );
+    expect(
+      applyCustomerStyle(REPLIES.backorderReservationUnavailable, tu),
+    ).toBe(
+      'Hubo un problema al confirmar tu pedido apartado; el equipo te va a llamar para resolverlo. No se creó ningún pedido.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderRescheduleUnavailable, tu)).toBe(
+      'No puedo agendarlo de nuevo de forma automática. Si quieres, dime «hablar con una persona» y el equipo te ayuda.',
     );
   });
 });

@@ -16,8 +16,10 @@ import { CHATBOT_API_SLEEP } from '../../chatbot-api/infrastructure/chatbot-api-
 import {
   parseBackorderEnvelope,
   parseBackorderList,
+  parseBackorderResumeAfter,
   type BackorderBot,
   type BackorderClient,
+  type BackorderRecoveryClient,
   type CreateBackorderInput,
   type CreateBackorderResult,
   type ListBackordersQuery,
@@ -42,7 +44,9 @@ const TIMEOUT_MS = 10_000;
  * idempotency key.
  */
 @Injectable()
-export class BackorderHttpClient implements BackorderClient {
+export class BackorderHttpClient
+  implements BackorderClient, BackorderRecoveryClient
+{
   constructor(
     private readonly httpService: HttpService,
     private readonly configService: ConfigService,
@@ -95,6 +99,33 @@ export class BackorderHttpClient implements BackorderClient {
       true,
     );
     return this.accept(response, [200], parseBackorderList);
+  }
+
+  async undeliveredResumeAfter(
+    updatedSince: string | null,
+  ): Promise<string | null> {
+    const response = await this.send(
+      {
+        method: 'GET',
+        url: '/chatbot-api/backorders',
+        params: updatedSince === null ? {} : { updatedSince },
+      },
+      true,
+    );
+    // Only the position matters here: a drift of the item shape must never
+    // block the feed recovery.
+    const position =
+      response.status === 200
+        ? parseBackorderResumeAfter(response.data)
+        : undefined;
+    if (position === undefined)
+      throw new UpstreamError(
+        'Chatbot API backorder response was invalid',
+        response.status,
+        response.data,
+        extractErrorCode(response.data),
+      );
+    return position;
   }
 
   async cancelBackorder(id: string, reason?: string): Promise<BackorderBot> {

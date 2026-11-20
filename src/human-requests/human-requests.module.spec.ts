@@ -18,6 +18,9 @@ import {
   LIVE_RECONCILE_REF,
   type LiveReconcileRef,
 } from '../conversation/domain/live-reconcile-ref';
+import { BackorderFeedNoticeService } from '../backorders/application/backorder-feed.handler';
+import { BackorderFeedRecovery } from '../backorders/application/backorder-feed-recovery';
+import { BACKORDER_FEED_HANDLER } from './domain/backorder-feed';
 import { LiveConversationReconcileWorker } from './application/live-conversation-reconcile.worker';
 import { HumanRequestCreateService } from './application/human-request-create.service';
 import { HumanRequestDeliveryService } from './application/human-request-delivery.service';
@@ -177,6 +180,72 @@ describe('HumanRequestsModule', () => {
         await moduleRef.close();
       },
     );
+  });
+
+  describe('restock backorder T5a wiring', () => {
+    const backorderOf = (moduleRef: Awaited<ReturnType<typeof compile>>) =>
+      (
+        moduleRef.get<unknown>(HumanRequestDeliveryService) as {
+          ports: { backorder?: { ports: Record<string, unknown> } };
+        }
+      ).ports.backorder;
+
+    it('BackordersModule provides the real handler for BACKORDER_FEED_HANDLER and the delivery service gets it', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule);
+      const handler = backorderOf(moduleRef);
+      expect(handler).toBeInstanceOf(BackorderFeedNoticeService);
+      expect(moduleRef.get(BACKORDER_FEED_HANDLER, { strict: false })).toBe(
+        handler,
+      );
+      await moduleRef.close();
+    });
+
+    it.each([
+      ['on', { templatesEnabled: true }, true],
+      ['off', { templatesEnabled: false }, false],
+      ['unset', {}, false],
+      ['a string', { templatesEnabled: 'true' }, false],
+    ])(
+      'templates flag %s: the handler gets templatesEnabled only when exactly true',
+      async (_name, backorder, expected) => {
+        const { pool } = fakePool();
+        const moduleRef = await compile(pool, HumanRequestsServicesModule, {
+          backorder,
+        });
+        expect(backorderOf(moduleRef)?.ports.templatesEnabled === true).toBe(
+          expected,
+        );
+        await moduleRef.close();
+      },
+    );
+
+    it('the configured template names reach the handler', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool, HumanRequestsServicesModule, {
+        backorder: {
+          templatesEnabled: true,
+          templateNames: { reserved: 'mi_llego' },
+        },
+      });
+      expect(backorderOf(moduleRef)?.ports.templateNames).toEqual({
+        reserved: 'mi_llego',
+      });
+      await moduleRef.close();
+    });
+
+    it('the feed consumer gets the backorder recovery position on bootstrap', async () => {
+      const { pool } = fakePool();
+      const moduleRef = await compile(pool);
+      await moduleRef.init();
+      const lifecycle = moduleRef.get<unknown>(HumanRequestFeedLifecycle) as {
+        consumer: { ports: { backorders?: unknown } };
+      };
+      expect(lifecycle.consumer.ports.backorders).toBeInstanceOf(
+        BackorderFeedRecovery,
+      );
+      await moduleRef.close();
+    });
   });
 
   describe('unit 14 T4 wiring (scheduling state ports)', () => {

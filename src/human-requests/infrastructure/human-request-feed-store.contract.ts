@@ -180,6 +180,41 @@ export const SALE_PICKUP_REVIEW_DECISIONS: DeliveryDecision[] = [
   'PICKUP_EXPIRED_REVIEW_NOTICE',
 ];
 
+/** Decisions of the restock backorder notices (migration 5600). */
+export const BACKORDER_DECISIONS: DeliveryDecision[] = [
+  'BACKORDER_RESERVED_NOTICE',
+  'BACKORDER_REMINDER_NOTICE',
+  'BACKORDER_EXPIRED_NOTICE',
+  'BACKORDER_LOST_NOTICE',
+  'BACKORDER_CANCELLED_NOTICE',
+  'BACKORDER_ETA_PENDING',
+  'BACKORDER_PAYLOAD_INVALID',
+  'BACKORDER_OVERTAKEN',
+  'TEMPLATE_NOT_APPROVED',
+];
+
+/** A typed restock backorder item (requestId null, no saleId). */
+export const backorderItem = (deliveryId: string): FeedItem => ({
+  type: 'backorder.reserved',
+  cursor: '000000004311',
+  deliveryId,
+  requestId: null,
+  conversationRef: REF,
+  notBefore: null,
+  expiresAt: null,
+  payload: {
+    backorderId: '0d3c0000-1111-4222-8333-444455556666',
+    folio: 'BO-000012',
+    productName: 'Croquetas',
+    variantName: null,
+    quantity: 2,
+    branchName: 'Centro',
+    customerFirstName: 'Rosa',
+    version: 3,
+    raw: { finalPriceCents: 109900 },
+  },
+});
+
 /** A typed pay-in-store sale item (requestId null, a saleId). */
 export const salePickupItem = (deliveryId: string): FeedItem => ({
   type: 'sale.pickup_reminder',
@@ -527,6 +562,110 @@ export function runHumanRequestFeedStoreContract(
         });
       },
     );
+
+    it.each(BACKORDER_DECISIONS)(
+      'records the restock backorder decision %s on a transition',
+      async (decision) => {
+        await store.insertDelivery(backorderItem('bo-d'));
+        const next = await store.transition(
+          'bo-d',
+          { localState: 'RECEIVED', attemptId: null },
+          {
+            localState: 'STALE',
+            decision,
+            attemptId: ATTEMPT_A,
+            attemptedAt: AT,
+            providerMessageId: null,
+            ack: 'STALE',
+          },
+        );
+        expect(next).toMatchObject({
+          decision,
+          localState: 'STALE',
+          ackReason: null,
+        });
+      },
+    );
+
+    it('stores PROVIDER_REJECTED with its reason and clears it on the next attempt', async () => {
+      await store.insertDelivery(backorderItem('bo-r'));
+      const rejected = await store.transition(
+        'bo-r',
+        { localState: 'RECEIVED', attemptId: null },
+        {
+          localState: 'STALE',
+          decision: 'TEMPLATE_NOT_APPROVED',
+          attemptId: ATTEMPT_A,
+          attemptedAt: AT,
+          providerMessageId: null,
+          ack: 'PROVIDER_REJECTED',
+          ackReason: 'TEMPLATE_NOT_APPROVED',
+        },
+      );
+      expect(rejected).toMatchObject({
+        ackState: 'PENDING',
+        ackOutcome: 'PROVIDER_REJECTED',
+        ackReason: 'TEMPLATE_NOT_APPROVED',
+      });
+      await expect(store.getDelivery('bo-r')).resolves.toMatchObject({
+        ackOutcome: 'PROVIDER_REJECTED',
+        ackReason: 'TEMPLATE_NOT_APPROVED',
+      });
+      // The reason survives the ACK retry bookkeeping.
+      await store.completeAck('bo-r', ATTEMPT_A, {
+        ackState: 'PENDING',
+        retryAt: new Date(Date.now() + 60_000),
+        error: 'boom',
+      });
+      await expect(store.getDelivery('bo-r')).resolves.toMatchObject({
+        ackReason: 'TEMPLATE_NOT_APPROVED',
+      });
+      await store.completeAck('bo-r', ATTEMPT_A, { ackState: 'ACKED' });
+      await expect(store.getDelivery('bo-r')).resolves.toMatchObject({
+        ackState: 'ACKED',
+        ackReason: 'TEMPLATE_NOT_APPROVED',
+      });
+      // A new attempt with another outcome carries no reason.
+      const again = await store.transition(
+        'bo-r',
+        { localState: 'STALE', attemptId: ATTEMPT_A },
+        {
+          localState: 'STALE',
+          decision: 'HUMAN_SESSION',
+          attemptId: ATTEMPT_B,
+          attemptedAt: AT,
+          providerMessageId: null,
+          ack: 'STALE',
+          ackReason: 'ignored: STALE has no reason',
+        },
+      );
+      expect(again).toMatchObject({ ackOutcome: 'STALE', ackReason: null });
+    });
+
+    it('dropping an owed ACK drops its reason', async () => {
+      await store.insertDelivery(backorderItem('bo-x'));
+      await store.transition(
+        'bo-x',
+        { localState: 'RECEIVED', attemptId: null },
+        {
+          localState: 'STALE',
+          decision: 'HUMAN_SESSION',
+          attemptId: ATTEMPT_A,
+          attemptedAt: AT,
+          providerMessageId: null,
+          ack: 'PROVIDER_REJECTED',
+          ackReason: 'HUMAN_SESSION',
+        },
+      );
+      await expect(
+        store.completeAck('bo-x', ATTEMPT_A, { ackState: null }),
+      ).resolves.toBe(true);
+      await expect(store.getDelivery('bo-x')).resolves.toMatchObject({
+        ackState: null,
+        ackOutcome: null,
+        ackReason: null,
+      });
+    });
 
     it('stores a scheduled item with its request and conversation', async () => {
       await store.insertDelivery(rescheduledItem('sc-r'));

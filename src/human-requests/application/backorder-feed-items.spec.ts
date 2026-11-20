@@ -4,6 +4,10 @@ import { ConfigService } from '@nestjs/config';
 import { AxiosHeaders, type AxiosRequestConfig } from 'axios';
 import { of, throwError } from 'rxjs';
 import type { BackorderFeedItem } from '../../chatbot-api/domain/dtos/human-requests.dto';
+import type {
+  OutboundInteractive,
+  OutboundTemplate,
+} from '../../whatsapp/domain/whatsapp-sender.port';
 import { ChatbotApiHttpClient } from '../../chatbot-api/infrastructure/chatbot-api-http.client';
 import type { BackorderFeedHandler } from '../domain/backorder-feed';
 import {
@@ -99,6 +103,14 @@ describe('backorder feed items (restock backorder S15)', () => {
       sendText?: (message: { to: string; text: string }) => Promise<{
         providerMessageId: string;
       }>;
+      sendInteractive?: (message: OutboundInteractive) => Promise<{
+        providerMessageId: string;
+        providerMessageIds: string[];
+      }>;
+      sendTemplate?: (message: OutboundTemplate) => Promise<{
+        providerMessageId: string;
+      }>;
+      ackFails?: boolean;
     } = {},
   ) => {
     const http = new HttpService();
@@ -120,6 +132,8 @@ describe('backorder feed items (restock backorder S15)', () => {
         const body = config.data as Record<string, unknown>;
         const deliveryId = decodeURIComponent(ack[1]);
         acks.push({ deliveryId, body });
+        if (options.ackFails === true)
+          return throwError(() => new Error('socket hang up'));
         return of(
           response({
             deliveryId,
@@ -148,6 +162,12 @@ describe('backorder feed items (restock backorder S15)', () => {
       store,
       client,
       sender: {
+        ...(options.sendInteractive === undefined
+          ? {}
+          : { sendInteractive: options.sendInteractive }),
+        ...(options.sendTemplate === undefined
+          ? {}
+          : { sendTemplate: options.sendTemplate }),
         sendText:
           options.sendText ??
           ((message: { to: string; text: string }) => {
@@ -167,7 +187,7 @@ describe('backorder feed items (restock backorder S15)', () => {
       { store, client, delivery, lock: new FakeLock() },
       { sleep: () => Promise.resolve() },
     );
-    return { client, store, consumer, feedPages, acks, sent };
+    return { client, store, consumer, feedPages, acks, sent, delivery };
   };
 
   it('parses backorder.* as typed items: requestId null, no saleId key, loose common payload, every other member kept', async () => {
@@ -392,6 +412,331 @@ describe('backorder feed items (restock backorder S15)', () => {
     });
   });
 
+  describe('T5a: buttons, PROVIDER_REJECTED and its stored reason (S9, S13)', () => {
+    const BUTTONS = [
+      { id: `backorder_confirm:${BACKORDER}`, title: 'Confirmar pedido' },
+      {
+        id: `backorder_cancel:pick:${BACKORDER}`,
+        title: 'Ya no lo quiero',
+      },
+    ];
+    const sendPlan = (extra: Record<string, unknown> = {}) => ({
+      plan: jest.fn(() =>
+        Promise.resolve({
+          action: 'send' as const,
+          decision: 'BACKORDER_RESERVED_NOTICE' as const,
+          senderId: '5215512349901',
+          text: 'Ya llegó su pedido BO-000012. ¿Lo confirmamos?',
+          ...extra,
+        }),
+      ),
+    });
+    const wire = (id: string, type = 'backorder.reserved') => ({
+      items: [backorderWire(id, type)],
+      nextCursor: `0000000000${id}`,
+    });
+    const refusal = (status: number) =>
+      Object.assign(new Error('Meta refused'), {
+        name: 'WhatsappSendError',
+        status,
+        stage: 'send',
+      });
+    const interactive = () => {
+      const calls: OutboundInteractive[] = [];
+      return {
+        calls,
+        sendInteractive: (message: OutboundInteractive) => {
+          calls.push(message);
+          return Promise.resolve({
+            providerMessageId: 'wamid.btn',
+            providerMessageIds: ['wamid.btn'],
+          });
+        },
+      };
+    };
+
+    it('a plan with buttons goes out as an interactive message, not as text', async () => {
+      const buttons = interactive();
+      const { consumer, feedPages, acks, sent } = setup({
+        backorder: sendPlan({
+          buttons: BUTTONS,
+          shortBody: '¿Lo confirmamos?',
+        }),
+        sendInteractive: buttons.sendInteractive,
+      });
+      feedPages.push(wire('30'));
+      await consumer.runOnce();
+      expect(sent).toEqual([]);
+      expect(buttons.calls).toEqual([
+        {
+          to: '5215512349901',
+          body: 'Ya llegó su pedido BO-000012. ¿Lo confirmamos?',
+          shortBody: '¿Lo confirmamos?',
+          interactive: { type: 'buttons', buttons: BUTTONS },
+        },
+      ]);
+      expect(acks[0].body).toMatchObject({
+        outcome: 'PROVIDER_ACCEPTED',
+        providerMessageId: 'wamid.btn',
+      });
+    });
+
+    it('a sender without interactive support sends the plain text', async () => {
+      const { consumer, feedPages, sent, acks } = setup({
+        backorder: sendPlan({ buttons: BUTTONS }),
+      });
+      feedPages.push(wire('31'));
+      await consumer.runOnce();
+      expect(sent).toHaveLength(1);
+      expect(acks[0].body.outcome).toBe('PROVIDER_ACCEPTED');
+    });
+
+    it('a rejected plan is ACKed PROVIDER_REJECTED with its reason, persisted and replayed verbatim', async () => {
+      const backorder = {
+        plan: jest.fn(() =>
+          Promise.resolve({
+            action: 'rejected' as const,
+            decision: 'TEMPLATE_NOT_APPROVED' as const,
+            reason: 'TEMPLATE_NOT_APPROVED',
+          }),
+        ),
+      };
+      const { consumer, feedPages, acks, sent, store } = setup({
+        backorder,
+        ackFails: true,
+      });
+      feedPages.push(wire('32'));
+      await expect(consumer.runOnce()).resolves.toEqual({
+        kind: 'page',
+        items: 1,
+      });
+      expect(sent).toEqual([]);
+      expect(acks[0].body).toEqual({
+        outcome: 'PROVIDER_REJECTED',
+        attemptId: expect.any(String) as unknown,
+        attemptedAt: expect.any(String) as unknown,
+        reason: 'TEMPLATE_NOT_APPROVED',
+      });
+      expect(acks[0].body).not.toHaveProperty('providerMessageId');
+      // The ACK failed (socket hang up): the row keeps what to replay.
+      await expect(store.getDelivery('32')).resolves.toMatchObject({
+        localState: 'STALE',
+        decision: 'TEMPLATE_NOT_APPROVED',
+        ackState: 'PENDING',
+        ackOutcome: 'PROVIDER_REJECTED',
+        ackReason: 'TEMPLATE_NOT_APPROVED',
+      });
+    });
+
+    it('the durable ACK sweep resends the identical PROVIDER_REJECTED body', async () => {
+      const backorder = {
+        plan: jest.fn(() =>
+          Promise.resolve({
+            action: 'rejected' as const,
+            decision: 'NO_CONVERSATION' as const,
+            reason: 'NO_CONVERSATION',
+          }),
+        ),
+      };
+      const { consumer, feedPages, acks, delivery } = setup({
+        backorder,
+        ackFails: true,
+      });
+      feedPages.push(wire('33'));
+      await consumer.runOnce();
+      const first = acks[0].body;
+      // Replay of the due ACK (the maintenance worker's sweep).
+      await delivery.sweepAcks();
+      await delivery.sweepAcks();
+      expect(acks.length).toBeGreaterThanOrEqual(1);
+      for (const ack of acks) expect(ack.body).toEqual(first);
+    });
+
+    describe('staffAlert plans (reserved / reminder)', () => {
+      it('a HUMAN conversation: PROVIDER_REJECTED HUMAN_SESSION, nothing sent', async () => {
+        const { consumer, feedPages, acks, sent, store } = setup({
+          backorder: sendPlan({ staffAlert: true, buttons: BUTTONS }),
+          human: true,
+        });
+        feedPages.push(wire('34'));
+        await consumer.runOnce();
+        expect(sent).toEqual([]);
+        expect(acks[0].body).toMatchObject({
+          outcome: 'PROVIDER_REJECTED',
+          reason: 'HUMAN_SESSION',
+        });
+        await expect(store.getDelivery('34')).resolves.toMatchObject({
+          localState: 'STALE',
+          decision: 'HUMAN_SESSION',
+          ackReason: 'HUMAN_SESSION',
+        });
+      });
+
+      it('without staffAlert a HUMAN conversation stays STALE', async () => {
+        const { consumer, feedPages, acks } = setup({
+          backorder: sendPlan(),
+          human: true,
+        });
+        feedPages.push(wire('35', 'backorder.reservation_expired'));
+        await consumer.runOnce();
+        expect(acks.map((a) => a.body.outcome)).toEqual(['STALE']);
+        expect(acks[0].body).not.toHaveProperty('reason');
+      });
+
+      it('the window closed at send time (131047): PROVIDER_REJECTED WINDOW_CLOSED', async () => {
+        const { consumer, feedPages, acks } = setup({
+          backorder: sendPlan({ staffAlert: true }),
+          sendText: () =>
+            Promise.reject(
+              Object.assign(new Error('window'), { graphErrorCode: 131047 }),
+            ),
+        });
+        feedPages.push(wire('36'));
+        await consumer.runOnce();
+        expect(acks[0].body).toMatchObject({
+          outcome: 'PROVIDER_REJECTED',
+          reason: 'WINDOW_CLOSED',
+        });
+      });
+
+      it('a message Meta definitely refuses (4xx): PROVIDER_REJECTED UNREACHABLE', async () => {
+        const buttons = interactive();
+        const { consumer, feedPages, acks, store } = setup({
+          backorder: sendPlan({ staffAlert: true, buttons: BUTTONS }),
+          sendInteractive: () => Promise.reject(refusal(400)),
+        });
+        feedPages.push(wire('37'));
+        await consumer.runOnce();
+        expect(buttons.calls).toEqual([]);
+        expect(acks[0].body).toMatchObject({
+          outcome: 'PROVIDER_REJECTED',
+          reason: 'UNREACHABLE',
+        });
+        await expect(store.getDelivery('37')).resolves.toMatchObject({
+          decision: 'SEND_REFUSED',
+          ackReason: 'UNREACHABLE',
+        });
+      });
+
+      it('an uncertain send (timeout / 5xx) is DELIVERY_UNKNOWN: never rejected, never retried', async () => {
+        const { consumer, feedPages, acks } = setup({
+          backorder: sendPlan({ staffAlert: true }),
+          sendText: () => Promise.reject(refusal(503)),
+        });
+        feedPages.push(wire('38'));
+        await consumer.runOnce();
+        expect(acks.map((a) => a.body.outcome)).toEqual(['DELIVERY_UNKNOWN']);
+      });
+
+      it('a template Meta refuses: PROVIDER_REJECTED TEMPLATE_NOT_APPROVED', async () => {
+        const { consumer, feedPages, acks, store } = setup({
+          backorder: sendPlan({
+            staffAlert: true,
+            template: {
+              templateName: 'pedido_reposicion_llego',
+              languageCode: 'es_MX',
+              bodyParameters: ['Rosa'],
+              refusedDecision: 'TEMPLATE_NOT_APPROVED',
+            },
+          }),
+          sendTemplate: () => Promise.reject(refusal(404)),
+        });
+        feedPages.push(wire('39'));
+        await consumer.runOnce();
+        expect(acks[0].body).toMatchObject({
+          outcome: 'PROVIDER_REJECTED',
+          reason: 'TEMPLATE_NOT_APPROVED',
+        });
+        await expect(store.getDelivery('39')).resolves.toMatchObject({
+          decision: 'TEMPLATE_NOT_APPROVED',
+          ackReason: 'TEMPLATE_NOT_APPROVED',
+        });
+      });
+
+      it('an approved template goes out as a template and is ACKed PROVIDER_ACCEPTED', async () => {
+        const templates: OutboundTemplate[] = [];
+        const { consumer, feedPages, acks, sent } = setup({
+          backorder: sendPlan({
+            staffAlert: true,
+            template: {
+              templateName: 'pedido_reposicion_llego',
+              languageCode: 'es_MX',
+              bodyParameters: ['Rosa', 'BO-000012'],
+              refusedDecision: 'TEMPLATE_NOT_APPROVED',
+            },
+          }),
+          sendTemplate: (message) => {
+            templates.push(message);
+            return Promise.resolve({ providerMessageId: 'wamid.tpl' });
+          },
+        });
+        feedPages.push(wire('40'));
+        await consumer.runOnce();
+        expect(sent).toEqual([]);
+        expect(templates).toEqual([
+          {
+            to: '5215512349901',
+            templateName: 'pedido_reposicion_llego',
+            languageCode: 'es_MX',
+            bodyParameters: ['Rosa', 'BO-000012'],
+          },
+        ]);
+        expect(acks[0].body).toMatchObject({
+          outcome: 'PROVIDER_ACCEPTED',
+          providerMessageId: 'wamid.tpl',
+        });
+      });
+    });
+
+    it('a template refused on a notice without staffAlert (expired / lost) is STALE TEMPLATE_NOT_APPROVED', async () => {
+      const { consumer, feedPages, acks, store } = setup({
+        backorder: sendPlan({
+          decision: 'BACKORDER_EXPIRED_NOTICE',
+          template: {
+            templateName: 'pedido_reposicion_vencido',
+            languageCode: 'es_MX',
+            bodyParameters: ['BO-000012', 'Croquetas'],
+            refusedDecision: 'TEMPLATE_NOT_APPROVED',
+          },
+        }),
+        sendTemplate: () => Promise.reject(refusal(404)),
+      });
+      feedPages.push(wire('41', 'backorder.reservation_expired'));
+      await consumer.runOnce();
+      expect(acks.map((a) => a.body.outcome)).toEqual(['STALE']);
+      await expect(store.getDelivery('41')).resolves.toMatchObject({
+        decision: 'TEMPLATE_NOT_APPROVED',
+        ackReason: null,
+      });
+    });
+
+    it('a sent message clears nothing it should keep: PROVIDER_ACCEPTED rows carry no reason', async () => {
+      const { consumer, feedPages, store } = setup({
+        backorder: sendPlan({ staffAlert: true }),
+      });
+      feedPages.push(wire('42'));
+      await consumer.runOnce();
+      await expect(store.getDelivery('42')).resolves.toMatchObject({
+        localState: 'SENT',
+        ackReason: null,
+      });
+    });
+
+    it('request and sale items are untouched: a request cancel still sends text and ACKs PROVIDER_ACCEPTED', async () => {
+      const { consumer, feedPages, acks, sent } = setup({
+        backorder: sendPlan({ staffAlert: true }),
+      });
+      feedPages.push({
+        items: [cancelledWire('43', '8c1d0000-aaaa-4bbb-8ccc-ddddeeeeffff')],
+        nextCursor: '000000000043',
+      });
+      await consumer.runOnce();
+      expect(sent).toHaveLength(1);
+      expect(acks[0].body).toMatchObject({ outcome: 'PROVIDER_ACCEPTED' });
+      expect(acks[0].body).not.toHaveProperty('reason');
+    });
+  });
+
   describe('ackBodyFor safety net', () => {
     const row = (type: string, ackOutcome: string): DeliveryRow =>
       ({
@@ -435,6 +780,22 @@ describe('backorder feed items (restock backorder S15)', () => {
         });
       },
     );
+
+    it('PROVIDER_REJECTED carries its stored reason; without one the body is invalid', () => {
+      const rejected = row('backorder.reserved', 'PROVIDER_REJECTED');
+      expect(
+        ackBodyFor({ ...rejected, ackReason: 'TEMPLATE_NOT_APPROVED' }),
+      ).toEqual({
+        outcome: 'PROVIDER_REJECTED',
+        attemptId: ATTEMPT,
+        attemptedAt: '2026-11-21T10:00:00.000Z',
+        reason: 'TEMPLATE_NOT_APPROVED',
+      });
+      expect(ackBodyFor({ ...rejected, ackReason: null })).toBeNull();
+      expect(
+        ackBodyFor({ ...rejected, ackReason: 'X', attemptedAt: null }),
+      ).toBeNull();
+    });
 
     it('a request row keeps its deferral body', () => {
       expect(

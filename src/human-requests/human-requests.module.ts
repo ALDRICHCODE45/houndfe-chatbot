@@ -16,6 +16,8 @@ import {
   type OutboxDrainWaker,
 } from '../backend-outbox/domain/backend-outbox';
 import { RoutingBackendOutboxDelivery } from '../backend-outbox/infrastructure/routing-backend-outbox.delivery';
+import { BackorderFeedRecovery } from '../backorders/application/backorder-feed-recovery';
+import { BackordersModule } from '../backorders/backorders.module';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
 import {
   CHATBOT_API_CLIENT,
@@ -116,6 +118,8 @@ export class HumanRequestFeedLifecycle
     @Optional()
     @Inject(OUTBOX_DRAIN_WAKER)
     private readonly waker?: OutboxDrainWaker,
+    // Restock backorder T5a: the backorder position of the 410 recovery.
+    @Optional() private readonly backorders?: BackorderFeedRecovery,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -125,6 +129,7 @@ export class HumanRequestFeedLifecycle
       client: this.client,
       delivery: this.delivery,
       lock: new PostgresFeedConsumerLock(this.pool),
+      ...(this.backorders === undefined ? {} : { backorders: this.backorders }),
     });
     this.maintenance = new HumanRequestMaintenanceWorker(this.delivery);
     this.consumer.start();
@@ -257,6 +262,8 @@ const CUSTOMER_PORT_TOKENS = [
     CustomerProfileModule,
     BackendOutboxEnqueueModule,
     SchedulingStateModule,
+    // Restock backorder T5a: BACKORDER_FEED_HANDLER (the backorder.* notices).
+    BackordersModule,
   ],
   providers: [
     {
@@ -435,6 +442,8 @@ export class HumanRequestsServicesModule {}
     WhatsappSenderModule,
     CustomerProfileModule,
     BackendOutboxEnqueueModule,
+    // The lifecycle injects BackorderFeedRecovery (410 recovery).
+    BackordersModule,
   ],
   providers: [HumanRequestFeedLifecycle, HumanRequestOutboxRoutes],
   exports: [HumanRequestsServicesModule],

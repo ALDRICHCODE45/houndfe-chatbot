@@ -10,6 +10,22 @@ export interface CartItem {
   variantId?: string;
   quantity: number;
   unitPriceCents: number;
+  /**
+   * Restock backorder T5b: the line is the customer's RESERVED backorder
+   * (`unitPriceCents` = its `finalPriceCents`). Absent on every ordinary
+   * line, so stored carts without a backorder are unchanged.
+   */
+  backorder?: CartBackorderRef;
+}
+
+/** What a backorder cart line remembers about its reservation. */
+export interface CartBackorderRef {
+  id: string;
+  folio: string;
+  productName: string;
+  variantName: string | null;
+  /** ISO instant (UTC) the reservation ends. */
+  reservedUntil: string;
 }
 
 /**

@@ -9,8 +9,14 @@ import {
 } from '../../chatbot-api/domain/chatbot-api.client';
 import type { BotSaleResponse } from '../../chatbot-api/domain/dtos/sales.dto';
 import {
+  BACKORDER_CLIENT,
+  type BackorderBot,
+  type BackorderClient,
+} from '../../backorders/domain/backorder';
+import {
   CreateCheckoutInputSchema,
   INVALID_CHECKOUT_REQUEST,
+  backorderCheckoutFailure,
   SHIPPING_QUOTE_ALREADY_USED,
   CheckoutPickupLocationSchema,
   checkoutErrorMismatches,
@@ -67,7 +73,20 @@ import { ConversationGates } from '../../conversation-gates/application/conversa
 import { processLocalConversationGates } from '../../conversation-gates/infrastructure/process-local-conversation-gates';
 import { DurableOrderConfirmation } from './gates/order-confirmation.gate';
 import { sanitizeErrorText } from '../../common/log-safe';
-import { paymentMethodButtons } from '../domain/customer-reply';
+import {
+  BACKORDER_MISMATCH_REPLY,
+  BACKORDER_REPRICE_FAILED_REPLY,
+  BACKORDER_RESCHEDULE_PROMPT,
+  BACKORDER_RESCHEDULE_QUESTION,
+  BACKORDER_RESERVATION_UNAVAILABLE_REPLY,
+  backorderLineDroppedReply,
+} from '../domain/backorder-copy';
+import {
+  backorderRescheduleButtons,
+  paymentMethodButtons,
+} from '../domain/customer-reply';
+import { backorderLineDecision } from './minimal-backorder-checkout';
+import { sourceDecisionOf } from './minimal-backorder-confirm.service';
 import { paymentMethodsFor } from '../domain/payment-methods';
 import {
   MINIMAL_PAYMENT_BUTTONS_PROMPT,
@@ -102,6 +121,8 @@ export const MINIMAL_ORDER_CUSTOMER_RECHECK_REPLY =
 /** Backend code: `expectedTotalCents` no longer matches merchandise plus
  * shipping (a promotion started or ended); nothing was written. */
 const PROMO_RE_QUOTE = 'PROMO_RE_QUOTE';
+/** A stored total that matches no quote: forces the next price refresh to rewrite. */
+const STALE_TOTAL_CENTS = Number.MAX_SAFE_INTEGER;
 /** Internal `send` → `consume` marker for PROMO_RE_QUOTE; never sent. */
 const PROMO_REPRICE_MARKER = Symbol('minimal-order.promo-reprice').toString();
 /** Test seam for quote expiry; production uses `Date.now`. */
@@ -275,6 +296,11 @@ interface OrderPlaced {
   payInStore: boolean;
 }
 
+/** Restock backorder T5b: the checkout refused a backorder line; nothing was created. */
+interface BackorderRefused {
+  backorderReply: MinimalCheckoutReply;
+}
+
 /** The customer reply for a created order: text plus one button per method. */
 function orderReply(value: string | OrderPlaced): MinimalCheckoutReply {
   if (typeof value === 'string') return { reply: value };
@@ -312,6 +338,7 @@ function sameCartLines(
       return (
         line.productId === item.productId &&
         line.variantId === item.variantId &&
+        line.backorder?.id === item.backorder?.id &&
         line.quantity === item.quantity &&
         line.unitPriceCents === item.unitPriceCents
       );
@@ -347,6 +374,12 @@ export class MinimalOrderService {
     // S1: the last-order pointer and checkout name for the customer memory.
     @Optional() private readonly profiles?: CustomerProfileService,
     @Optional() gates?: ConversationGates,
+    // Restock backorder T5b: reads the backorder after a checkout refusal
+    // (refreshed price, reschedule offer); optional, the refusal is worded
+    // without it.
+    @Optional()
+    @Inject(BACKORDER_CLIENT)
+    private readonly backorders?: BackorderClient,
   ) {
     this.now = now ?? (() => Date.now());
     this.confirmation = new DurableOrderConfirmation(
@@ -457,7 +490,10 @@ export class MinimalOrderService {
           };
     }
     const reply = await this.place(input.senderId, fresh.snapshot);
-    if (typeof reply !== 'string') return orderReply(reply);
+    if (typeof reply !== 'string')
+      return 'backorderReply' in reply
+        ? reply.backorderReply
+        : orderReply(reply);
     // This reply only follows a cleared key (first attempt, or a later one
     // whose earlier attempt the status read resolved), so re-quoting is safe.
     if (reply === MINIMAL_ORDER_SHIPPING_REQUOTE_REPLY)
@@ -675,6 +711,9 @@ export class MinimalOrderService {
         quantity: item.quantity,
         unitPriceCents: item.unitPriceCents,
         finalPriceCents: item.finalPriceCents,
+        ...(item.backorder === undefined
+          ? {}
+          : { backorderId: item.backorder.id }),
       }));
       if (!isPickupCurrent(record, lines)) return null;
     }
@@ -719,6 +758,9 @@ export class MinimalOrderService {
       quantity: item.quantity,
       unitPriceCents: item.unitPriceCents,
       finalPriceCents: item.finalPriceCents,
+      ...(item.backorder === undefined
+        ? {}
+        : { backorderId: item.backorder.id }),
     }));
     if (isMinimalPickup(record))
       return isPickupCurrent(record, cartLines) ? { mode: 'pickup' } : null;
@@ -752,7 +794,7 @@ export class MinimalOrderService {
   private async place(
     senderId: string,
     snapshot: MinimalOrderSnapshot,
-  ): Promise<string | OrderPlaced> {
+  ): Promise<string | OrderPlaced | BackorderRefused> {
     const unverified = MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified;
     const phone = parseMexicanWhatsAppPhone(senderId);
     if (phone === null) return unverified;
@@ -801,6 +843,11 @@ export class MinimalOrderService {
         variantName: item.variantName ?? null,
         quantity: item.quantity,
         unitPriceCents: item.unitPriceCents,
+        // Restock backorder T5b: the line confirms this RESERVED backorder
+        // (`unitPriceCents` = its final price); sent only when present.
+        ...(item.backorder === undefined
+          ? {}
+          : { backorderId: item.backorder.id }),
       })),
     };
   }
@@ -877,7 +924,7 @@ export class MinimalOrderService {
     senderId: string,
     snapshot: MinimalOrderSnapshot,
     checkoutPayload: CreateCheckoutInput,
-  ): Promise<string | OrderPlaced> {
+  ): Promise<string | OrderPlaced | BackorderRefused> {
     const unverified = MINIMAL_ORDER_INELIGIBLE_REPLIES.cart_unverified;
     const digest = fingerprint(checkoutPayload);
     // `keyed` is the parsed cart; `stored` is the exact value now in the slot,
@@ -956,10 +1003,17 @@ export class MinimalOrderService {
       // back our own sale) the key is read first: a sale under it is ours to
       // complete; a confirmed absence lets the key be cleared below.
       let earlierResolved = false;
+      // Restock backorder T5b: a refusal about a backorder line also proves
+      // THIS call wrote nothing; after an earlier uncertain attempt the key is
+      // read the same way (a sale under it is ours, an absence clears it).
+      const backorderRefusalAfterAttempt =
+        (keyed.idempotencyAttempts ?? 1) > 1 &&
+        this.isBackorderRefusal(error, keyed);
       if (
-        isQuoteRejection(error) &&
-        (code === SHIPPING_QUOTE_ALREADY_USED ||
-          (keyed.idempotencyAttempts ?? 1) > 1)
+        (isQuoteRejection(error) &&
+          (code === SHIPPING_QUOTE_ALREADY_USED ||
+            (keyed.idempotencyAttempts ?? 1) > 1)) ||
+        backorderRefusalAfterAttempt
       ) {
         const own = await this.ownCheckout(keyed.idempotencyKey);
         if (own.kind === 'sale')
@@ -1011,7 +1065,11 @@ export class MinimalOrderService {
       // A quote is pinned to lines and address, never to the customer: kept,
       // it would be resent after the re-check and fail the same way.
       if (customerMismatch) delete unkeyed.shipping;
+      // Restock backorder T5b: a refusal about a backorder line edits the
+      // cart copy (drop / refresh the line) before the single commit below.
+      const refused = await this.backorderRefusal(error, unkeyed);
       await this.commitCart(senderId, stored, unkeyed);
+      if (refused !== null) return refused;
       if (ambiguousPhone) return MINIMAL_ORDER_PHONE_AMBIGUOUS_REPLY;
       if (addressRejected) return MINIMAL_CHECKOUT_RESELECT_REPLY;
       if (customerMismatch) return MINIMAL_ORDER_CUSTOMER_RECHECK_REPLY;
@@ -1048,6 +1106,138 @@ export class MinimalOrderService {
       pickupLocation,
       checkoutFirstName(snapshot),
     );
+  }
+
+  /**
+   * Restock backorder T5b: the checkout refused a line that carries a
+   * `backorderId` and wrote nothing (the key is already being rotated). The
+   * decision is `backorderLineDecision`; this applies it to `cart` (the copy
+   * about to be committed) and words the answer. `null`: not a backorder-line
+   * refusal, the existing handling answers.
+   */
+  private async backorderRefusal(
+    error: unknown,
+    cart: MinimalCartState,
+  ): Promise<string | BackorderRefused | null> {
+    const failure = backorderCheckoutFailure(error);
+    const lines = cart.items.filter((item) => item.backorder !== undefined);
+    if (failure === null || lines.length === 0) return null;
+    const decision = backorderLineDecision(failure);
+    if (decision === null) return null;
+    this.logger.warn(
+      `checkout backorder refusal code=${failure.code} decision=${decision.kind}` +
+        (decision.kind === 'mismatch'
+          ? ` field=${decision.field ?? 'none'}`
+          : ''),
+    );
+    if (decision.kind === 'unavailable')
+      return {
+        backorderReply: { reply: BACKORDER_RESERVATION_UNAVAILABLE_REPLY },
+      };
+    const read = new Map(
+      await Promise.all(
+        lines.map(
+          async (line) =>
+            [
+              line.backorder!.id,
+              await this.readBackorder(line.backorder!.id),
+            ] as const,
+        ),
+      ),
+    );
+    const affected = this.affectedLines(lines, read, decision);
+    const folio = affected.length === 1 ? affected[0].backorder! : null;
+    const dropAffected = () => {
+      cart.items = cart.items.filter((item) => !affected.includes(item));
+      delete cart.shipping;
+      delete cart.expectedTotalCents;
+    };
+    if (decision.kind === 'mismatch') {
+      dropAffected();
+      return { backorderReply: { reply: BACKORDER_MISMATCH_REPLY } };
+    }
+    if (decision.kind === 'reprice') {
+      const fresh =
+        affected.length === 1
+          ? (read.get(affected[0].backorder!.id)?.finalPriceCents ??
+            decision.currentPriceCents)
+          : null;
+      if (fresh === null || !Number.isSafeInteger(fresh) || fresh < 0)
+        return { backorderReply: { reply: BACKORDER_REPRICE_FAILED_REPLY } };
+      // The stored shipping stays: `freshOrder` re-quotes a delivery quote
+      // pinned to the old price (L16) and pickup does not depend on prices.
+      // The line price alone never shows as a change (the refresh compares
+      // the stored unit prices with the quote's, now equal), so the stored
+      // total is parked on a value no real total can equal: the next
+      // `refreshPrices` then reports a re-price, which re-quotes a delivery
+      // order and rewrites the true total.
+      affected[0].unitPriceCents = fresh;
+      cart.expectedTotalCents = STALE_TOTAL_CENTS;
+      return PROMO_REPRICE_MARKER;
+    }
+    dropAffected();
+    const reply = backorderLineDroppedReply(decision.why, folio);
+    const offer =
+      decision.why === 'expired' && folio !== null
+        ? read.get(folio.id)
+        : undefined;
+    if (
+      offer === undefined ||
+      offer === null ||
+      sourceDecisionOf(offer) === null
+    )
+      return { backorderReply: { reply } };
+    return {
+      backorderReply: {
+        reply: `${reply} ${BACKORDER_RESCHEDULE_QUESTION}`,
+        interactive: backorderRescheduleButtons(
+          offer.id,
+          BACKORDER_RESCHEDULE_PROMPT,
+        ),
+      },
+    };
+  }
+
+  /** The error is a backorder-line decision for a cart that holds such a line. */
+  private isBackorderRefusal(error: unknown, cart: MinimalCartState): boolean {
+    if (!cart.items.some((item) => item.backorder !== undefined)) return false;
+    const failure = backorderCheckoutFailure(error);
+    return failure !== null && backorderLineDecision(failure) !== null;
+  }
+
+  /** The backorder as the backend sees it now; `null` when it cannot be read. */
+  private async readBackorder(id: string): Promise<BackorderBot | null> {
+    try {
+      return (await this.backorders?.getBackorder(id)) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The error does not name its line. One backorder line is the one; with
+   * several, the lines whose backorder no longer fits the refusal (read fresh)
+   * are, else every backorder line (nothing could be told apart).
+   */
+  private affectedLines(
+    lines: MinimalCartState['items'],
+    read: ReadonlyMap<string, BackorderBot | null>,
+    decision: ReturnType<typeof backorderLineDecision>,
+  ): MinimalCartState['items'] {
+    if (lines.length === 1 || decision === null) return lines;
+    const nowMs = this.now();
+    const odd = lines.filter((line) => {
+      const backorder = read.get(line.backorder!.id);
+      if (backorder === undefined || backorder === null) return false;
+      if (decision.kind === 'reprice')
+        return backorder.finalPriceCents !== line.unitPriceCents;
+      if (decision.kind !== 'drop') return false;
+      return (
+        backorder.status !== 'RESERVED' ||
+        !(Date.parse(backorder.reservedUntil ?? '') > nowMs)
+      );
+    });
+    return odd.length > 0 ? odd : decision.kind === 'reprice' ? [] : lines;
   }
 
   /** What `/checkouts/status` shows under this key: our sale, a confirmed

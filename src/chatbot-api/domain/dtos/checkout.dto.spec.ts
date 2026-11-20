@@ -1,10 +1,12 @@
 import {
+  backorderCheckoutFailure,
   checkoutErrorMismatches,
   CheckoutIdempotencyKeySchema,
   CreateCheckoutInputSchema,
   normalizeCheckoutResponse,
   normalizeCheckoutStatus,
 } from './checkout.dto';
+import { ChatbotApiError } from '../errors';
 
 const id = '11111111-1111-4111-8111-111111111111';
 export const checkoutInput = {
@@ -549,5 +551,120 @@ describe('checkout status recovery (R3-strict-receipt)', () => {
     ['not_observed with a key', { status: 'not_observed', checkout: {} }],
   ])('still fails closed with %s', (_name, body) => {
     expect(normalizeCheckoutStatus(body)).toBeNull();
+  });
+});
+
+describe('restock backorder checkout line (backorderId)', () => {
+  const withLine = (line: Record<string, unknown>) => ({
+    ...checkoutInput,
+    sale: {
+      ...checkoutInput.sale,
+      items: [{ ...checkoutInput.sale.items[0], ...line }],
+    },
+  });
+  it('accepts an optional backorderId uuid, null or absent', () => {
+    expect(
+      CreateCheckoutInputSchema.safeParse(withLine({ backorderId: id }))
+        .success,
+    ).toBe(true);
+    expect(
+      CreateCheckoutInputSchema.safeParse(withLine({ backorderId: null }))
+        .success,
+    ).toBe(true);
+    expect(CreateCheckoutInputSchema.safeParse(checkoutInput).success).toBe(
+      true,
+    );
+  });
+  it('still rejects a non-uuid backorderId and unknown line keys', () => {
+    expect(
+      CreateCheckoutInputSchema.safeParse(withLine({ backorderId: 'nope' }))
+        .success,
+    ).toBe(false);
+    expect(
+      CreateCheckoutInputSchema.safeParse(withLine({ extra: 1 })).success,
+    ).toBe(false);
+  });
+});
+
+describe('backorderCheckoutFailure (contract T3 error table)', () => {
+  const failure = (
+    statusCode: number | null,
+    errorCode: string | null,
+    body?: unknown,
+  ) =>
+    backorderCheckoutFailure(
+      new ChatbotApiError('x', statusCode, body, errorCode),
+    );
+
+  it.each([
+    [404, 'BACKORDER_NOT_FOUND'],
+    [409, 'BACKORDER_RESERVATION_EXPIRED'],
+    [409, 'BACKORDER_RESERVATION_LOST'],
+    [409, 'BACKORDER_RESERVATION_UNAVAILABLE'],
+    [400, 'INVALID_CHECKOUT_REQUEST'],
+    [503, 'BACKORDER_CHECKOUT_UNAVAILABLE'],
+  ])('maps %s %s', (status, code) => {
+    expect(failure(status, code, { statusCode: status })).toEqual({
+      code,
+      status,
+    });
+  });
+  it('carries the status of BACKORDER_NOT_RESERVED', () => {
+    expect(
+      failure(409, 'BACKORDER_NOT_RESERVED', {
+        statusCode: 409,
+        error: 'BACKORDER_NOT_RESERVED',
+        status: 'CONFIRMED',
+      }),
+    ).toEqual({
+      code: 'BACKORDER_NOT_RESERVED',
+      status: 409,
+      backorderStatus: 'CONFIRMED',
+    });
+    expect(failure(409, 'BACKORDER_NOT_RESERVED', {})).toEqual({
+      code: 'BACKORDER_NOT_RESERVED',
+      status: 409,
+      backorderStatus: null,
+    });
+  });
+  it('carries the field of BACKORDER_MISMATCH', () => {
+    expect(failure(409, 'BACKORDER_MISMATCH', { field: 'quantity' })).toEqual({
+      code: 'BACKORDER_MISMATCH',
+      status: 409,
+      field: 'quantity',
+    });
+    expect(failure(409, 'BACKORDER_MISMATCH', null)).toEqual({
+      code: 'BACKORDER_MISMATCH',
+      status: 409,
+      field: null,
+    });
+  });
+  it('carries currentPriceCents of PRICE_OUT_OF_DATE (null when absent)', () => {
+    expect(
+      failure(409, 'PRICE_OUT_OF_DATE', { currentPriceCents: 109900 }),
+    ).toEqual({
+      code: 'PRICE_OUT_OF_DATE',
+      status: 409,
+      currentPriceCents: 109900,
+    });
+    expect(failure(409, 'PRICE_OUT_OF_DATE', { statusCode: 409 })).toEqual({
+      code: 'PRICE_OUT_OF_DATE',
+      status: 409,
+      currentPriceCents: null,
+    });
+    expect(
+      failure(409, 'PRICE_OUT_OF_DATE', { currentPriceCents: -5 }),
+    ).toEqual({
+      code: 'PRICE_OUT_OF_DATE',
+      status: 409,
+      currentPriceCents: null,
+    });
+  });
+  it('is null for other errors, non-API errors and transport failures', () => {
+    expect(failure(409, 'PROMO_RE_QUOTE')).toBeNull();
+    expect(failure(null, 'BACKORDER_NOT_FOUND')).toBeNull();
+    expect(failure(500, null)).toBeNull();
+    expect(backorderCheckoutFailure(new Error('boom'))).toBeNull();
+    expect(backorderCheckoutFailure('BACKORDER_NOT_FOUND')).toBeNull();
   });
 });

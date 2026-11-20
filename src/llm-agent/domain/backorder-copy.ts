@@ -283,3 +283,123 @@ export function backorderStatusListReply(
     ...(more > 0 ? [`Y ${more} más.`] : []),
   ].join('\n');
 }
+
+// --- T5b / S6: confirm, checkout and reschedule ---------------------------
+
+export const BACKORDER_CONFIRM_NOT_FOUND_REPLY =
+  'No encontré ese pedido apartado.';
+export const BACKORDER_CONFIRM_FAILED_REPLY =
+  'No pude consultar su pedido apartado por ahora. Intente de nuevo en unos minutos.';
+export const BACKORDER_CONFIRMED_ALREADY_REPLY =
+  'Ese pedido ya está confirmado.';
+export const BACKORDER_CANCELLED_ALREADY_REPLY =
+  'Ese pedido apartado ya está cancelado.';
+/** The reschedule question and the short body of its buttons. */
+export const BACKORDER_RESCHEDULE_QUESTION =
+  '¿Quiere que se lo agende de nuevo? Quedaría al final de la fila de espera.';
+export const BACKORDER_RESCHEDULE_PROMPT = '¿Lo agendo de nuevo?';
+export const BACKORDER_RESCHEDULE_DECLINE_REPLY = 'Entendido.';
+/** No decision to schedule from: it cannot be rescheduled automatically. */
+export const BACKORDER_RESCHEDULE_UNAVAILABLE_REPLY =
+  'No puedo agendarlo de nuevo de forma automática. Si quiere, dígame «hablar con una persona» y el equipo le ayuda.';
+
+/** «Se venció el apartado de su pedido BO-000012.» */
+export function backorderExpiredReply(
+  backorder: Pick<BackorderBot, 'folio'>,
+): string {
+  return `Se venció el apartado de su pedido ${backorder.folio}.`;
+}
+
+/** The backorder has not arrived (or went back to waiting): nothing to confirm. */
+export function backorderNotReservedYetReply(
+  backorder: Pick<BackorderBot, 'folio'>,
+): string {
+  return `Su pedido ${backorder.folio} todavía no está apartado. Le aviso en cuanto llegue.`;
+}
+
+/**
+ * The confirm tap was valid: the reserved backorder is now a line of the
+ * cart (at its final price) and the normal checkout continues.
+ */
+export function backorderAddedReply(
+  backorder: Pick<
+    BackorderBot,
+    | 'folio'
+    | 'quantity'
+    | 'productName'
+    | 'variantName'
+    | 'finalPriceCents'
+    | 'reservedUntil'
+  >,
+  now: Date,
+): string {
+  const until =
+    backorder.reservedUntil !== null &&
+    Date.parse(backorder.reservedUntil) > now.getTime()
+      ? backorderDateTime(backorder.reservedUntil, now)
+      : null;
+  return (
+    `Listo, su pedido apartado ${backorder.folio} (${backorder.quantity} × ${label(backorder)}) ` +
+    `ya está en su carrito a ${mxn(backorder.finalPriceCents ?? 0)} c/u.` +
+    (until === null
+      ? ''
+      : ` Se lo tenemos apartado hasta ${endSentence(until)}`)
+  );
+}
+
+/** What went wrong with the backorder line at checkout (all nothing-created). */
+export type BackorderLineDrop =
+  | 'expired'
+  | 'confirmed'
+  | 'cancelled'
+  | 'waiting'
+  | 'lost'
+  | 'not_found'
+  | 'unknown';
+
+/**
+ * The checkout refused a backorder line and created nothing: say why, that
+ * the line left the cart, and (expired) the offer to schedule it again.
+ */
+export function backorderLineDroppedReply(
+  why: BackorderLineDrop,
+  backorder: Pick<BackorderBot, 'folio'> | null,
+): string {
+  const folio = backorder === null ? '' : ` ${backorder.folio}`;
+  const removed = 'Quité esa pieza de su carrito y no se creó ningún pedido.';
+  switch (why) {
+    case 'expired':
+      return `Se venció el apartado de su pedido${folio}. ${removed}`;
+    case 'confirmed':
+      return `Ese pedido ya está confirmado, así que no lo agrego de nuevo. ${removed}`;
+    case 'cancelled':
+      return `Ese pedido apartado ya está cancelado. ${removed}`;
+    case 'waiting':
+      return `Su pedido${folio} todavía no está apartado. Le aviso en cuanto llegue. ${removed}`;
+    case 'lost':
+      return `Lo siento, el lote apartado de su pedido${folio} venció y ya no se lo tenemos apartado. Sigue primero en la fila: le aviso en cuanto llegue de nuevo. ${removed}`;
+    case 'not_found':
+      return `No encontré ese pedido apartado. ${removed}`;
+    default:
+      return `Ese pedido apartado ya no está disponible para confirmar. ${removed}`;
+  }
+}
+
+/** BACKORDER_RESERVATION_UNAVAILABLE: a data fault the team must resolve. */
+export const BACKORDER_RESERVATION_UNAVAILABLE_REPLY =
+  'Hubo un problema al confirmar su pedido apartado; el equipo le va a llamar para resolverlo. No se creó ningún pedido.';
+/** BACKORDER_MISMATCH: the line no longer matches the reservation. */
+export const BACKORDER_MISMATCH_REPLY =
+  'No pude confirmar su pedido apartado porque no coincide con la reserva. Quité esa pieza de su carrito y no se creó ningún pedido. Pida ayuda al equipo si lo necesita.';
+/** The reserved line must be refreshed before another summary. */
+export const BACKORDER_REPRICE_FAILED_REPLY =
+  'No pude actualizar el precio de su pedido apartado; no se creó ningún pedido. Intente de nuevo en unos minutos.';
+
+/** The rescheduled backorder is not new (still active or already a sale). */
+export function backorderRescheduleStateReply(
+  backorder: Pick<BackorderBot, 'folio' | 'status'>,
+): string {
+  if (backorder.status === 'CONFIRMED')
+    return `Su pedido ${backorder.folio} ya está confirmado.`;
+  return `Su pedido ${backorder.folio} sigue agendado; no hace falta agendarlo de nuevo.`;
+}
