@@ -154,3 +154,49 @@ Outcomes: `PROVIDER_ACCEPTED`, `DELIVERY_UNKNOWN`, `STALE`, plus new terminal `P
 
 1. Apply backend migration `20261120000000_backorders` (additive).
 2. Add `backorders:create`, `backorders:read`, `backorders:cancel` to the chatbot's `svc_` credential.
+
+## Update: backend T2 built (backend main ec838050, received 2026-11-20)
+
+Live now on the backend branch (deploy pending): reservation on arrival, 24 h window, reminder, expiry, expired-lot swap, the feed items `backorder.reserved`, `backorder.reservation_reminder`, `backorder.reservation_expired`, `backorder.reservation_lost`, and the outcome `PROVIDER_REJECTED`. `backorder.cancelled_by_staff` ships with backend T5, `eta_*` with T4, checkout with `backorderId` with T3.
+
+### Matching and sweep
+- Every stock increase (adjustment, initial stock, cancelled sale, lapsed sale hold, released reservation) walks the product/variant `WAITING` queue by `scheduledAt, id` and reserves every backorder whose whole quantity fits; `backorder.reserved` is written in the same transaction (exactly once per reservation).
+- `reservedUntil = reservedAt + 24 h`, `reminderAt = reservedUntil − 3 h`, regardless of delivery.
+- Sweep every 30 s: reminder once (skipped if the sweep was down past the deadline: expires directly); expiry → `EXPIRED`, units to the next fitting backorder (its own `backorder.reserved`) or general stock, `backorder.reservation_expired`, staff notice; expired lot → silent swap (no item) or back to `WAITING` front with `backorder.reservation_lost`; safety-net allocation.
+- Customer cancel vs expiry serialize: if the expiry wins, cancel answers `409 BACKORDER_NOT_CANCELLABLE {status: "EXPIRED"}`. Customer cancel writes no feed item. Cancelling a `RESERVED` backorder hands the units to the next one.
+- After `EXPIRED` the reservation fields keep their values; after `reservation_lost` they are cleared.
+
+### Feed envelope (differs from sale items)
+Standard item with `requestId: null` and **no `saleId` key**; `backorderId` is inside `payload`:
+
+```json
+{
+  "cursor": "000000004311", "deliveryId": "5b1f…", "type": "backorder.reserved",
+  "requestId": null, "conversationRef": "wa:5215512349901",
+  "payload": {
+    "backorderId": "uuid", "folio": "BO-000012",
+    "productName": "Croquetas Adulto Raza Grande 18 kg", "variantName": null,
+    "quantity": 2, "branchName": "Centro", "customerFirstName": "Rosa", "version": 3,
+    "referencePriceCents": 114900, "currentPriceCents": 109900, "finalPriceCents": 109900,
+    "reservedUntil": "2026-11-21T15:00:00.000Z", "reminderAt": "2026-11-21T12:00:00.000Z"
+  },
+  "notBefore": null, "expiresAt": null
+}
+```
+
+`conversationRef` is the customer's mirrored chat, or `null` (none or several): then resolve the customer through `GET /chatbot-api/backorders/:id`. Common payload fields: `backorderId`, `folio`, `productName`, `variantName`, `quantity`, `branchName`, `customerFirstName`, `version`. Per type: reserved (`referencePriceCents`, `currentPriceCents`, `finalPriceCents`, `reservedUntil`, `reminderAt`); reservation_reminder (`reservedUntil`); reservation_expired (`expiredAt`); reservation_lost (`reason: "LOT_EXPIRED"`, `queuePosition`, `estimatedAt`); cancelled_by_staff (`reason` or null, T5); eta_updated (`estimatedAt`, `restockDays`, T4); eta_unavailable (T4). At most one item per backorder, type and `version`; dedupe by `deliveryId`. Timestamps UTC `Z`.
+
+### ACK outcomes for `backorder.*`
+`POST /chatbot-api/deliveries/:deliveryId/outcome`, same body rules as every item:
+- `PROVIDER_ACCEPTED` (`providerMessageId`, `attemptedAt`), `DELIVERY_UNKNOWN` (`attemptedAt`; do not retry), `STALE` (not sent).
+- **`PROVIDER_REJECTED`** (new, terminal, backorder items only): `{attemptId, outcome: "PROVIDER_REJECTED", attemptedAt, reason}`, `reason` required 1–280 (e.g. `TEMPLATE_NOT_APPROVED`, `UNREACHABLE`), no `providerMessageId`. On `backorder.reserved`/`reservation_reminder` it creates a staff notice to call the customer.
+- `DEFERRED_WINDOW_CLOSED`, `DEFERRED_HUMAN_SESSION` → `422 OUTCOME_NOT_ALLOWED` for backorder items (send an approved template or ACK `STALE`/`PROVIDER_REJECTED`).
+- `PROVIDER_REJECTED` on a non-backorder item → `422 OUTCOME_NOT_ALLOWED` (was 400). `reason` with another outcome or invalid reason → `400 VALIDATION_ERROR`. Same `attemptId` with another reason → `409 IDEMPOTENCY_CONFLICT`; another attempt after a terminal outcome → `409 OUTCOME_ALREADY_RECORDED`.
+
+### Recovery after `410 CURSOR_EXPIRED`
+`GET /chatbot-api/backorders?…&updatedSince=` also returns `backorderUndeliveredResumeAfter` (12-digit cursor of the sucursal's oldest unacknowledged backorder item minus one, or null). Resume the feed from the smallest of `nextCursor`, any `undeliveredResumeAfter`, `saleUndeliveredResumeAfter` and `backorderUndeliveredResumeAfter` (fixed-width string compare). Backorder items never appear in `pending-deliveries` nor in the request recovery walk.
+
+### Deploy order (T2)
+1. The chatbot feed consumer must accept `requestId: null` without `saleId`, the `backorder.*` types (ACK `STALE` for types not handled yet) and be able to report `PROVIDER_REJECTED` **before** the backend deploys T2.
+2. Backend T2 must not go live before the chatbot can check out a reservation (backend T3 + chatbot T5).
+3. Backend migrations `20261120010000_backorder_stock_movements`, `20261121000000_backorder_feed`, `20261121000100_backorder_feed`; the bot must not report `PROVIDER_REJECTED` against a database without the last one (500).
