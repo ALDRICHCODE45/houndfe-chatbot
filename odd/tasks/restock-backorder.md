@@ -1,0 +1,34 @@
+# Restock backorder («pedido por reposición»)
+
+Cross-repo feature: houndfe-backend (model, stock-back event, matching, feed, /chatbot-api), frontend-houndfe (POS list and visibility), houndfe-chatbot (offer, notices, confirm, checkout). The backend builds first; the chatbot consumes its contract.
+
+## Specs
+
+- S1. After the RESTOCK estimate reaches the customer («El equipo nos confirmó un estimado de N días…»), the bot offers to schedule the order: the customer can accept or decline. Accepting creates a backorder (customer, product, variant, quantity, reference price, ETA, source RESTOCK decision) and the bot confirms it was scheduled and that it will notify on arrival.
+- S2. Price: "El menor de los dos (recomendado)" — the customer pays the lower of the reference price at scheduling and the current price at arrival; the bot states the price at confirmation.
+- S3. Priority on arrival: "Se le aparta solo y el bot le pide confirmar (recomendado)" — the backend reserves the arrived units for waiting backorders in scheduling order; reserved units cannot be sold at the counter; if the customer does not confirm in time they are released to the next backorder (then to general stock).
+- S4. Confirmation window: "24 horas (recomendado)" — like the pay-in-store hold, with a reminder before it expires.
+- S5. Arrival detection: "Cuando sube el stock del producto (recomendado)" — any stock increase (adjustment, initial stock, sale cancellation) that leaves sellable stock above zero triggers matching; no extra step for the team.
+- S6. On arrival the bot sends a summary (product, quantity, price per S2, deadline per S4) with a Confirm button; confirming continues the normal checkout (delivery or pickup, then payment). Payment is on arrival, never upfront (v1: no money, no deposit).
+- S7. ETA slip: owner (verbatim) "solo le estas diciendo al cliente que no ha llegado pero no estas mostrando mucho interes realmente de venderle el producto". When the ETA passes and the backorder is still waiting, before messaging the customer the bot obtains a new estimate from the team, then tells the customer the new date and keeps selling. Only one such follow-up.
+- S8. The customer can cancel a scheduled backorder from the conversation; the team can see and cancel backorders in the POS.
+- S9. Notices outside the 24 h WhatsApp window use Meta templates (owner creates them in Meta).
+
+## Tasks
+
+| ID | Specs | Route | Status | Commit |
+| --- | --- | --- | --- | --- |
+| T1 | S1-S9 | Backend agent proposes the contract (model, states, events, feed items, /chatbot-api endpoints, errors); chatbot reviews it | in progress | — |
+| T2 | S1-S5, S7-S8 | Backend agent implements (houndfe-backend) | pending | — |
+| T3 | S3, S8 | Frontend agent implements the POS list and reserved-stock visibility (frontend-houndfe) | pending | — |
+| T4 | S1 | Chatbot: offer after the estimate, create the backorder, decline path | pending | — |
+| T5 | S2, S4, S6, S9 | Chatbot: arrival notice (template outside window), Confirm, checkout with the backorder price, reminder/expiry notices | pending | — |
+| T6 | S7, S8 | Chatbot: ETA slip re-estimate and notice, customer cancel | pending | — |
+| T7 | S1-S9 | Eval scenario + live verification | pending | — |
+
+## Log
+
+- L1 (2026-11-20, user): "Bien guarda todo lo que mencionas como pendientes, no lo pierdas de vista, sin embargo, no leas los otros repositorios, solamante pregunta a los agentes de esos repositorios (houndfe-frontend y houndfe-backend) preguntales lo que quieras, espera su respuesta y listo. hay que continuar con el pedido por reposicion. por favor."
+- L2 (2026-11-17, owner idea, Engram ideas/restock-backorder): out-of-stock → RESTOCK estimate → offer to schedule → backorder → arrival notice with Confirm → normal checkout; pay on arrival; backorder priority over walk-ins; ETA slip re-estimate once (S7 quote); v1 no money, v2 deposit.
+- L3 (2026-11-20, agents via intercom): nothing exists in any repo. Backend main 06fa82aa: RESTOCK decision stores productId/variantId; no goods receipt; stock rises only via POST /inventory/adjustments, initial stock and sale cancellation, all through StockJournalWriter; no event on stock increase (LowStockCrossing rearms silently, natural hook); feed (pg_notify) fits a new item; pay-in-store hold needs existing stock. Frontend: RESTOCK request ends at the estimate; purchase orders and pay-in-store holds are the closest patterns.
+- L4 (2026-11-20, owner answers): price S2 "El menor de los dos (recomendado)"; priority S3 "Se le aparta solo y el bot le pide confirmar (recomendado)"; window S4 "24 horas (recomendado)"; arrival S5 "Cuando sube el stock del producto (recomendado)"; coordination "Sí, coordina con los dos".
