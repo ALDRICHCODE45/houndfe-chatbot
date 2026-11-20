@@ -13,6 +13,7 @@ import type {
 import { HumanRequestDeliveryService } from '../application/human-request-delivery.service';
 import { HumanRequestFeedConsumer } from '../application/human-request-feed.consumer';
 import {
+  BACKORDER_DECISIONS,
   LIVE_DECISIONS,
   REF,
   SALE_PICKUP_DECISIONS,
@@ -24,6 +25,7 @@ import {
   runHumanRequestFeedStoreContract,
   salePickupItem,
   SALE_PICKUP_REVIEW_DECISIONS,
+  backorderItem,
   staffMessageItem,
   templateItem,
 } from './human-request-feed-store.contract';
@@ -45,6 +47,7 @@ describe('PostgresHumanRequestFeedStore.insertDelivery fallbacks (stubbed pool)'
     attempted_at: null,
     ack_state: null,
     ack_outcome: null,
+    ack_reason: null,
     ack_attempts: 0,
     next_ack_at: null,
     created_at: new Date(),
@@ -166,6 +169,7 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
       'ack_attempts',
       'ack_error',
       'ack_outcome',
+      'ack_reason',
       'ack_state',
       'attempt_id',
       'attempted_at',
@@ -677,6 +681,120 @@ ddescribe('human request feed migration 4300 + store (real PostgreSQL)', () => {
     await truncate();
     migrate('up');
     await expect(since('5300000000000')).resolves.toBe(count5300);
+  });
+
+  it('migration 5600: backorder decisions, PROVIDER_REJECTED with its reason, guarded down', async () => {
+    const store = new PostgresHumanRequestFeedStore(pool);
+    await store.insertDelivery(backorderItem('bo-1'));
+    for (const decision of [
+      ...BACKORDER_DECISIONS,
+      ...SALE_PICKUP_REVIEW_DECISIONS,
+      ...SALE_PICKUP_DECISIONS,
+      ...SCHEDULE_DECISIONS,
+      ...LIVE_DECISIONS,
+      'UNKNOWN_TYPE',
+      'WINDOW_CLOSED',
+      'HUMAN_SESSION',
+    ])
+      await expect(
+        pool.query(
+          `UPDATE human_request_deliveries SET decision = $1 WHERE delivery_id = 'bo-1'`,
+          [decision],
+        ),
+      ).resolves.toBeDefined();
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'NOPE' WHERE delivery_id = 'bo-1'`,
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+
+    // The reason CHECK: required with PROVIDER_REJECTED, forbidden elsewhere,
+    // 1-280 characters.
+    const owe = (outcome: string, reason: string | null) =>
+      pool.query(
+        `UPDATE human_request_deliveries
+            SET ack_state = 'PENDING', ack_outcome = $1, ack_reason = $2,
+                attempt_id = gen_random_uuid(), next_ack_at = now()
+          WHERE delivery_id = 'bo-1'`,
+        [outcome, reason],
+      );
+    await expect(
+      owe('PROVIDER_REJECTED', 'UNREACHABLE'),
+    ).resolves.toBeDefined();
+    await expect(owe('PROVIDER_REJECTED', null)).rejects.toMatchObject({
+      code: '23514',
+    });
+    await expect(owe('PROVIDER_REJECTED', '')).rejects.toMatchObject({
+      code: '23514',
+    });
+    await expect(
+      owe('PROVIDER_REJECTED', 'x'.repeat(281)),
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(
+      owe('PROVIDER_REJECTED', 'x'.repeat(280)),
+    ).resolves.toBeDefined();
+    await expect(owe('STALE', 'UNREACHABLE')).rejects.toMatchObject({
+      code: '23514',
+    });
+    await expect(owe('STALE', null)).resolves.toBeDefined();
+    await truncate();
+
+    const count5600 = await since('5600000000000');
+    expect(Number(count5600)).toBeGreaterThanOrEqual(1);
+    // down refuses while a row uses a new decision or the new outcome.
+    for (const decision of BACKORDER_DECISIONS) {
+      await store.insertDelivery(backorderItem('bo-2'));
+      await pool.query(
+        `UPDATE human_request_deliveries SET decision = $1 WHERE delivery_id = 'bo-2'`,
+        [decision],
+      );
+      expect(() => migrate('down', count5600)).toThrow(/refusing to roll back/);
+      await expect(since('5600000000000')).resolves.toBe(count5600);
+      await truncate();
+    }
+    await store.insertDelivery(backorderItem('bo-3'));
+    await store.transition(
+      'bo-3',
+      { localState: 'RECEIVED', attemptId: null },
+      {
+        localState: 'STALE',
+        decision: 'HUMAN_SESSION',
+        attemptId: '0b8f5c0e-6d7a-4c1e-9a52-3f1d2b6a7c10',
+        attemptedAt: '2026-11-21T10:00:00.000Z',
+        providerMessageId: null,
+        ack: 'PROVIDER_REJECTED',
+        ackReason: 'HUMAN_SESSION',
+      },
+    );
+    expect(() => migrate('down', count5600)).toThrow(/refusing to roll back/);
+    await truncate();
+
+    // A row with a 5300 decision does not block it; the old CHECKs are back
+    // and the column is gone.
+    await rawInsert('bo-4');
+    await pool.query(
+      `UPDATE human_request_deliveries SET decision = 'PICKUP_EXPIRED_REVIEW_NOTICE' WHERE delivery_id = 'bo-4'`,
+    );
+    migrate('down', count5600);
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries SET decision = 'BACKORDER_LOST_NOTICE' WHERE delivery_id = 'bo-4'`,
+      ),
+    ).rejects.toThrow(/decision_check/);
+    await expect(
+      pool.query(
+        `UPDATE human_request_deliveries
+            SET ack_state = 'PENDING', ack_outcome = 'PROVIDER_REJECTED',
+                attempt_id = gen_random_uuid(), next_ack_at = now()
+          WHERE delivery_id = 'bo-4'`,
+      ),
+    ).rejects.toThrow(/ack_outcome_check/);
+    await expect(
+      pool.query(`SELECT ack_reason FROM human_request_deliveries`),
+    ).rejects.toThrow(/ack_reason/);
+    await truncate();
+    migrate('up');
+    await expect(since('5600000000000')).resolves.toBe(count5600);
   });
 
   runHumanRequestFeedStoreContract('postgres', () =>

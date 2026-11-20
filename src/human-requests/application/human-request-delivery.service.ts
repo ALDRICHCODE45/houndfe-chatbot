@@ -30,7 +30,10 @@ import type {
 import type { SendResult } from '../../whatsapp/domain/whatsapp-sender.port';
 import type { ScheduledConversationHandler } from './scheduled-conversation.service';
 import type { SalePickupHandler } from './sale-pickup-notice.service';
-import type { BackorderFeedHandler } from '../domain/backorder-feed';
+import type {
+  BackorderFeedHandler,
+  BackorderNoticeButton,
+} from '../domain/backorder-feed';
 import {
   CANCEL_NOTICE,
   LEDGER_RETENTION_MS,
@@ -49,6 +52,7 @@ import {
   type DeliveryDecision,
   type DeliveryExpectation,
   type DeliveryRow,
+  type DeliveryTransition,
   type HumanRequestFeedStore,
 } from '../domain/human-request-feed';
 import {
@@ -67,7 +71,7 @@ export interface HumanRequestDeliveryPorts {
     /** Pay-in-store templates S4: BOT notices outside the 24 h window.
      *  Optional for hand-built harnesses: absent → a template plan is a
      *  definite non-send (its refused decision). */
-    Partial<Pick<WhatsappSenderPort, 'sendTemplate'>>;
+    Partial<Pick<WhatsappSenderPort, 'sendTemplate' | 'sendInteractive'>>;
   /** S4: required, so a missing reader can never skip the hold. */
   handoff: HandoffModeReader &
     /** Follow-ups S4: the ENDING marker (a session known to be ending whose
@@ -140,6 +144,13 @@ interface LiveHooks {
 
 type Plan =
   | ({ action: 'stale'; decision: DeliveryDecision } & LiveHooks)
+  /** Restock backorder: nothing sent, ACK `PROVIDER_REJECTED` with `reason`
+   *  (the backend alerts staff to call the customer). */
+  | ({
+      action: 'rejected';
+      decision: DeliveryDecision;
+      reason: string;
+    } & LiveHooks)
   | ({
       action: 'send';
       decision: DeliveryDecision;
@@ -158,6 +169,15 @@ type Plan =
       /** Live notice (greeting, reassignment, farewell, resume): sent while
        *  the mode is HUMAN, so the HUMAN hold does not apply. */
       live?: boolean;
+      /** Restock backorder: reply buttons under `text` (plain text when the
+       *  sender cannot send interactive messages) and the short body used
+       *  over Meta's interactive limit. */
+      buttons?: ReadonlyArray<BackorderNoticeButton>;
+      shortBody?: string;
+      /** Restock backorder reserved / reminder: a notice that cannot reach
+       *  the customer is `PROVIDER_REJECTED` (the backend alerts staff),
+       *  not `STALE`. */
+      staffAlert?: boolean;
     } & LiveHooks)
   | ({
       /** Staff message / template: sent by `deliver` (never mirrored), never
@@ -685,6 +705,16 @@ export class HumanRequestDeliveryService {
       return next !== null;
     }
 
+    if (plan.action === 'rejected') {
+      const next = await this.ports.store.transition(
+        row.deliveryId,
+        expected,
+        this.rejection(plan.decision, plan.reason, attemptedAt),
+      );
+      if (next !== null) await this.flushAck(next);
+      return next !== null;
+    }
+
     const hold =
       plan.action === 'relay' || plan.live === true
         ? ({ hold: false } as const)
@@ -699,14 +729,22 @@ export class HumanRequestDeliveryService {
       plan.action === 'send' &&
       (plan.overdue === true || plan.cancellation)
     ) {
-      const next = await this.ports.store.transition(row.deliveryId, expected, {
-        localState: 'STALE',
-        decision: 'HUMAN_SESSION',
-        attemptId: this.newAttemptId(),
-        attemptedAt,
-        providerMessageId: null,
-        ack: 'STALE',
-      });
+      // Restock backorder reserved / reminder: staff is talking to the
+      // customer, and the backend alerts them (PROVIDER_REJECTED).
+      const next = await this.ports.store.transition(
+        row.deliveryId,
+        expected,
+        plan.staffAlert === true
+          ? this.rejection('HUMAN_SESSION', 'HUMAN_SESSION', attemptedAt)
+          : {
+              localState: 'STALE',
+              decision: 'HUMAN_SESSION',
+              attemptId: this.newAttemptId(),
+              attemptedAt,
+              providerMessageId: null,
+              ack: 'STALE',
+            },
+      );
       if (next !== null) await this.flushAck(next);
       return next !== null;
     }
@@ -795,13 +833,7 @@ export class HumanRequestDeliveryService {
           ? await plan.deliver()
           : plan.template !== undefined
             ? await this.sendNoticeTemplate(plan.senderId, plan.template)
-            : await this.ports.sender.sendText({
-                to: plan.senderId,
-                text: plan.text,
-                ...(plan.staffReplyId === undefined
-                  ? {}
-                  : { staffReplyId: plan.staffReplyId }),
-              }));
+            : await this.sendNoticeText(plan));
     } catch (error) {
       if (plan.action === 'relay')
         return this.relayFailed(row, plan, claimed, base, error);
@@ -815,6 +847,36 @@ export class HumanRequestDeliveryService {
           error,
         );
       const windowClosed = isWindowClosedSendError(error);
+      // Restock backorder reserved / reminder: a closed window or a message
+      // Meta definitely refuses cannot be delivered, so staff is alerted.
+      if (
+        plan.action === 'send' &&
+        plan.staffAlert === true &&
+        (windowClosed || classifyRelaySendError(error) === 'REFUSED')
+      ) {
+        this.logger.warn(
+          `delivery ${row.deliveryId} ${row.type} not delivered (${windowClosed ? 'window closed' : 'refused'}): ${describeError(error)}`,
+        );
+        const rejected = await this.ports.store.transition(
+          row.deliveryId,
+          claimed,
+          windowClosed
+            ? this.rejection(
+                'WINDOW_CLOSED',
+                'WINDOW_CLOSED',
+                attemptedAt,
+                attemptId,
+              )
+            : this.rejection(
+                'SEND_REFUSED',
+                'UNREACHABLE',
+                attemptedAt,
+                attemptId,
+              ),
+        );
+        if (rejected !== null) await this.flushAck(rejected);
+        return true;
+      }
       if (!windowClosed)
         this.logger.warn(
           `delivery ${row.deliveryId} send uncertain: ${describeError(error)}`,
@@ -852,6 +914,54 @@ export class HumanRequestDeliveryService {
     else await this.flushAck(sent);
     await this.finishLive(plan, row, { kind: 'ACCEPTED', providerMessageId });
     return true;
+  }
+
+  /** `PROVIDER_REJECTED` (restock backorder, migration 5600): nothing was
+   *  sent (or Meta definitely refused it); the backend alerts staff on
+   *  reserved / reminder. A reason is 1-280 characters. */
+  private rejection(
+    decision: DeliveryDecision,
+    reason: string,
+    attemptedAt: string,
+    attemptId: string = this.newAttemptId(),
+  ): DeliveryTransition {
+    return {
+      localState: 'STALE',
+      decision,
+      attemptId,
+      attemptedAt,
+      providerMessageId: null,
+      ack: 'PROVIDER_REJECTED',
+      ackReason: reason.slice(0, 280),
+    };
+  }
+
+  /** A BOT text notice: reply buttons when the plan has them and the sender
+   *  can send them, else the plain text. */
+  private sendNoticeText(
+    plan: Extract<Plan, { action: 'send' }>,
+  ): Promise<SendResult> {
+    const sendInteractive = this.ports.sender.sendInteractive?.bind(
+      this.ports.sender,
+    );
+    if (
+      plan.buttons !== undefined &&
+      plan.buttons.length > 0 &&
+      sendInteractive !== undefined
+    )
+      return sendInteractive({
+        to: plan.senderId,
+        body: plan.text,
+        interactive: { type: 'buttons', buttons: plan.buttons },
+        ...(plan.shortBody === undefined ? {} : { shortBody: plan.shortBody }),
+      });
+    return this.ports.sender.sendText({
+      to: plan.senderId,
+      text: plan.text,
+      ...(plan.staffReplyId === undefined
+        ? {}
+        : { staffReplyId: plan.staffReplyId }),
+    });
   }
 
   /** A BOT notice template (pay-in-store templates S4), mirrored like any
@@ -903,17 +1013,32 @@ export class HumanRequestDeliveryService {
     this.logger.warn(
       `delivery ${row.deliveryId} ${row.type} template ${template.templateName} ${uncertain ? 'send uncertain' : 'refused'} (Meta code ${metaCode}): ${describeError(error)}`,
     );
-    const next = await this.ports.store.transition(row.deliveryId, claimed, {
-      ...base,
-      providerMessageId: null,
-      ...(uncertain
-        ? ({ localState: 'UNKNOWN', ack: 'DELIVERY_UNKNOWN' } as const)
-        : ({
-            localState: 'STALE',
-            decision: template.refusedDecision,
-            ack: 'STALE',
-          } as const)),
-    });
+    // Restock backorder reserved / reminder: a refused template cannot
+    // deliver the notice, so staff is alerted (PROVIDER_REJECTED).
+    const rejected =
+      !uncertain && plan.action === 'send' && plan.staffAlert === true;
+    const next = await this.ports.store.transition(
+      row.deliveryId,
+      claimed,
+      rejected
+        ? this.rejection(
+            template.refusedDecision,
+            'TEMPLATE_NOT_APPROVED',
+            base.attemptedAt,
+            base.attemptId,
+          )
+        : {
+            ...base,
+            providerMessageId: null,
+            ...(uncertain
+              ? ({ localState: 'UNKNOWN', ack: 'DELIVERY_UNKNOWN' } as const)
+              : ({
+                  localState: 'STALE',
+                  decision: template.refusedDecision,
+                  ack: 'STALE',
+                } as const)),
+          },
+    );
     if (next !== null) await this.flushAck(next);
     await this.finishLive(plan, row, {
       kind: uncertain ? 'UNKNOWN' : 'NOT_SENT',
@@ -1068,9 +1193,9 @@ export class HumanRequestDeliveryService {
       // A notice that may not wait (the backend refuses DEFERRED_* for
       // backorder items): a HUMAN chat is an immediate STALE
       // (HUMAN_SESSION), a closed window at send time is STALE.
-      return planned.action === 'send'
-        ? { ...planned, cancellation: true }
-        : { action: 'stale', decision: planned.decision };
+      if (planned.action === 'send') return { ...planned, cancellation: true };
+      if (planned.action === 'rejected') return planned;
+      return { action: 'stale', decision: planned.decision };
     }
 
     if (isSalePickupItem(item)) {

@@ -19,6 +19,10 @@ const receiptLessThanLease = (fallback: number) =>
   Joi.number().integer().min(1).less(RECEIPT_LEASE_MS_VALUE).default(fallback);
 
 // WU15-1: ASCII hex digit pattern for 64-character token validation.
+/** A Meta template name: lowercase `[a-z0-9_]+`, at most 512 chars. */
+const metaTemplateName = Joi.string()
+  .pattern(/^[a-z0-9_]{1,512}$/)
+  .optional();
 const METRICS_TOKEN_HEX_RE = /^[0-9a-fA-F]{64}$/;
 
 const receiptMediaHostsSchema = Joi.string()
@@ -250,6 +254,15 @@ const innerEnvValidationSchema = Joi.object({
   // out as Meta utility templates when the 24 h window is closed. Default
   // off until Meta approves the three templates.
   PAY_IN_STORE_TEMPLATES_ENABLED: Joi.boolean().default(false),
+  // odd/tasks/restock-backorder.md T5a S9: the backorder.* notices go out as
+  // Meta utility templates when the 24 h window is closed. Default off until
+  // Meta approves them (docs/minimal-backorder.md has the texts). The names
+  // are optional overrides of the proposed ones.
+  BACKORDER_TEMPLATES_ENABLED: Joi.boolean().default(false),
+  BACKORDER_TEMPLATE_RESERVED: metaTemplateName,
+  BACKORDER_TEMPLATE_REMINDER: metaTemplateName,
+  BACKORDER_TEMPLATE_EXPIRED: metaTemplateName,
+  BACKORDER_TEMPLATE_LOST: metaTemplateName,
 
   // N18: destination/origin receipt fields inside `extracted` (backend
   // aebb60ef). Kill switch only; default on.

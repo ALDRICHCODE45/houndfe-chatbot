@@ -1,3 +1,4 @@
+import { BACKORDER_TEMPLATE_DEFAULTS } from '../backorders/domain/backorder-notices';
 import configuration from './configuration';
 
 /**
@@ -61,6 +62,11 @@ describe('configuration()', () => {
     'CONVERSATION_MIRROR_DELIVERY_ENABLED',
     'PAY_IN_STORE_ENABLED',
     'PAY_IN_STORE_TEMPLATES_ENABLED',
+    'BACKORDER_TEMPLATES_ENABLED',
+    'BACKORDER_TEMPLATE_RESERVED',
+    'BACKORDER_TEMPLATE_REMINDER',
+    'BACKORDER_TEMPLATE_EXPIRED',
+    'BACKORDER_TEMPLATE_LOST',
     'OPS_CHANNEL_PHONE',
     // Removed shipping vars (U6): kept here so the test restores them.
     'SHIPPING_QUOTES_ENABLED',
@@ -366,6 +372,41 @@ describe('configuration()', () => {
       if (env === undefined) delete process.env.PAY_IN_STORE_TEMPLATES_ENABLED;
       else process.env.PAY_IN_STORE_TEMPLATES_ENABLED = env;
       expect(configuration().payInStore.templatesEnabled).toBe(expected);
+    });
+
+    // restock backorder T5a (S9): default off; names default to the proposed
+    // Meta templates and are configurable.
+    it.each([
+      [undefined, false],
+      ['true', true],
+      ['True', true],
+      ['false', false],
+      ['', false],
+    ])('maps BACKORDER_TEMPLATES_ENABLED=%s', (env, expected) => {
+      if (env === undefined) delete process.env.BACKORDER_TEMPLATES_ENABLED;
+      else process.env.BACKORDER_TEMPLATES_ENABLED = env;
+      expect(configuration().backorder.templatesEnabled).toBe(expected);
+    });
+
+    it('maps the backorder template names with their defaults', () => {
+      // One source of truth: the handler's defaults are the configured ones.
+      expect(configuration().backorder.templateNames).toEqual(
+        BACKORDER_TEMPLATE_DEFAULTS,
+      );
+      expect(configuration().backorder.templateNames).toEqual({
+        reserved: 'pedido_reposicion_llego',
+        reminder: 'pedido_reposicion_recordatorio',
+        expired: 'pedido_reposicion_vencido',
+        lost: 'pedido_reposicion_lote',
+      });
+      process.env.BACKORDER_TEMPLATE_RESERVED = 'llego_v2';
+      process.env.BACKORDER_TEMPLATE_LOST = 'lote_v2';
+      expect(configuration().backorder.templateNames).toEqual({
+        reserved: 'llego_v2',
+        reminder: 'pedido_reposicion_recordatorio',
+        expired: 'pedido_reposicion_vencido',
+        lost: 'lote_v2',
+      });
     });
 
     // WU15-1: metricsToken surfaces independently on receiptMedia

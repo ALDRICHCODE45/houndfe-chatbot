@@ -616,6 +616,44 @@ describe('envValidationSchema', () => {
     });
   });
 
+  // restock backorder T5a (S9): Meta templates outside the 24 h window.
+  describe('BACKORDER_TEMPLATES_ENABLED and template names', () => {
+    const validate = (extra: Record<string, unknown>) =>
+      envValidationSchema.validate(
+        { ...validEnv, ...extra },
+        { abortEarly: false },
+      ) as { error?: Joi.ValidationError; value: Record<string, unknown> };
+
+    it.each([
+      [undefined, false, false],
+      ['true', true, false],
+      ['false', false, false],
+      ['yes', undefined, true],
+    ])('validates flag=%s', (flag, expected, invalid) => {
+      const { error, value } = validate(
+        flag === undefined ? {} : { BACKORDER_TEMPLATES_ENABLED: flag },
+      );
+      expect(Boolean(error)).toBe(invalid);
+      if (invalid)
+        expect(error!.details[0].path).toContain('BACKORDER_TEMPLATES_ENABLED');
+      else expect(value.BACKORDER_TEMPLATES_ENABLED).toBe(expected);
+    });
+
+    it.each([
+      'BACKORDER_TEMPLATE_RESERVED',
+      'BACKORDER_TEMPLATE_REMINDER',
+      'BACKORDER_TEMPLATE_EXPIRED',
+      'BACKORDER_TEMPLATE_LOST',
+    ])('%s is an optional Meta template name', (name) => {
+      expect(validate({}).error).toBeUndefined();
+      expect(validate({ [name]: 'mi_plantilla_2' }).error).toBeUndefined();
+      for (const bad of ['Mi-Plantilla', 'con espacio', '', 'x'.repeat(513)]) {
+        const { error } = validate({ [name]: bad });
+        expect(error?.details[0].path).toContain(name);
+      }
+    });
+  });
+
   describe('CONVERSATION_MIRROR_DELIVERY_ENABLED', () => {
     it.each([
       [undefined, false, false],

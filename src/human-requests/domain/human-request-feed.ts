@@ -109,7 +109,28 @@ export type DeliveryDecision =
   // ---- pay in store templates (migration 5300) ----
   /** sale.pickup_expired_review: the "alguien del equipo le va a contactar"
    *  notice sent (free text only; no template exists for it). */
-  | 'PICKUP_EXPIRED_REVIEW_NOTICE';
+  | 'PICKUP_EXPIRED_REVIEW_NOTICE'
+  // ---- restock backorder notices (migration 5600) ----
+  /** backorder.reserved: the arrival summary with Confirm / Ya no. */
+  | 'BACKORDER_RESERVED_NOTICE'
+  /** backorder.reservation_reminder sent. */
+  | 'BACKORDER_REMINDER_NOTICE'
+  /** backorder.reservation_expired sent (with or without a reschedule offer). */
+  | 'BACKORDER_EXPIRED_NOTICE'
+  /** backorder.reservation_lost: the apology sent. */
+  | 'BACKORDER_LOST_NOTICE'
+  /** backorder.cancelled_by_staff sent. */
+  | 'BACKORDER_CANCELLED_NOTICE'
+  /** backorder.eta_updated / eta_unavailable: not handled yet (T6 S7): STALE. */
+  | 'BACKORDER_ETA_PENDING'
+  /** A backorder notice whose payload cannot be worded. */
+  | 'BACKORDER_PAYLOAD_INVALID'
+  /** A reserved / reminder notice whose reservation deadline already
+   *  passed when it was planned: not announced (STALE). */
+  | 'BACKORDER_OVERTAKEN'
+  /** The approved template is missing, not approved or refused by Meta
+   *  (STALE, or PROVIDER_REJECTED for reserved / reminder). */
+  | 'TEMPLATE_NOT_APPROVED';
 
 export type AckState = 'PENDING' | 'ACKED' | 'FAILED_PERMANENT';
 
@@ -137,6 +158,9 @@ export interface DeliveryRow {
   /** `null`: no ACK owed for the current attempt. */
   ackState: AckState | null;
   ackOutcome: DeliveryOutcome | null;
+  /** `PROVIDER_REJECTED` only (migration 5600): its `reason`, 1-280 chars;
+   *  `null` for every other outcome. */
+  ackReason: string | null;
   ackAttempts: number;
   nextAckAt: Date | null;
   createdAt: Date;
@@ -152,6 +176,9 @@ export interface DeliveryTransition {
   attemptedAt: string | null;
   providerMessageId: string | null;
   ack: DeliveryOutcome | null;
+  /** The `reason` of a `PROVIDER_REJECTED` ack (required with it, absent
+   *  or `null` with any other outcome). */
+  ackReason?: string | null;
 }
 
 /** Compare-and-set guard: the row must still be in this state and attempt. */
@@ -473,10 +500,16 @@ export function ackBodyFor(row: DeliveryRow): DeliveryOutcomeInput | null {
         ? null
         : { outcome: row.ackOutcome, attemptId, attemptedAt };
     case 'PROVIDER_REJECTED':
-      // The ledger cannot store the `reason` (no column; the migration CHECK
-      // does not know the outcome), so no row ever owes it yet. Null =
-      // invalid body, never a made-up reason. T5 adds the storage.
-      return null;
+      // Migration 5600 stores the `reason`. Without it (or an attempt time)
+      // the body is invalid: never a made-up reason.
+      return row.ackReason === null || attemptedAt === undefined
+        ? null
+        : {
+            outcome: 'PROVIDER_REJECTED',
+            attemptId,
+            attemptedAt,
+            reason: row.ackReason,
+          };
     case 'STALE':
       return {
         outcome: 'STALE',

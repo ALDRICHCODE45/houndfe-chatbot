@@ -968,3 +968,99 @@ describe('HumanRequestFeedConsumer', () => {
     });
   });
 });
+
+describe('HumanRequestFeedConsumer recovery with backorders (restock backorder T5a)', () => {
+  const SYNCED = '2026-11-01T00:00:00.000Z';
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const build = (
+    undeliveredResumeAfter:
+      | ((updatedSince: string | null) => Promise<string | null>)
+      | undefined,
+    walk: ListOpenRequestsResult,
+  ) => {
+    const store = new InMemoryHumanRequestFeedStore();
+    const feed = new ScriptedFeed([{ kind: 'CURSOR_EXPIRED' }]);
+    feed.openScript = [walk];
+    const consumer = new HumanRequestFeedConsumer(
+      {
+        store,
+        client: feed,
+        delivery: {
+          accept: () => Promise.resolve(),
+          abandon: () => Promise.resolve(),
+        },
+        lock: new FakeLock(),
+        ...(undeliveredResumeAfter === undefined
+          ? {}
+          : { backorders: { undeliveredResumeAfter } }),
+      },
+      { clock: () => Date.now() + 120_000, sleep: () => Promise.resolve() },
+    );
+    return { store, feed, consumer };
+  };
+
+  it('resumes from the backorder position when it is the smallest', async () => {
+    const lookup = jest.fn(() => Promise.resolve('000000001500'));
+    const { store, consumer } = build(
+      lookup,
+      openPage(
+        [openRequest('a', { undeliveredResumeAfter: '000000001700' })],
+        '000000001900',
+        null,
+      ),
+    );
+    await store.saveCursor('000000000009', SYNCED);
+    await expect(consumer.runOnce()).resolves.toMatchObject({
+      kind: 'recovered',
+    });
+    expect(lookup).toHaveBeenCalledWith(SYNCED);
+    await expect(store.readCursor()).resolves.toBe('000000001500');
+  });
+
+  it('a larger backorder position changes nothing', async () => {
+    const { store, consumer } = build(
+      () => Promise.resolve('000000002500'),
+      openPage(
+        [openRequest('a', { undeliveredResumeAfter: '000000001700' })],
+        '000000001900',
+        null,
+      ),
+    );
+    await consumer.runOnce();
+    await expect(store.readCursor()).resolves.toBe('000000001700');
+  });
+
+  it('no backorder position (null) and no port behave as before', async () => {
+    for (const lookup of [() => Promise.resolve(null), undefined]) {
+      const { store, consumer } = build(
+        lookup,
+        openPage([openRequest('a')], '000000001900', null),
+      );
+      await consumer.runOnce();
+      await expect(store.readCursor()).resolves.toBe('000000001900');
+    }
+  });
+
+  it('asks without updatedSince when synced_at was never saved', async () => {
+    const lookup = jest.fn(() => Promise.resolve(null));
+    const { consumer } = build(lookup, openPage([], '000000001900', null));
+    await consumer.runOnce();
+    expect(lookup).toHaveBeenCalledWith(null);
+  });
+
+  it('a failed backorder read saves nothing: the expired cursor stays and the next pass walks again', async () => {
+    const { store, consumer } = build(
+      () => Promise.reject(new Error('backend 503')),
+      openPage([], '000000001900', null),
+    );
+    await store.saveCursor('000000000009', SYNCED);
+    await consumer.runOnce().catch(() => undefined);
+    await expect(store.readCursor()).resolves.toBe('000000000009');
+    await expect(store.readSyncedAt()).resolves.toBe(SYNCED);
+  });
+});

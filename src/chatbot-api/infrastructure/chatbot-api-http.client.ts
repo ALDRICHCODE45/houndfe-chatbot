@@ -490,7 +490,7 @@ export class ChatbotApiHttpClient
         'INVALID_CHECKOUT_REQUEST',
       );
     }
-    const data = parsed.data;
+    const data = withoutNullBackorderIds(parsed.data);
     const response = await this.requestWithResponse<unknown>({
       method: 'POST',
       url: '/chatbot-api/checkouts',
@@ -2428,6 +2428,26 @@ export class ChatbotApiHttpClient
 
     return Math.max(0, parsed);
   }
+}
+
+/** Restock backorder T3: `backorderId: null` means "omitted"; the member is
+ *  sent only when present, so every other request stays byte-identical. */
+function withoutNullBackorderIds(
+  input: CreateCheckoutInput,
+): CreateCheckoutInput {
+  if (input.sale.items.every((item) => item.backorderId !== null)) return input;
+  return {
+    ...input,
+    sale: {
+      ...input.sale,
+      items: input.sale.items.map((item) => {
+        if (item.backorderId !== null) return item;
+        const { backorderId: omitted, ...rest } = item;
+        void omitted;
+        return rest;
+      }),
+    },
+  };
 }
 
 function defaultSleep(milliseconds: number): Promise<void> {

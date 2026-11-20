@@ -1,0 +1,259 @@
+import {
+  applyCustomerStyle,
+  type CustomerStyle,
+} from '../../customer-profile/domain/notice-style';
+import {
+  backorderDate,
+  backorderDateTime,
+} from '../../llm-agent/domain/backorder-copy';
+
+/**
+ * Restock backorder T5a: the customer copy of the `backorder.*` feed notices
+ * (docs/minimal-backorder.md, "Notices"), in usted. Server-owned data only:
+ * names, folio, price and dates come from the feed item, never from a model.
+ *
+ * Skeletons carry `{placeholders}` that are filled AFTER the register is
+ * applied, so a product or first name is never rewritten by a phrase pair
+ * (a product called «Su pedido Premium» stays as it is).
+ */
+
+// ------------------------------------------------------------- buttons
+
+/** Reply buttons are tapped by id; T5b parses `backorder_confirm` and the two
+ *  reschedule ids, T6a parses `backorder_cancel:pick` (customer-reply.ts). */
+export const BACKORDER_CONFIRM_TITLE = 'Confirmar pedido';
+export const BACKORDER_NO_LONGER_TITLE = 'Ya no lo quiero';
+export const BACKORDER_RESCHEDULE_TITLE = 'Sí, agéndalo';
+export const BACKORDER_RESCHEDULE_DECLINE_TITLE = 'No, gracias';
+
+export const backorderConfirmButtonId = (backorderId: string): string =>
+  `backorder_confirm:${backorderId}`;
+/** The «Ya no lo quiero» tap is T6a's cancel-pick: it leads to its
+ *  «¿Cancelo su pedido …?» question. */
+export const backorderCancelPickButtonId = (backorderId: string): string =>
+  `backorder_cancel:pick:${backorderId}`;
+export const backorderRescheduleButtonId = (backorderId: string): string =>
+  `backorder_reschedule:${backorderId}`;
+export const backorderRescheduleDeclineButtonId = (
+  backorderId: string,
+): string => `backorder_reschedule_decline:${backorderId}`;
+
+export const backorderConfirmButtons = (
+  backorderId: string,
+): ReadonlyArray<{ id: string; title: string }> => [
+  { id: backorderConfirmButtonId(backorderId), title: BACKORDER_CONFIRM_TITLE },
+  {
+    id: backorderCancelPickButtonId(backorderId),
+    title: BACKORDER_NO_LONGER_TITLE,
+  },
+];
+
+export const backorderRescheduleButtons = (
+  backorderId: string,
+): ReadonlyArray<{ id: string; title: string }> => [
+  {
+    id: backorderRescheduleButtonId(backorderId),
+    title: BACKORDER_RESCHEDULE_TITLE,
+  },
+  {
+    id: backorderRescheduleDeclineButtonId(backorderId),
+    title: BACKORDER_RESCHEDULE_DECLINE_TITLE,
+  },
+];
+
+// ---------------------------------------------------------------- copy
+
+export const BACKORDER_CONFIRM_QUESTION = '¿Lo confirmamos?';
+export const BACKORDER_RESCHEDULE_QUESTION =
+  '¿Quiere que se lo vuelva a agendar?';
+
+/** Phrases the shared `customer-style.ts` pairs do not cover (the notices
+ *  say «Se lo apartamos», «Le recuerdo», «le aviso en cuanto llegue», …).
+ *  Applied before the shared pairs for tú customers. */
+const TU_PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ['Le recuerdo que su pedido', 'Te recuerdo que tu pedido'],
+  ['Se lo apartamos', 'Te lo apartamos'],
+  [BACKORDER_RESCHEDULE_QUESTION, '¿Quieres que te lo vuelva a agendar?'],
+  ['el lote que le apartamos', 'el lote que te apartamos'],
+  ['le aviso en cuanto llegue', 'te aviso en cuanto llegue'],
+];
+
+/** A skeleton in the customer's style, then its `{placeholders}` filled. */
+export function renderNotice(
+  skeleton: string,
+  values: Readonly<Record<string, string>>,
+  style: CustomerStyle | null,
+): string {
+  let text = skeleton;
+  if (style !== null) {
+    if (style.register === 'tu')
+      for (const [usted, tu] of TU_PAIRS) text = text.split(usted).join(tu);
+    text = applyCustomerStyle(text, style);
+  }
+  return text.replace(/\{(\w+)\}/g, (match, key: string) =>
+    Object.prototype.hasOwnProperty.call(values, key) ? values[key] : match,
+  );
+}
+
+/** `$1099.00 MXN`, the money format of the rest of the bot. */
+export const backorderMoney = (cents: number): string =>
+  `$${(cents / 100).toFixed(2)} MXN`;
+
+/** `Croquetas (18 kg)`: the product with its presentation. */
+export const backorderLabel = (
+  productName: string,
+  variantName: string | null,
+): string =>
+  variantName === null ? productName : `${productName} (${variantName})`;
+
+/** «a. m.» already ends with its period: never «a. m..». */
+const endSentence = (text: string): string =>
+  text.endsWith('.') ? text : `${text}.`;
+
+/** «el 21 de noviembre a las 9:00 a. m.» (Mexico City), `null` if unreadable. */
+export const backorderDeadline = (iso: string, now: Date): string | null =>
+  backorderDateTime(iso, now);
+
+/** «27 de noviembre» when the estimate is still ahead, else `null`. */
+export function backorderEstimateDate(
+  iso: string | null,
+  now: Date,
+): string | null {
+  if (iso === null) return null;
+  const at = Date.parse(iso);
+  return Number.isNaN(at) || at <= now.getTime()
+    ? null
+    : backorderDate(iso, now);
+}
+
+export interface ReservedNoticeInput {
+  firstName: string | null;
+  folio: string;
+  quantity: number;
+  label: string;
+  finalPriceCents: number;
+  referencePriceCents: number | null;
+  /** Output of `backorderDeadline`. */
+  deadline: string;
+}
+
+/** S6: the arrival summary (product, quantity, price, deadline). */
+export function reservedNotice(
+  input: ReservedNoticeInput,
+  style: CustomerStyle | null,
+): string {
+  const lowered =
+    input.referencePriceCents !== null &&
+    input.finalPriceCents < input.referencePriceCents;
+  return renderNotice(
+    `¡Buenas noticias{greeting}! Ya llegó su pedido {folio}: {quantity} × {label}. ` +
+      `Se lo apartamos a {price} c/u{drop} hasta {deadline} {question}`,
+    {
+      greeting: input.firstName === null ? '' : `, ${input.firstName}`,
+      folio: input.folio,
+      quantity: String(input.quantity),
+      label: input.label,
+      price: backorderMoney(input.finalPriceCents),
+      drop: lowered
+        ? ` (bajó de precio, antes ${backorderMoney(input.referencePriceCents as number)})`
+        : '',
+      deadline: endSentence(input.deadline),
+      question: renderNotice(BACKORDER_CONFIRM_QUESTION, {}, style),
+    },
+    style,
+  );
+}
+
+/** S4: the reminder before the 24 h hold lapses. */
+export function reminderNotice(
+  input: { folio: string; deadline: string },
+  style: CustomerStyle | null,
+): string {
+  return renderNotice(
+    'Le recuerdo que su pedido {folio} sigue apartado hasta {deadline} {question}',
+    {
+      folio: input.folio,
+      deadline: endSentence(input.deadline),
+      question: renderNotice(BACKORDER_CONFIRM_QUESTION, {}, style),
+    },
+    style,
+  );
+}
+
+/** S4: the hold lapsed; with a reschedule offer when the backend names the
+ *  source decision (the buttons then answer it). */
+export function expiredNotice(
+  input: { folio: string; productName: string; offerReschedule: boolean },
+  style: CustomerStyle | null,
+): string {
+  return renderNotice(
+    input.offerReschedule
+      ? `Se venció el apartado de su pedido {folio} ({product}). ${BACKORDER_RESCHEDULE_QUESTION}`
+      : 'Se venció el apartado de su pedido {folio} ({product}).',
+    { folio: input.folio, product: input.productName },
+    style,
+  );
+}
+
+/** S12: the reserved lot expired and no valid one is left. */
+export function lostNotice(
+  input: {
+    firstName: string | null;
+    productName: string;
+    folio: string;
+    /** Output of `backorderEstimateDate`. */
+    estimateDate: string | null;
+  },
+  style: CustomerStyle | null,
+): string {
+  return renderNotice(
+    'Una disculpa{greeting}: el lote que le apartamos de {product} caducó y no tenemos otro vigente. ' +
+      'Su pedido {folio} sigue en primer lugar; le aviso en cuanto llegue{when}.',
+    {
+      greeting: input.firstName === null ? '' : `, ${input.firstName}`,
+      product: input.productName,
+      folio: input.folio,
+      when:
+        input.estimateDate === null ? '' : ` (aprox. ${input.estimateDate})`,
+    },
+    style,
+  );
+}
+
+/** Staff cancelled it; the staff's reason is verbatim, never restyled. */
+export function cancelledNotice(
+  input: { folio: string; reason: string | null },
+  style: CustomerStyle | null,
+): string {
+  const head = renderNotice(
+    'El equipo canceló su pedido {folio}',
+    { folio: input.folio },
+    style,
+  );
+  if (input.reason === null) return `${head}.`;
+  return `${head}: ${endSentence(input.reason)}`;
+}
+
+// ------------------------------------------------------------ templates
+
+/** Approved Meta template language (the owner creates them in `es_MX`). */
+export const BACKORDER_TEMPLATE_LANGUAGE = 'es_MX';
+
+/** Defaults; every name is configurable (docs/minimal-backorder.md). */
+export const BACKORDER_TEMPLATE_DEFAULTS = {
+  reserved: 'pedido_reposicion_llego',
+  reminder: 'pedido_reposicion_recordatorio',
+  expired: 'pedido_reposicion_vencido',
+  lost: 'pedido_reposicion_lote',
+} as const;
+
+export type BackorderTemplateNames = {
+  -readonly [K in keyof typeof BACKORDER_TEMPLATE_DEFAULTS]: string;
+};
+
+/** A template parameter: one line, trimmed, ≤ 1024 chars; `null` when empty
+ *  (Meta refuses an empty value). */
+export function templateParameter(value: string): string | null {
+  const line = value.replace(/\s+/g, ' ').trim().slice(0, 1024).trim();
+  return line === '' ? null : line;
+}

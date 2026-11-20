@@ -48,6 +48,24 @@ const configuration = () => ({
     // apartado_plazo_actualizado. Off → a closed window stays STALE.
     templatesEnabled: envBoolean(process.env.PAY_IN_STORE_TEMPLATES_ENABLED),
   },
+  backorder: {
+    // Default off (restock backorder T5a, S9): the owner turns it on once
+    // Meta approved the four pedido_reposicion_* templates. Off → reserved /
+    // reminder outside the 24 h window are PROVIDER_REJECTED
+    // TEMPLATE_NOT_APPROVED (staff calls), the other notices STALE.
+    templatesEnabled: envBoolean(process.env.BACKORDER_TEMPLATES_ENABLED),
+    // Approved template names (`es_MX`); defaults are the proposed ones.
+    templateNames: {
+      reserved:
+        process.env.BACKORDER_TEMPLATE_RESERVED || 'pedido_reposicion_llego',
+      reminder:
+        process.env.BACKORDER_TEMPLATE_REMINDER ||
+        'pedido_reposicion_recordatorio',
+      expired:
+        process.env.BACKORDER_TEMPLATE_EXPIRED || 'pedido_reposicion_vencido',
+      lost: process.env.BACKORDER_TEMPLATE_LOST || 'pedido_reposicion_lote',
+    },
+  },
   chatbotApi: {
     baseUrl: process.env.CHATBOT_API_BASE_URL as string,
     serviceKey: process.env.SERVICE_KEY as string,

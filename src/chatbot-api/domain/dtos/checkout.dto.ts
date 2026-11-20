@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ChatbotApiError } from '../errors';
 import { isCheckoutUuid } from './checkout-context.dto';
 
 /** The quote already backs another sale; nothing was written (no saleId). */
@@ -90,6 +91,10 @@ export const CreateCheckoutInputSchema = z
                 variantName: z.string().nullish(),
                 quantity: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
                 unitPriceCents: cents,
+                /** Restock backorder T3: the RESERVED backorder this line
+                 *  confirms (`unitPriceCents` = its `finalPriceCents`). Sent
+                 *  only when present; `null` = omitted. */
+                backorderId: uuid.nullish(),
               })
               .strict(),
           )
@@ -305,4 +310,104 @@ export function checkoutErrorMismatches(body: unknown): string[] {
   return Array.isArray(mismatches)
     ? mismatches.filter((part): part is string => typeof part === 'string')
     : [];
+}
+
+// ------------------------------------------------- restock backorder checkout
+
+/**
+ * Restock backorder T3 (docs/contracts/restock-backorder-bot-contract.md,
+ * "backend T3 built"): the checkout errors a line with `backorderId` can
+ * raise, typed so the confirm flow branches on `code` instead of reading raw
+ * bodies. `createCheckout` already surfaces them as a `ChatbotApiError`
+ * (`statusCode`, `errorCode`, `responseBody`); this reads the detail member.
+ */
+export const BACKORDER_CHECKOUT_ERROR_CODES = [
+  'BACKORDER_NOT_FOUND',
+  'BACKORDER_NOT_RESERVED',
+  'BACKORDER_RESERVATION_EXPIRED',
+  'BACKORDER_RESERVATION_LOST',
+  'BACKORDER_RESERVATION_UNAVAILABLE',
+  'BACKORDER_MISMATCH',
+  'PRICE_OUT_OF_DATE',
+  'INVALID_CHECKOUT_REQUEST',
+  'BACKORDER_CHECKOUT_UNAVAILABLE',
+] as const;
+export type BackorderCheckoutErrorCode =
+  (typeof BACKORDER_CHECKOUT_ERROR_CODES)[number];
+
+export type BackorderCheckoutFailure =
+  | {
+      code:
+        | 'BACKORDER_NOT_FOUND'
+        | 'BACKORDER_RESERVATION_EXPIRED'
+        | 'BACKORDER_RESERVATION_LOST'
+        | 'BACKORDER_RESERVATION_UNAVAILABLE'
+        | 'INVALID_CHECKOUT_REQUEST'
+        | 'BACKORDER_CHECKOUT_UNAVAILABLE';
+      /** HTTP status of the answer. */
+      status: number;
+    }
+  | {
+      code: 'BACKORDER_NOT_RESERVED';
+      status: number;
+      /** The backorder's state (`CONFIRMED`, `EXPIRED`, …); `null` when the
+       *  body does not name it. */
+      backorderStatus: string | null;
+    }
+  | {
+      code: 'BACKORDER_MISMATCH';
+      status: number;
+      /** customerId / productId / variantId / quantity; `null` if absent. */
+      field: string | null;
+    }
+  | {
+      code: 'PRICE_OUT_OF_DATE';
+      status: number;
+      /** The backorder's `finalPriceCents` (ordinary line: `null`). */
+      currentPriceCents: number | null;
+    };
+
+const isBackorderCheckoutCode = (
+  code: string | null,
+): code is BackorderCheckoutErrorCode =>
+  code !== null &&
+  (BACKORDER_CHECKOUT_ERROR_CODES as readonly string[]).includes(code);
+
+/**
+ * The typed backorder failure of a rejected checkout, or `null` for any
+ * other error (a transport failure, another code, a non-API error).
+ */
+export function backorderCheckoutFailure(
+  error: unknown,
+): BackorderCheckoutFailure | null {
+  if (!(error instanceof ChatbotApiError)) return null;
+  const { statusCode: status, errorCode: code, responseBody: body } = error;
+  if (status === null || !isBackorderCheckoutCode(code)) return null;
+  const member = (key: string): unknown =>
+    typeof body === 'object' && body !== null
+      ? (body as Record<string, unknown>)[key]
+      : undefined;
+  const text = (key: string): string | null => {
+    const value = member(key);
+    return typeof value === 'string' && value !== '' ? value : null;
+  };
+  switch (code) {
+    case 'BACKORDER_NOT_RESERVED':
+      return { code, status, backorderStatus: text('status') };
+    case 'BACKORDER_MISMATCH':
+      return { code, status, field: text('field') };
+    case 'PRICE_OUT_OF_DATE': {
+      const cents = member('currentPriceCents');
+      return {
+        code,
+        status,
+        currentPriceCents:
+          typeof cents === 'number' && Number.isInteger(cents) && cents >= 0
+            ? cents
+            : null,
+      };
+    }
+    default:
+      return { code, status };
+  }
 }

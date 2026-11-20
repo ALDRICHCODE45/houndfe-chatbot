@@ -2,6 +2,7 @@ import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { AxiosHeaders } from 'axios';
 import { of, throwError } from 'rxjs';
+import { backorderCheckoutFailure } from '../domain/dtos/checkout.dto';
 import { ChatbotApiError, UpstreamError } from '../domain/errors';
 import { ChatbotApiHttpClient } from './chatbot-api-http.client';
 
@@ -106,6 +107,83 @@ describe('atomic checkout mocked HTTP contract', () => {
       }),
     );
   });
+  it('T5b: sends a backorderId line as is and keeps other lines byte-identical', async () => {
+    request.mockReturnValue(of(response(receipt)));
+    const backorderLine = {
+      productId: id,
+      productName: 'Food',
+      quantity: 2,
+      unitPriceCents: 109900,
+      backorderId: '22222222-2222-4222-8222-222222222222',
+    };
+    const sale = {
+      ...input.sale,
+      items: [backorderLine, input.sale.items[0]],
+    };
+    await client.createCheckout({ ...input, sale }, key);
+    const sent = request.mock.calls[0][0].data as typeof input;
+    expect(sent.sale.items).toEqual([backorderLine, input.sale.items[0]]);
+    expect(JSON.stringify(sent.sale.items[1])).toBe(
+      JSON.stringify(input.sale.items[0]),
+    );
+  });
+  it('T5b: a null backorderId is not sent; no member without it', async () => {
+    request.mockReturnValue(of(response(receipt)));
+    const sale = {
+      ...input.sale,
+      items: [{ ...input.sale.items[0], backorderId: null }],
+    };
+    await client.createCheckout({ ...input, sale }, key);
+    const sent = request.mock.calls[0][0].data as typeof input;
+    expect(Object.keys(sent.sale.items[0])).not.toContain('backorderId');
+    expect(sent).toEqual(input);
+  });
+  it('T5b: a non-uuid backorderId is rejected before HTTP', async () => {
+    const sale = {
+      ...input.sale,
+      items: [{ ...input.sale.items[0], backorderId: 'nope' }],
+    };
+    await expect(
+      client.createCheckout({ ...input, sale }, key),
+    ).rejects.toMatchObject({ errorCode: 'INVALID_CHECKOUT_REQUEST' });
+    expect(request).not.toHaveBeenCalled();
+  });
+  it.each([
+    [404, 'BACKORDER_NOT_FOUND', {}],
+    [409, 'BACKORDER_NOT_RESERVED', { status: 'EXPIRED' }],
+    [409, 'BACKORDER_RESERVATION_EXPIRED', {}],
+    [409, 'BACKORDER_RESERVATION_LOST', {}],
+    [409, 'BACKORDER_RESERVATION_UNAVAILABLE', {}],
+    [409, 'BACKORDER_MISMATCH', { field: 'quantity' }],
+    [409, 'PRICE_OUT_OF_DATE', { currentPriceCents: 109900 }],
+    [400, 'INVALID_CHECKOUT_REQUEST', {}],
+    [503, 'BACKORDER_CHECKOUT_UNAVAILABLE', {}],
+  ])(
+    'T5b: %s %s passes through with its detail and maps to a typed failure',
+    async (statusCode, code, detail) => {
+      for (const body of [
+        { statusCode, error: code, message: code, ...detail },
+        { statusCode, error: 'HTTP error', code, message: code, ...detail },
+      ]) {
+        request.mockReturnValue(
+          throwError(() => ({ response: { status: statusCode, data: body } })),
+        );
+        const error: unknown = await client
+          .createCheckout(input, key)
+          .catch((e: unknown) => e);
+        expect(error).toMatchObject({
+          statusCode,
+          errorCode: code,
+          responseBody: body,
+        });
+        expect(backorderCheckoutFailure(error)).toMatchObject({
+          code,
+          status: statusCode,
+        });
+      }
+      expect(sleep).not.toHaveBeenCalled();
+    },
+  );
   it('sends createIfAbsent/newSaved without a shipping member', async () => {
     const sale = { ...input.sale, shipping: undefined };
     const freeInput = {
