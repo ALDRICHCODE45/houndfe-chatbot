@@ -644,6 +644,8 @@ describe('envValidationSchema', () => {
       'BACKORDER_TEMPLATE_REMINDER',
       'BACKORDER_TEMPLATE_EXPIRED',
       'BACKORDER_TEMPLATE_LOST',
+      'BACKORDER_TEMPLATE_ETA_UPDATED',
+      'BACKORDER_TEMPLATE_ETA_UNAVAILABLE',
     ])('%s is an optional Meta template name', (name) => {
       expect(validate({}).error).toBeUndefined();
       expect(validate({ [name]: 'mi_plantilla_2' }).error).toBeUndefined();

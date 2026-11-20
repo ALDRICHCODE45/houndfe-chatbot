@@ -5,8 +5,9 @@ schedule the order. Accepting creates a backorder in the backend
 (`POST /chatbot-api/backorders`); nothing is paid until the product arrives.
 Contract: [`contracts/restock-backorder-bot-contract.md`](contracts/restock-backorder-bot-contract.md).
 Tracker: `odd/tasks/restock-backorder.md`. The arrival, reminder, expiry and
-lost notices (T5a) are in [§8](#8-notices-from-the-feed-t5a-s4-s6-s9-s12-s13-s15);
-confirm and checkout (T5b), the ETA slip (T6, S7) are other tasks. The
+lost notices (T5a) and the ETA-slip notices (T6, S7) are in
+[§8](#8-notices-from-the-feed-t5a-s4-s6-s9-s12-s13-s15);
+confirm and checkout are T5b. The
 customer cancel and status from the chat (T6, S8) and the two verify
 follow-ups of T4 (retry body, replay status) are described in
 [§6](#6-customer-cancel-and-status-from-the-chat-t6-s8) and
@@ -317,13 +318,39 @@ name is never rewritten).
 | `backorder.reservation_expired` | «Se venció el apartado de su pedido {folio} ({product}).» plus «¿Quiere que se lo vuelva a agendar?» **only when the payload carries `sourceDecisionId`** (backend T4) | with `sourceDecisionId`: [Sí, agéndalo] `backorder_reschedule:<backorderId>` · [No, gracias] `backorder_reschedule_decline:<backorderId>`; without it, none |
 | `backorder.reservation_lost` | «Una disculpa, {firstName}: el lote que le apartamos de {product} caducó y no tenemos otro vigente. Su pedido {folio} sigue en primer lugar; le aviso en cuanto llegue (aprox. {27 de noviembre}).» The date is dropped when `estimatedAt` is absent or past. | none |
 | `backorder.cancelled_by_staff` (backend T5, may arrive later) | «El equipo canceló su pedido {folio}: {reason}.» The reason is the team's text verbatim (not restyled); without one «El equipo canceló su pedido {folio}.» | none |
-| `backorder.eta_updated` / `eta_unavailable` (backend T4) | not sent: ACK `STALE`, decision `BACKORDER_ETA_PENDING` (T6, S7 will handle them) | |
+| `backorder.eta_updated` (backend T4, S7) | «{firstName}, le actualizo su pedido {folio} ({quantity} × {product}): el equipo nos confirmó que llega aprox. el {27 de noviembre}. Se lo aparto en cuanto llegue y le aviso; sigue sin pagar nada hasta entonces. Con gusto se lo tengo listo. ¿Seguimos con su pedido?» An `estimatedAt` already past (or missing / unreadable) is never shown: «… ({quantity} × {product}): el equipo está confirmando la nueva fecha de llegada. Se lo aparto …». No first name: «Le actualizo su pedido …». | [Seguir esperando] `backorder_wait:<backorderId>` · [Ya no lo quiero] `backorder_cancel:pick:<backorderId>` |
+| `backorder.eta_unavailable` (backend T4, S7) | «{firstName}, el proveedor todavía no nos confirma fecha para {product} (pedido {folio}). Su lugar sigue apartado: en cuanto llegue se lo separo y le aviso. ¿Seguimos con su pedido?» No first name: «El proveedor todavía no nos confirma fecha …». | the same two |
 | any other `backorder.*` | ACK `STALE`, decision `UNKNOWN_TYPE` | |
+
+**ETA slip (S7).** Owner, verbatim: «solo le estas diciendo al cliente que no ha
+llegado pero no estas mostrando mucho interes realmente de venderle el
+producto». The backend asks staff ONE re-estimate when a WAITING backorder's
+`estimatedAt` passes, and only then sends `eta_updated {estimatedAt}` (a human
+estimate, not a guarantee; it may already be past) or `eta_unavailable` (no
+confirmed date; the backorder stays WAITING in its place) once per backorder.
+The notices therefore keep selling: they say the product is still wanted,
+that nothing is paid until arrival, and give two buttons. They are **not**
+staff-alert types: outside the window without templates, or in a HUMAN
+session, they are `STALE` (`WINDOW_CLOSED` / `HUMAN_SESSION`). The ledger
+decision is `BACKORDER_ETA_PENDING` (migration 5600's CHECK has no value of
+its own for them and a new one needs a migration). Similar available products
+are **not** offered: no cheap deterministic path exists (catalog search is a
+model-driven tool) and the notice never calls a model.
+
+Tapping **[Seguir esperando]** (`backorder_wait:<backorderId>`) is answered by
+`MinimalBackorderManageService` (llm-agent, next to the T6a cancel / status
+service) with no model call and no backend write: the customer's active list
+is read by phone and, when that backorder is still `WAITING`, the reply is
+«Perfecto, le aviso en cuanto llegue.». A backorder that is no longer WAITING
+(reserved, cancelled, unknown) is the generic stale-button reply; an unreadable
+list answers «No pude consultar su pedido por ahora.» (never the promise).
+**[Ya no lo quiero]** is T6a's cancel-pick: «¿Cancelo su pedido …?».
 
 The button ids are the contract with the answering turn: `backorder_cancel:pick`
 is T6a's cancel-pick (it leads to «¿Cancelo su pedido …?», id format pinned by a
 test against `parseInteractiveReplyId`); `backorder_confirm` and the two
-`backorder_reschedule*` ids are T5b's. Button titles are the same in usted and
+`backorder_reschedule*` ids are T5b's; `backorder_wait` is S7's (parsed in
+`src/llm-agent/domain/customer-reply.ts`). Button titles are the same in usted and
 tú. A text longer than Meta's interactive limit is sent as text first and the
 buttons carry a short body («¿Lo confirmamos?» / «¿Quiere que se lo vuelva a
 agendar?»).
@@ -334,10 +361,10 @@ when it was planned (a backlog drained late) is `STALE` /
 
 ### Window, templates, HUMAN sessions (S9, S13)
 
-| Situation | `reserved` / `reminder` | `expired` / `lost` / `cancelled` |
+| Situation | `reserved` / `reminder` | `expired` / `lost` / `cancelled` / `eta_*` |
 | --- | --- | --- |
-| inside the 24 h window, chat in BOT mode | text + buttons, ACK `PROVIDER_ACCEPTED` | text (+ buttons for a reschedulable `expired`), `PROVIDER_ACCEPTED` |
-| window closed, `BACKORDER_TEMPLATES_ENABLED` exactly `true` | the Meta template (below), no buttons | the Meta template; `cancelled_by_staff` has none → `STALE` / `WINDOW_CLOSED` |
+| inside the 24 h window, chat in BOT mode | text + buttons, ACK `PROVIDER_ACCEPTED` | text (+ buttons for a reschedulable `expired` and for `eta_*`), `PROVIDER_ACCEPTED` |
+| window closed, `BACKORDER_TEMPLATES_ENABLED` exactly `true` | the Meta template (below), no buttons | the Meta template (`eta_updated` → `pedido_reposicion_fecha`, `eta_unavailable` → `pedido_reposicion_sin_fecha`); `cancelled_by_staff` has none → `STALE` / `WINDOW_CLOSED` |
 | window closed, templates off | ACK **`PROVIDER_REJECTED` `TEMPLATE_NOT_APPROVED`**: the backend alerts staff to call | `STALE` / `WINDOW_CLOSED` |
 | chat in HUMAN mode | **`PROVIDER_REJECTED` `HUMAN_SESSION`** (staff are with the customer; the backend alerts them) | `STALE` / `HUMAN_SESSION` |
 | Meta refuses the message or template | **`PROVIDER_REJECTED`** `UNREACHABLE` / `TEMPLATE_NOT_APPROVED` | `STALE` |
@@ -351,13 +378,25 @@ customer answers in text (a reply also reopens the 24 h window). A template
 whose parameter would be empty is treated as "no template".
 
 **Unknown customer (`conversationRef` null: none or several mirrored chats).**
-The handler asks an optional `resolveConversation(backorderId)` port; nothing is
-wired today because `GET /chatbot-api/backorders/:id` names no phone (`BackorderBot`
-has no customer phone), so those items are **never sent to anyone**: `reserved` /
-`reminder` are `PROVIDER_REJECTED` `NO_CONVERSATION` (staff calls, S13), the
-rest `STALE` / `NO_CONVERSATION`. A malformed `conversationRef` is treated the
-same. Asking the backend to expose the customer's phone on that endpoint would
-make these resolvable.
+Backend T4b adds `phoneCountryCode` and `phone` (or null / null) to every
+`backorder.*` payload (and to `BackorderBot`, parsed as optional members). With
+a null `conversationRef` the handler derives the WhatsApp sender from **that
+payload phone only**, with the bot's own Mexican normalisation
+(`parseMexicanWhatsAppPhone`, `src/sale-flow/domain/mexican-whatsapp-phone.ts`):
+the country code must be `52` (a leading `+` is tolerated) and the phone exactly
+ten digits, and the pair must read back unchanged; anything else (a foreign
+code, a short or lettered phone, a phone that already carries `52`, non-text
+members, null) counts as «no phone». Meta knows the same number as `521` + ten
+digits (legacy) or `52` + ten digits, and the local window and style are keyed
+by the form the customer last wrote from, so the `521…` form is used when its
+window is open, else the current `52…` form. The window read then decides as
+usual (text and buttons, template, or `STALE`); a failing read throws and the
+page is read again. A non-null `conversationRef` always wins (a malformed one is
+never replaced by the phone). With no usable phone the old behaviour stands: the
+optional `resolveConversation(backorderId)` port (nothing wired), then those
+items are **never sent to anyone**: `reserved` / `reminder` are
+`PROVIDER_REJECTED` `NO_CONVERSATION` (staff calls, S13), the rest
+`STALE` / `NO_CONVERSATION`. Logs never carry the phone.
 
 ### Meta templates the owner creates (S9)
 
@@ -391,6 +430,19 @@ names (or set `BACKORDER_TEMPLATE_*`) and these example values, then set
    `{{1}}` first name · `{{2}}` product · `{{3}}` folio · `{{4}}` «aprox. 27 de noviembre»,
    or «fecha por confirmar» when there is no estimate.
 
+5. **`pedido_reposicion_fecha`**: the new estimated date (S7, `eta_updated`).
+   ```
+   Hola {{1}}, le actualizo su pedido {{2}} ({{3}}): el equipo nos confirmó la llegada {{4}}. Se lo aparto en cuanto llegue y le aviso; sigue sin pagar nada hasta entonces. Si ya no lo quiere, responda a este mensaje.
+   ```
+   `{{1}}` first name («cliente» when unknown) · `{{2}}` folio · `{{3}}` «2 × Croquetas …» ·
+   `{{4}}` «aprox. el 27 de noviembre», or «por confirmar con el equipo» when the
+   estimate is already past.
+6. **`pedido_reposicion_sin_fecha`**: no confirmed date yet (S7, `eta_unavailable`).
+   ```
+   Hola {{1}}, el proveedor todavía no nos confirma fecha para {{2}} (pedido {{3}}). Su lugar sigue apartado: en cuanto llegue se lo separo y le aviso. Si ya no lo quiere, responda a este mensaje.
+   ```
+   `{{1}}` first name · `{{2}}` product (with presentation) · `{{3}}` folio.
+
 Every parameter is one line (newlines and repeated spaces collapsed), trimmed and
 at most 1024 characters. Templates are in usted (Meta approves one text per
 language). Until approved, leave the flag off: a refused template is
@@ -405,15 +457,17 @@ bare yes must confirm the customer's `RESERVED` backorder.
   column (1-280 chars, required by and only with that outcome) and the new
   decisions (`BACKORDER_RESERVED_NOTICE`, `_REMINDER_NOTICE`, `_EXPIRED_NOTICE`,
   `_LOST_NOTICE`, `_CANCELLED_NOTICE`, `_ETA_PENDING`, `_PAYLOAD_INVALID`,
-  `_OVERTAKEN`, `TEMPLATE_NOT_APPROVED`). The ACK is rebuilt from the row, so a
+  `_OVERTAKEN`, `TEMPLATE_NOT_APPROVED`; `_ETA_PENDING` is now also the
+  decision of a sent or STALE `eta_*` notice). The ACK is rebuilt from the row, so a
   retried `PROVIDER_REJECTED` carries the same reason. `down` refuses while a
   row uses a new decision or the outcome.
 - **Recovery after `410 CURSOR_EXPIRED`** folds
   `backorderUndeliveredResumeAfter` (`GET /chatbot-api/backorders?updatedSince=`)
   into the resume minimum; a 403 / 404 degrades to "no position" with one warning.
 - **Config**: `BACKORDER_TEMPLATES_ENABLED` (default `false`, exactly `true`
-  enables), `BACKORDER_TEMPLATE_RESERVED` / `_REMINDER` / `_EXPIRED` / `_LOST`
-  (default the four names above; lowercase `[a-z0-9_]`).
+  enables), `BACKORDER_TEMPLATE_RESERVED` / `_REMINDER` / `_EXPIRED` / `_LOST` /
+  `_ETA_UPDATED` / `_ETA_UNAVAILABLE` (default the six names above; lowercase
+  `[a-z0-9_]`).
 
 ## Deploy notes
 
@@ -424,6 +478,9 @@ bare yes must confirm the customer's `RESERVED` backorder.
   the first `backorder.reserved` is ACKed `STALE` by an older bot.
 - The chatbot credential needs `backorders:read` for the recovery position
   (without it the recovery still works, without the backorder minimum).
+- Deploy the bot (parsing `eta_*` and the phone members, the notices and the
+  `backorder_wait` tap) before backend T4 goes live: an older bot ACKs the ETA
+  notices `STALE`, so the customer never hears the new date.
 - Meta templates and `BACKORDER_TEMPLATES_ENABLED` are optional; with the flag
   off, a customer outside the 24 h window gets no message and staff is alerted
   to call (`PROVIDER_REJECTED`).

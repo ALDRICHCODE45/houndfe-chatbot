@@ -354,24 +354,329 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
     });
   });
 
-  describe('eta_* (backend T4, handled by T6 S7)', () => {
-    it.each(['backorder.eta_updated', 'backorder.eta_unavailable'])(
-      '%s stays STALE with an explicit decision and no lookups',
-      async (type) => {
-        const { plan, ports } = setup();
-        await expect(plan(item(type, { restockDays: 5 }))).resolves.toEqual({
-          action: 'stale',
+  describe('eta_updated / eta_unavailable (backend T4, S7)', () => {
+    const etaUpdated = (raw: Record<string, unknown> = {}) =>
+      item('backorder.eta_updated', {
+        estimatedAt: '2026-11-27T15:00:00.000Z',
+        restockDays: 7,
+        ...raw,
+      });
+    const etaUnavailable = (raw: Record<string, unknown> = {}) =>
+      item('backorder.eta_unavailable', raw);
+    const WAIT_BUTTONS = [
+      { id: `backorder_wait:${ID}`, title: 'Seguir esperando' },
+      { id: `backorder_cancel:pick:${ID}`, title: 'Ya no lo quiero' },
+    ];
+
+    it('eta_updated inside the window: the new date, still selling, with [Seguir esperando] [Ya no lo quiero]', async () => {
+      const { plan, ports } = setup();
+      await expect(plan(etaUpdated())).resolves.toEqual({
+        action: 'send',
+        decision: 'BACKORDER_ETA_PENDING',
+        senderId: SENDER,
+        text:
+          `Rosa, le actualizo su pedido BO-000012 (2 × ${NAME}): el equipo nos confirmó ` +
+          'que llega aprox. el 27 de noviembre. Se lo aparto en cuanto llegue y le aviso; ' +
+          'sigue sin pagar nada hasta entonces. Con gusto se lo tengo listo. ¿Seguimos con su pedido?',
+        buttons: WAIT_BUTTONS,
+        shortBody: '¿Seguimos con su pedido?',
+      });
+      expect(ports.isWindowOpen).toHaveBeenCalledWith(SENDER);
+    });
+
+    it('is not a staff alert type (no staffAlert flag) and names the variant', async () => {
+      const { plan } = setup();
+      const planned = await plan(
+        item(
+          'backorder.eta_updated',
+          { estimatedAt: '2026-11-27T15:00:00.000Z' },
+          {},
+          { variantName: '18 kg' },
+        ),
+      );
+      expect(planned).not.toHaveProperty('staffAlert');
+      expect(planned).toMatchObject({
+        text: expect.stringContaining(`2 × ${NAME} (18 kg)`) as unknown,
+      });
+    });
+
+    it('the date is the Mexico City one (UTC late evening stays the day before)', async () => {
+      const { plan } = setup();
+      await expect(
+        plan(etaUpdated({ estimatedAt: '2026-11-28T03:00:00.000Z' })),
+      ).resolves.toMatchObject({
+        text: expect.stringContaining('aprox. el 27 de noviembre') as unknown,
+      });
+    });
+
+    it.each([
+      ['already past', '2026-11-19T15:00:00.000Z'],
+      ['unreadable', 'mañana'],
+      ['missing', null],
+    ])(
+      'eta_updated with an estimate %s: no date is invented, the team is confirming it',
+      async (_label, estimatedAt) => {
+        const { plan } = setup();
+        const planned = await plan(etaUpdated({ estimatedAt }));
+        expect(planned).toMatchObject({
+          action: 'send',
           decision: 'BACKORDER_ETA_PENDING',
+          text:
+            `Rosa, le actualizo su pedido BO-000012 (2 × ${NAME}): el equipo está confirmando ` +
+            'la nueva fecha de llegada. Se lo aparto en cuanto llegue y le aviso; ' +
+            'sigue sin pagar nada hasta entonces. Con gusto se lo tengo listo. ¿Seguimos con su pedido?',
+          buttons: WAIT_BUTTONS,
         });
-        expect(ports.isWindowOpen).not.toHaveBeenCalled();
+        expect((planned as { text: string }).text).not.toMatch(/aprox\. el/);
       },
     );
+
+    it('without a first name the greeting has no name', async () => {
+      const { plan } = setup();
+      await expect(
+        plan(
+          item('backorder.eta_updated', {}, {}, { customerFirstName: null }),
+        ),
+      ).resolves.toMatchObject({
+        text: expect.stringMatching(
+          /^Le actualizo su pedido BO-000012/,
+        ) as unknown,
+      });
+    });
+
+    it('eta_unavailable inside the window: honest, still selling, same two buttons', async () => {
+      const { plan } = setup();
+      const planned = await plan(etaUnavailable());
+      expect(planned).toEqual({
+        action: 'send',
+        decision: 'BACKORDER_ETA_PENDING',
+        senderId: SENDER,
+        text:
+          `Rosa, el proveedor todavía no nos confirma fecha para ${NAME} (pedido BO-000012). ` +
+          'Su lugar sigue apartado: en cuanto llegue se lo separo y le aviso. ¿Seguimos con su pedido?',
+        buttons: WAIT_BUTTONS,
+        shortBody: '¿Seguimos con su pedido?',
+      });
+      expect(planned).not.toHaveProperty('staffAlert');
+    });
+
+    it('eta_unavailable without a first name', async () => {
+      const { plan } = setup();
+      await expect(
+        plan(
+          item(
+            'backorder.eta_unavailable',
+            {},
+            {},
+            { customerFirstName: null },
+          ),
+        ),
+      ).resolves.toMatchObject({
+        text: expect.stringMatching(
+          /^El proveedor todavía no nos confirma fecha/,
+        ) as unknown,
+      });
+    });
+
+    it('tú customers get the tú copy; names and products are never restyled', async () => {
+      const { plan } = setup({
+        customerStyle: () => Promise.resolve({ register: 'tu' } as never),
+      });
+      const updated = await plan(etaUpdated({}));
+      expect(updated).toMatchObject({
+        text: expect.stringContaining(
+          'te actualizo tu pedido BO-000012',
+        ) as unknown,
+      });
+      expect((updated as { text: string }).text).toContain(
+        'Te lo aparto en cuanto llegue y te aviso',
+      );
+      expect((updated as { text: string }).text).toContain(
+        '¿Seguimos con tu pedido?',
+      );
+      const none = await plan(etaUnavailable());
+      expect((none as { text: string }).text).toContain(
+        'Tu lugar sigue apartado: en cuanto llegue te lo separo y te aviso',
+      );
+    });
+
+    it('the wait and cancel ids are the ones the customer reply parser knows', () => {
+      expect(parseInteractiveReplyId(`backorder_wait:${ID}`)).toEqual({
+        kind: 'backorder_wait',
+        reference: ID,
+      });
+      expect(parseInteractiveReplyId(`backorder_cancel:pick:${ID}`)).toEqual({
+        kind: 'backorder_cancel',
+        action: 'pick',
+        reference: ID,
+      });
+    });
+
+    it('a payload that cannot be worded is STALE BACKORDER_PAYLOAD_INVALID', async () => {
+      const { plan } = setup();
+      await expect(
+        plan(item('backorder.eta_updated', {}, {}, { folio: null })),
+      ).resolves.toEqual({
+        action: 'stale',
+        decision: 'BACKORDER_PAYLOAD_INVALID',
+      });
+      await expect(
+        plan(item('backorder.eta_updated', {}, {}, { quantity: null })),
+      ).resolves.toEqual({
+        action: 'stale',
+        decision: 'BACKORDER_PAYLOAD_INVALID',
+      });
+      await expect(
+        plan(item('backorder.eta_unavailable', {}, {}, { productName: null })),
+      ).resolves.toEqual({
+        action: 'stale',
+        decision: 'BACKORDER_PAYLOAD_INVALID',
+      });
+    });
+
+    it('outside the window without templates: STALE WINDOW_CLOSED (never a staff alert)', async () => {
+      const { plan } = setup({ isWindowOpen: () => Promise.resolve(false) });
+      for (const feedItem of [etaUpdated(), etaUnavailable()])
+        await expect(plan(feedItem)).resolves.toEqual({
+          action: 'stale',
+          decision: 'WINDOW_CLOSED',
+        });
+    });
+
+    it('outside the window with the flag not exactly true: STALE', async () => {
+      for (const templatesEnabled of [undefined, false, 'true' as never]) {
+        const { plan } = setup({
+          isWindowOpen: () => Promise.resolve(false),
+          templatesEnabled,
+        });
+        await expect(plan(etaUpdated())).resolves.toMatchObject({
+          action: 'stale',
+        });
+      }
+    });
+
+    describe('templates on, window closed', () => {
+      const on = {
+        isWindowOpen: () => Promise.resolve(false),
+        templatesEnabled: true,
+      };
+
+      it('eta_updated → pedido_reposicion_fecha with the date', async () => {
+        const { plan } = setup(on);
+        const planned = await plan(etaUpdated());
+        expect(planned).toMatchObject({
+          action: 'send',
+          decision: 'BACKORDER_ETA_PENDING',
+          senderId: SENDER,
+          template: {
+            templateName: 'pedido_reposicion_fecha',
+            languageCode: 'es_MX',
+            bodyParameters: [
+              'Rosa',
+              'BO-000012',
+              `2 × ${NAME}`,
+              'aprox. el 27 de noviembre',
+            ],
+            refusedDecision: 'TEMPLATE_NOT_APPROVED',
+          },
+        });
+        expect(planned).not.toHaveProperty('staffAlert');
+        expect(planned).not.toHaveProperty('buttons');
+      });
+
+      it('eta_updated with a past date: «por confirmar con el equipo»', async () => {
+        const { plan } = setup(on);
+        await expect(
+          plan(etaUpdated({ estimatedAt: '2026-11-19T15:00:00.000Z' })),
+        ).resolves.toMatchObject({
+          template: {
+            bodyParameters: [
+              'Rosa',
+              'BO-000012',
+              `2 × ${NAME}`,
+              'por confirmar con el equipo',
+            ],
+          },
+        });
+      });
+
+      it('eta_unavailable → pedido_reposicion_sin_fecha; no first name → «cliente»', async () => {
+        const { plan } = setup(on);
+        await expect(plan(etaUnavailable())).resolves.toMatchObject({
+          decision: 'BACKORDER_ETA_PENDING',
+          template: {
+            templateName: 'pedido_reposicion_sin_fecha',
+            bodyParameters: ['Rosa', NAME, 'BO-000012'],
+          },
+        });
+        await expect(
+          plan(
+            item(
+              'backorder.eta_unavailable',
+              {},
+              {},
+              { customerFirstName: null },
+            ),
+          ),
+        ).resolves.toMatchObject({
+          template: { bodyParameters: ['cliente', NAME, 'BO-000012'] },
+        });
+      });
+
+      it('names are configurable', async () => {
+        const { plan } = setup({
+          ...on,
+          templateNames: { etaUpdated: 'mi_fecha', etaUnavailable: 'mi_sin' },
+        });
+        await expect(plan(etaUpdated())).resolves.toMatchObject({
+          template: { templateName: 'mi_fecha' },
+        });
+        await expect(plan(etaUnavailable())).resolves.toMatchObject({
+          template: { templateName: 'mi_sin' },
+        });
+      });
+    });
 
     it('an unknown future backorder type is STALE UNKNOWN_TYPE', async () => {
       const { plan } = setup();
       await expect(plan(item('backorder.future'))).resolves.toEqual({
         action: 'stale',
         decision: 'UNKNOWN_TYPE',
+      });
+    });
+  });
+
+  describe('backend T4 payload shape (sourceDecisionId + phone)', () => {
+    it('reservation_expired with sourceDecisionId shows the reschedule offer and buttons', async () => {
+      const { plan } = setup();
+      await expect(
+        plan(
+          item(
+            'backorder.reservation_expired',
+            {
+              expiredAt: '2026-11-21T15:00:00.000Z',
+              sourceDecisionId: DECISION,
+              phoneCountryCode: '52',
+              phone: '5512349901',
+            },
+            {},
+          ),
+        ),
+      ).resolves.toEqual({
+        action: 'send',
+        decision: 'BACKORDER_EXPIRED_NOTICE',
+        senderId: SENDER,
+        text:
+          `Se venció el apartado de su pedido BO-000012 (${NAME}). ` +
+          '¿Quiere que se lo vuelva a agendar?',
+        buttons: [
+          { id: `backorder_reschedule:${ID}`, title: 'Sí, agéndalo' },
+          {
+            id: `backorder_reschedule_decline:${ID}`,
+            title: 'No, gracias',
+          },
+        ],
+        shortBody: '¿Quiere que se lo vuelva a agendar?',
       });
     });
   });
@@ -437,6 +742,175 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
       await plan(reserved({}, { conversationRef: null }));
       const lines = [...log.mock.calls, ...warn.mock.calls].flat().join(' ');
       expect(lines).not.toContain('5215512349901');
+    });
+  });
+
+  describe('customer conversation from the payload phone (S13, backend T4b)', () => {
+    const reservedTo = (raw: Record<string, unknown>) =>
+      reserved(raw, { conversationRef: null });
+
+    it('conversationRef null + phone: sends to the sender derived from the payload phone', async () => {
+      const resolveConversation = jest.fn(() => Promise.resolve(null));
+      const { plan, ports } = setup({ resolveConversation });
+      await expect(
+        plan(reservedTo({ phoneCountryCode: '52', phone: '5512349901' })),
+      ).resolves.toMatchObject({
+        action: 'send',
+        decision: 'BACKORDER_RESERVED_NOTICE',
+        senderId: SENDER,
+        staffAlert: true,
+      });
+      expect(ports.isWindowOpen).toHaveBeenCalledWith(SENDER);
+      expect(resolveConversation).not.toHaveBeenCalled();
+    });
+
+    it('prefers the form of the number whose window is open (modern 52 + 10)', async () => {
+      const isWindowOpen = jest.fn((id: string) =>
+        Promise.resolve(id === '525512349901'),
+      );
+      const { plan } = setup({ isWindowOpen });
+      await expect(
+        plan(reservedTo({ phoneCountryCode: '52', phone: '5512349901' })),
+      ).resolves.toMatchObject({ senderId: '525512349901' });
+    });
+
+    it('both forms closed: the notice goes to the modern id as a template (flag on)', async () => {
+      const { plan } = setup({
+        isWindowOpen: () => Promise.resolve(false),
+        templatesEnabled: true,
+      });
+      await expect(
+        plan(reservedTo({ phoneCountryCode: '52', phone: '5512349901' })),
+      ).resolves.toMatchObject({
+        senderId: '525512349901',
+        template: { templateName: 'pedido_reposicion_llego' },
+      });
+    });
+
+    it('eta and other notices use the phone as well; a +52 country code is accepted', async () => {
+      const { plan } = setup();
+      for (const type of [
+        'backorder.eta_updated',
+        'backorder.eta_unavailable',
+        'backorder.reservation_lost',
+        'backorder.cancelled_by_staff',
+      ])
+        await expect(
+          plan(
+            item(
+              type,
+              { phoneCountryCode: '+52', phone: '5512349901' },
+              { conversationRef: null },
+            ),
+          ),
+        ).resolves.toMatchObject({ action: 'send', senderId: SENDER });
+    });
+
+    it.each([
+      ['null phone', { phoneCountryCode: null, phone: null }],
+      ['absent members', {}],
+      [
+        'a foreign country code',
+        { phoneCountryCode: '1', phone: '5512349901' },
+      ],
+      ['a short phone', { phoneCountryCode: '52', phone: '551234990' }],
+      ['a phone with letters', { phoneCountryCode: '52', phone: '55123499AB' }],
+      [
+        'a phone with a leading zero',
+        { phoneCountryCode: '52', phone: '0512349901' },
+      ],
+      [
+        'a full-width digit phone',
+        { phoneCountryCode: '52', phone: '５５１２３４９９０１' },
+      ],
+      [
+        'a phone that already carries the country code',
+        { phoneCountryCode: '52', phone: '525512349901' },
+      ],
+      ['non-text members', { phoneCountryCode: 52, phone: 5512349901 }],
+    ])(
+      "%s keeps today's behaviour (reserved → NO_CONVERSATION rejected, others STALE)",
+      async (_label, raw) => {
+        const { plan, ports } = setup();
+        await expect(plan(reservedTo(raw))).resolves.toEqual({
+          action: 'rejected',
+          decision: 'NO_CONVERSATION',
+          reason: 'NO_CONVERSATION',
+        });
+        await expect(
+          plan(
+            item(
+              'backorder.reservation_reminder',
+              { reservedUntil: RESERVED_UNTIL, ...raw },
+              { conversationRef: null },
+            ),
+          ),
+        ).resolves.toMatchObject({ action: 'rejected' });
+        for (const type of [
+          'backorder.eta_updated',
+          'backorder.eta_unavailable',
+          'backorder.reservation_expired',
+        ])
+          await expect(
+            plan(item(type, raw, { conversationRef: null })),
+          ).resolves.toEqual({ action: 'stale', decision: 'NO_CONVERSATION' });
+        expect(ports.isWindowOpen).not.toHaveBeenCalled();
+      },
+    );
+
+    it('an unparseable phone still falls back to the resolver', async () => {
+      const resolveConversation = jest.fn(() => Promise.resolve(REF));
+      const { plan } = setup({ resolveConversation });
+      await expect(
+        plan(reservedTo({ phoneCountryCode: '1', phone: '5512349901' })),
+      ).resolves.toMatchObject({ senderId: SENDER });
+      expect(resolveConversation).toHaveBeenCalledWith(ID);
+    });
+
+    it('a conversationRef on the item wins: the payload phone is not used', async () => {
+      const { plan } = setup();
+      await expect(
+        plan(
+          reserved(
+            { phoneCountryCode: '52', phone: '5599999999' },
+            { conversationRef: 'wa:5215512349901' },
+          ),
+        ),
+      ).resolves.toMatchObject({ senderId: SENDER });
+    });
+
+    it('a malformed (non-null) conversationRef never falls back to the phone', async () => {
+      const { plan } = setup();
+      await expect(
+        plan(
+          reserved(
+            { phoneCountryCode: '52', phone: '5512349901' },
+            { conversationRef: 'garbage' },
+          ),
+        ),
+      ).resolves.toMatchObject({
+        action: 'rejected',
+        decision: 'NO_CONVERSATION',
+      });
+    });
+
+    it('a failing window read is transient (the plan throws), never "closed"', async () => {
+      const { plan } = setup({
+        isWindowOpen: () => Promise.reject(new Error('db down')),
+      });
+      await expect(
+        plan(reservedTo({ phoneCountryCode: '52', phone: '5512349901' })),
+      ).rejects.toThrow('db down');
+    });
+
+    it('the logs never carry the phone', async () => {
+      const log = jest.spyOn(Logger.prototype, 'log');
+      const warn = jest.spyOn(Logger.prototype, 'warn');
+      const { plan } = setup({ isWindowOpen: () => Promise.resolve(false) });
+      await plan(reservedTo({ phoneCountryCode: '52', phone: '5512349901' }));
+      await plan(reservedTo({ phoneCountryCode: '52', phone: '55123' }));
+      const lines = [...log.mock.calls, ...warn.mock.calls].flat().join(' ');
+      expect(lines).not.toContain('5512349901');
     });
   });
 

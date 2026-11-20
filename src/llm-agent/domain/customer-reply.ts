@@ -86,6 +86,8 @@ const BACKORDER_CANCEL = 'backorder_cancel';
 const BACKORDER_CONFIRM = 'backorder_confirm';
 const BACKORDER_RESCHEDULE = 'backorder_reschedule';
 const BACKORDER_RESCHEDULE_DECLINE = 'backorder_reschedule_decline';
+// Restock backorder S7: «Seguir esperando» under the ETA notices.
+const BACKORDER_WAIT = 'backorder_wait';
 const BACKORDER_REFERENCE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -99,6 +101,8 @@ export const INTERACTIVE_BACKORDER_KEEP_TEXT = 'No';
 export const INTERACTIVE_BACKORDER_CONFIRM_TEXT = 'Confirmo mi pedido apartado';
 /** Restock backorder T5b: «No, gracias» under the reschedule question. */
 export const INTERACTIVE_BACKORDER_RESCHEDULE_DECLINE_TEXT = 'No, gracias';
+/** Restock backorder S7: what the ETA notices' «Seguir esperando» button stands for. */
+export const INTERACTIVE_BACKORDER_WAIT_TEXT = 'Seguir esperando';
 /** Change intents: never an affirmative for the confirmation gates. */
 export const INTERACTIVE_ORDER_CHANGE_TEXT = 'Quiero cambiar algo';
 export const INTERACTIVE_CHECKOUT_CHANGE_TEXT = 'Quiero corregir mis datos';
@@ -156,7 +160,13 @@ export type InteractiveReplyIntent =
         | 'backorder_reschedule'
         | 'backorder_reschedule_decline';
       reference: string;
-    };
+    }
+  /**
+   * Restock backorder S7: «Seguir esperando» under the ETA-slip notices
+   * (eta_updated / eta_unavailable); the reference is the BACKORDER id,
+   * re-verified against the customer's own active backorders.
+   */
+  | { kind: 'backorder_wait'; reference: string };
 
 /** Parse a reply id the bot issued; anything else (unknown, forged) is `null`. */
 export function parseInteractiveReplyId(
@@ -227,6 +237,10 @@ export function parseInteractiveReplyId(
       return tail !== null && BACKORDER_REFERENCE.test(tail)
         ? { kind: head, reference: tail }
         : null;
+    case BACKORDER_WAIT:
+      return tail !== null && BACKORDER_REFERENCE.test(tail)
+        ? { kind: 'backorder_wait', reference: tail }
+        : null;
     case PAYMENT_METHOD: {
       // Tail is `<method>:<saleId>`; both parts are required.
       const split = tail === null ? -1 : tail.indexOf(':');
@@ -278,6 +292,8 @@ export function interactiveReplyText(id: unknown, title: unknown): string {
         : fallback;
     case 'backorder_confirm':
       return INTERACTIVE_BACKORDER_CONFIRM_TEXT;
+    case 'backorder_wait':
+      return INTERACTIVE_BACKORDER_WAIT_TEXT;
     case 'backorder_reschedule':
       return INTERACTIVE_CONFIRM_TEXT;
     case 'backorder_reschedule_decline':

@@ -253,3 +253,16 @@ A refused checkout charges nothing; the same `X-Idempotency-Key` may be retried 
 Dev :3003: all backorder migrations applied; scopes backorders:* added to credentials «dev-chatbot-human-intervention» and «dev-chatbot-e2e (all scopes) 2026-11-06». Test: schedule on an out-of-stock product, then a positive POST /inventory/adjustments reserves it and emits backorder.reserved.
 
 Deploy (T3): no backend migration; deploy the bot's handling of BACKORDER_* and PRICE_OUT_OF_DATE {currentPriceCents} with or before the backend; backend T2 must not go live before the bot sends backorderId.
+
+## Update: backend T4 + T4b built (backend main 2a114337, live on dev :3003)
+
+- **Overdue ETA (§8):** when a WAITING backorder's `estimatedAt` passes, the server asks staff ONE RESTOCK re-estimate per (sucursal, product, variant) BEFORE telling the customer anything; meanwhile the bot gets nothing and `GET` still shows the old past `estimatedAt` (do not invent a date). When staff answer, every still-WAITING attached backorder gets exactly once:
+  - `backorder.eta_updated {estimatedAt, restockDays}` → tell the customer the new approximate date (a human estimate, not a guarantee; may be close or already past).
+  - `backorder.eta_unavailable` (no extra member; date stays in the past) → staff have no confirmed date; it does NOT mean never: the backorder stays WAITING in its place and is reserved when stock arrives. Offer to keep waiting or cancel.
+  - Skipped (no item) if the backorder became RESERVED/CONFIRMED/CANCELLED/EXPIRED before the answer. Only once per backorder; no expiry if staff never answer.
+- The server-created re-estimate request is staff-only: the bot never receives `request.answered` for it nor sees it in request recovery (the earlier STALE workaround is no longer needed).
+- `sourceDecisionId` in every `BackorderBot` (the decision the bot sent) and in `backorder.reservation_expired` / `backorder.cancelled_by_staff` payloads: reschedule with it.
+- **T4b:** `phoneCountryCode` and `phone` (or null/null when the customer has none) in `BackorderBot` (create, GET :id, list, cancel) and in EVERY `backorder.*` payload. When `conversationRef` is null, reach the customer with that pair.
+- Home delivery with a backorder line + an ordinary line of the same product: quote once with the summed quantity; the checkout's quote binding sums quantities per (productId, variantId), so no `SHIPPING_QUOTE_MISMATCH [LINES]`.
+- Concurrent checkouts of the same product: `409 STOCK_INSUFFICIENT_AT_CONFIRM` instead of `500 CHECKOUT_CREATE_FAILED`.
+- No new backend migrations for T3/T4. Deploy order: the bot must parse eta_* and the new members before the backend deploys T4.

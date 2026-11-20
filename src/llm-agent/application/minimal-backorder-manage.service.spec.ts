@@ -505,3 +505,61 @@ describe('status from the chat (S8)', () => {
     expect(await w.say('¿cómo va mi pedido?')).toBeNull();
   });
 });
+
+describe('«Seguir esperando» tap of the ETA notices (S7)', () => {
+  const WAIT = `backorder_wait:${ID}`;
+  const REPLY = 'Perfecto, le aviso en cuanto llegue.';
+
+  it('answers a short confirmation with no cancel, no model, verified against the active list', async () => {
+    const w = world();
+    expect(await w.say('Seguir esperando', WAIT)).toEqual({
+      kind: 'reply',
+      reply: REPLY,
+    });
+    expect(w.client.listBackorders).toHaveBeenCalledWith({
+      phoneCountryCode: '52',
+      phone: '5512349901',
+      status: 'WAITING,RESERVED',
+    });
+    expect(w.client.cancelBackorder).not.toHaveBeenCalled();
+    expect(w.competing).not.toHaveBeenCalled();
+  });
+
+  it("a backorder that is not the customer's active one is a stale button", async () => {
+    const w = world([backorder({ id: ID2 })]);
+    expect(await w.say('Seguir esperando', WAIT)).toEqual({ kind: 'stale' });
+    const none = world([]);
+    expect(await none.say('Seguir esperando', WAIT)).toEqual({ kind: 'stale' });
+  });
+
+  it('a backorder already reserved no longer waits: stale, never «le aviso»', async () => {
+    const w = world([backorder({ status: 'RESERVED' })]);
+    expect(await w.say('Seguir esperando', WAIT)).toEqual({ kind: 'stale' });
+  });
+
+  it('a backend that cannot be read answers the honest failure, never the promise', async () => {
+    const w = world();
+    w.client.listBackorders.mockRejectedValue(apiError(500, null));
+    const turn = await w.say('Seguir esperando', WAIT);
+    expect(replyOf(turn)).toBe('No pude consultar su pedido por ahora.');
+  });
+
+  it('a forged id is not ours', async () => {
+    const w = world();
+    expect(await w.say('Seguir esperando', 'backorder_wait:nope')).toBeNull();
+    expect(w.client.listBackorders).not.toHaveBeenCalled();
+  });
+
+  it('spends a pending cancel question (it is another message)', async () => {
+    const w = world();
+    await w.say('cancela lo que aparté');
+    await w.say('Seguir esperando', WAIT);
+    expect(await w.say('sí')).toBeNull();
+    expect(w.client.cancelBackorder).not.toHaveBeenCalled();
+  });
+
+  it('a sender that is no Mexican WhatsApp number is not ours', async () => {
+    const w = world();
+    expect(await w.say('Seguir esperando', WAIT, 'abc')).toBeNull();
+  });
+});

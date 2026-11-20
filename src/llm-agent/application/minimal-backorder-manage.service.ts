@@ -33,6 +33,9 @@ import {
   type CustomerReplyInteractive,
 } from '../domain/customer-reply';
 
+/** S7: the answer to «Seguir esperando». */
+export const BACKORDER_WAIT_REPLY = 'Perfecto, le aviso en cuanto llegue.';
+
 export interface MinimalBackorderManageDeps {
   readonly backorders: BackorderClient;
   /** Test seam; production uses `Date.now`. */
@@ -132,6 +135,11 @@ export class MinimalBackorderManageService {
 
     if (input.interactiveReplyId !== undefined) {
       const intent = parseInteractiveReplyId(input.interactiveReplyId);
+      if (intent?.kind === 'backorder_wait') {
+        // Another button is another message: it spends the question.
+        this.pending.delete(senderId);
+        return this.wait(phone, intent.reference);
+      }
       if (intent?.kind !== 'backorder_cancel') {
         // Another button is another message: it spends the question.
         this.pending.delete(senderId);
@@ -277,6 +285,24 @@ export class MinimalBackorderManageService {
         BACKORDER_CANCEL_PICK_PROMPT,
       ) ?? undefined,
     );
+  }
+
+  /**
+   * S7: «Seguir esperando» under an ETA notice. No backend write: the
+   * backorder stays WAITING in its place. The promise is only made while the
+   * customer's own list still shows it WAITING (a reserved, cancelled or
+   * unknown one is a stale button; an unreadable list never promises).
+   */
+  private async wait(
+    phone: { phoneCountryCode: string; phone: string },
+    backorderId: string,
+  ): Promise<MinimalBackorderManageTurn> {
+    const active = await this.listActive(phone);
+    if (active === null) return this.reply(BACKORDER_STATUS_FAILED_REPLY);
+    const target = active.find((item) => item.id === backorderId);
+    if (target === undefined || target.status !== 'WAITING')
+      return { kind: 'stale' };
+    return this.reply(BACKORDER_WAIT_REPLY);
   }
 
   /** A tapped yes / no / pick; always verified against the customer's list. */
