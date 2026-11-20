@@ -194,6 +194,8 @@ import {
 } from '../domain/minimal-catalog-availability';
 import { limitCatalogOptions } from '../domain/minimal-catalog-relevance';
 import {
+  contextSpeciesFromImageBlock,
+  dropContextSpeciesContradictions,
   planCatalogOptions,
   renderCatalogOptions,
   type CatalogOptionsPlan,
@@ -955,6 +957,11 @@ type CatalogRun = {
   stockAfter: boolean;
   /** L31: the customer's own words this turn ({lo pedido}). */
   customerText?: string;
+  /**
+   * The species of the customer's product photo (image block only): items of
+   * other species never reach the model or the customer as options.
+   */
+  contextSpecies?: string;
 };
 
 /** The customer's own text turns, oldest first. */
@@ -2546,10 +2553,12 @@ export class MinimalCatalogAgentService {
     const reorderRun: ReorderRun | null = this.cart
       ? { attempted: false, value: null }
       : null;
+    const photoSpecies = contextSpeciesFromImageBlock(input.text);
     const catalogRun: CatalogRun = {
       plans: [],
       stockAfter: false,
       customerText: customerOwnText(input.text),
+      ...(photoSpecies === null ? {} : { contextSpecies: photoSpecies }),
     };
     // S13d: the agotado product the previous options message offered to ask
     // about; a non-plain acceptance reaches the model with that exact id
@@ -3792,11 +3801,26 @@ export class MinimalCatalogAgentService {
             // beyond them can be presented to the customer.
             // S11/S12: agotado products go last BEFORE the cap, so an agotado
             // product never displaces an available match from the 3.
-            const limited = limitCatalogOptions(preferInStock(items));
+            // Photo species context: with no plan, items of another species
+            // than the customer's photo are dropped before the cap.
+            const limited = limitCatalogOptions(
+              preferInStock(
+                dropContextSpeciesContradictions(
+                  items,
+                  q,
+                  catalogRun?.contextSpecies,
+                ),
+              ),
+            );
             // S13b: when the items are classifiable the application picks
             // (available first, exact → same type → brand only, ≤ 3) and
             // renders the options; otherwise the model answers as before.
-            const plan = planCatalogOptions(q, items, catalogRun?.customerText);
+            const plan = planCatalogOptions(
+              q,
+              items,
+              catalogRun?.customerText,
+              catalogRun?.contextSpecies,
+            );
             const offered =
               plan === null
                 ? limited.offered

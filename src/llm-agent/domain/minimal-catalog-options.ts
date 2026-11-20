@@ -198,9 +198,76 @@ function categoryOtherType(
   return named.length > 0 && !named.some((group) => requested.includes(group));
 }
 
+/**
+ * Indexes of the species groups (into {@link SPECIES_GROUPS}) a free text
+ * names; the eval's species check compares customer and reply with them.
+ */
+export function speciesGroupsNamedIn(text: string): number[] {
+  const named = stems(text);
+  return SPECIES_GROUPS.flatMap((group, index) =>
+    hasAny(named, group) ? [index] : [],
+  );
+}
+
 /** Species groups a stem set names. */
 const speciesGroups = (set: ReadonlySet<string>) =>
   SPECIES_GROUPS.filter((group) => hasAny(set, group));
+
+/** Stems of every life-stage group (never merged from a context species). */
+const STAGE_STEMS: ReadonlySet<string> = new Set(
+  STAGE_GROUPS.flatMap(([a, b]) => [...a, ...b]),
+);
+
+/**
+ * Species-only stems of a context species word (one non-stage stem per
+ * species group it names), or none when the query already names a species
+ * (the query always wins). Never stage stems: «gatito» must not turn the
+ * request into a life-stage one.
+ */
+function contextSpeciesStems(
+  q: string,
+  contextSpecies: string | undefined,
+): string[] {
+  if (typeof contextSpecies !== 'string') return [];
+  if (speciesGroups(attributeStems(q)).length > 0) return [];
+  return speciesGroups(stems(contextSpecies)).flatMap((group) => {
+    const stem = [...group].find((s) => !STAGE_STEMS.has(s));
+    return stem === undefined ? [] : [stem];
+  });
+}
+
+/**
+ * The species the customer's product photo names, read from the FIRST field
+ * of the synthetic image block (never the whole text: the model-written
+ * product name, label text and guidance also live in the block). `null` when
+ * there is no block, no species, or more than one species group.
+ */
+export function contextSpeciesFromImageBlock(text: string): string | null {
+  const match =
+    /\[Imagen enviada por el cliente:\s*([^,\]"]*?)(?:\.\s|,|\]|"|$)/.exec(
+      text,
+    );
+  if (match === null) return null;
+  const words = [...match[1].matchAll(/[\p{L}\p{N}]+/gu)].map((m) => m[0]);
+  const named = words.filter((word) => SPECIES_STEMS.has(stem(word)));
+  const groups = new Set(
+    named.flatMap((word) => speciesGroups(new Set([stem(word)]))),
+  );
+  return groups.size === 1 ? named[0] : null;
+}
+
+/**
+ * Defense in depth for a search the plan could not classify: items whose
+ * text names only species other than the photo's are dropped.
+ */
+export function dropContextSpeciesContradictions<
+  T extends Partial<CatalogItemResponse>,
+>(items: readonly T[], q: string, contextSpecies: string | undefined): T[] {
+  const added = contextSpeciesStems(q, contextSpecies);
+  if (added.length === 0) return [...items];
+  const query = new Set(added);
+  return items.filter((item) => !contradicts(query, item));
+}
 
 /**
  * The item names only the opposing side of a life-stage group the query
@@ -333,7 +400,11 @@ interface QueryTokens {
   attributes: Set<string>;
 }
 
-function queryTokens(q: string, brands: ReadonlySet<string>): QueryTokens {
+function queryTokens(
+  q: string,
+  brands: ReadonlySet<string>,
+  contextStems: readonly string[] = [],
+): QueryTokens {
   const brand: string[] = [];
   const type: string[] = [];
   for (const { word } of significantQueryWords(q)) {
@@ -341,7 +412,9 @@ function queryTokens(q: string, brands: ReadonlySet<string>): QueryTokens {
     const bucket = brands.has(s) ? brand : type;
     if (!bucket.includes(s)) bucket.push(s);
   }
-  return { brand, type, attributes: attributeStems(q) };
+  const attributes = attributeStems(q);
+  for (const s of contextStems) attributes.add(s);
+  return { brand, type, attributes };
 }
 
 function classify(
@@ -461,15 +534,19 @@ function requestedPhrase(
  * backend order), at most {@link MAX_CATALOG_OPTIONS}. `null` when nothing is
  * classifiable (no significant word or no relevant item): the model answers
  * as before. `customerText` (the customer's own message of this turn) words
- * {lo pedido} when it carries the query's words (L31).
+ * {lo pedido} when it carries the query's words (L31). `contextSpecies` (the
+ * species of the customer's product photo, only when `q` names none) makes
+ * items of other species contradict, like a species stated in `q`.
  */
 export function planCatalogOptions(
   q: string,
   items: readonly CatalogItemResponse[],
   customerText?: string,
+  contextSpecies?: string,
 ): CatalogOptionsPlan | null {
   if (significantQueryWords(q).length === 0) return null;
-  const tokens = queryTokens(q, brandStems(items));
+  const contextStems = contextSpeciesStems(q, contextSpecies);
+  const tokens = queryTokens(q, brandStems(items), contextStems);
   const relevant: CatalogOption[] = [];
   let contradicted = false;
   for (const item of items) {
@@ -497,7 +574,11 @@ export function planCatalogOptions(
         tokens.brand.length > 0 && (cls === 'exact' || (hasBrand && hasType)),
     });
   }
-  const requested = requestedPhrase(q, items, customerText);
+  const asked = requestedPhrase(q, items, customerText);
+  const requested =
+    contextStems.length > 0 && speciesGroups(stems(asked)).length === 0
+      ? `${asked} para ${contextSpecies}`
+      : asked;
   const brandRequested = tokens.brand.length > 0;
   if (relevant.length === 0)
     return contradicted

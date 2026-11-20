@@ -17,6 +17,7 @@ import { deriveRestockSourceRequestId } from '../../human-decisions/domain/resto
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import { MinimalCartSelections } from '../domain/minimal-cart-selections';
 import { MinimalCartService } from './minimal-cart.service';
+import { buildProductImageTurnText } from '../../product-image/domain/product-image';
 
 const SENDER = '5215550001111';
 const OTHER = '5215550002222';
@@ -1514,6 +1515,118 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
         ]);
         expect(first).toEqual({ kind: 'handled', reply: PROD_REPLY });
       });
+    });
+  });
+
+  describe('photo species context (live eval 2026-11-19, image-no-match)', () => {
+    const pid = (n: number) =>
+      `dddddddd-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const priced = {
+      priceCents: 39900,
+      fromPriceCents: null,
+      promoPriceCents: null,
+      promotionEvaluationStatus: 'needs_human_review',
+    };
+    const food = (n: number, name: string, description: string) => ({
+      productId: pid(n),
+      name,
+      brand: null,
+      imageUrl: null,
+      description,
+      price: priced,
+      stock: { status: 'available', quantity: 5 },
+      variants: [],
+    });
+    const nupec = food(
+      1,
+      'Nupec Adulto Razas Medianas 18 kg',
+      'Alimento para perro.',
+    );
+    const proPlan = food(
+      2,
+      'Pro Plan Adulto Raza Mediana',
+      'Croquetas para perro adulto.',
+    );
+    const felix = food(3, 'Felix Atún 1 kg', 'Croquetas para gato sabor atún.');
+    const photo = buildProductImageTurnText('¿Tienen este? 😊', {
+      kind: 'product',
+      brand: 'Felix',
+      productName: null,
+      productType: 'croquetas',
+      species: 'gato',
+      size: '1 kg',
+      flavorOrVariant: 'atún',
+      labelText: null,
+      searchQueries: ['Felix atún 1 kg'],
+      confidence: 'high',
+    });
+    const run = async (text: string, items: unknown[]) => {
+      const built = build(
+        [
+          call('s1', 'searchCatalog', { q: 'Felix atún 1 kg' }),
+          say('Tengo croquetas Nupec para perro.'),
+        ],
+        {},
+        { item: nupec, stock: simpleStock },
+      );
+      built.chatbotApi.searchCatalog.mockResolvedValue(items as never);
+      const reply = await built.service.tryHandle({ senderId: SENDER, text });
+      const tools = built.captured[0].tools!;
+      const out = (await tools.searchCatalog.execute(
+        { q: 'Felix atún 1 kg' },
+        {},
+      )) as { results: Array<{ productId: string }> } & Record<string, unknown>;
+      return { reply, out, tools };
+    };
+
+    it('photo of cat food + only dog food in the catalog → the dead end, nothing dog reaches the model, the customer or the allowed ids', async () => {
+      const { reply, out, tools } = await run(photo, [nupec, proPlan]);
+      expect(reply).toEqual({
+        kind: 'handled',
+        reply:
+          'Felix atún para gato no tengo por ahora. ¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa? 😊',
+      });
+      expect(out.results).toEqual([]);
+      expect(out).toHaveProperty('presented_by_application');
+      expect(JSON.stringify(out)).not.toMatch(/perro|Nupec|Pro Plan/);
+      for (const dog of [nupec, proPlan])
+        await expect(
+          tools.checkStock.execute({ productId: dog.productId }, {}),
+        ).resolves.toMatchObject({ ok: false, error: 'unknown_product' });
+    });
+
+    it('a cat product among the dog ones is still offered, dog ones are not', async () => {
+      const { reply, out } = await run(photo, [nupec, felix, proPlan]);
+      expect(out.results.map((r) => r.productId)).toEqual([felix.productId]);
+      if (reply.kind !== 'handled') throw new Error('expected handled');
+      expect(reply.reply).toContain('*Felix Atún 1 kg*');
+      expect(reply.reply).not.toMatch(/perro|Nupec|Pro Plan/);
+    });
+
+    it('the same search without an image block is unchanged: dog food is offered as before', async () => {
+      const { out } = await run('¿Tienen este? 😊', [nupec, proPlan]);
+      expect(out.results.map((r) => r.productId)).toEqual([
+        nupec.productId,
+        proPlan.productId,
+      ]);
+      expect(out).not.toHaveProperty('presented_by_application');
+    });
+
+    it('an image block without a species is unchanged too', async () => {
+      const noSpecies = buildProductImageTurnText('¿Tienen este? 😊', {
+        kind: 'product',
+        brand: 'Felix',
+        productName: null,
+        productType: 'croquetas',
+        species: null,
+        size: '1 kg',
+        flavorOrVariant: null,
+        labelText: null,
+        searchQueries: ['Felix atún 1 kg'],
+        confidence: 'high',
+      });
+      const { out } = await run(noSpecies, [nupec, proPlan]);
+      expect(out.results).toHaveLength(2);
     });
   });
 

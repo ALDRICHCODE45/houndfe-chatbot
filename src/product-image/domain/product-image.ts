@@ -157,7 +157,7 @@ export function buildProductImageTurnText(
   return (
     `${question}\n` +
     `[Imagen enviada por el cliente: ${describeFields(description)}.${suggested} ` +
-    'Si no hay coincidencia exacta, ofrezca productos similares reales del catálogo (misma marca, mismo tipo o tamaño parecido) y aclare que no es el mismo; ' +
+    'Si no hay coincidencia exacta, ofrezca productos similares reales del catálogo (misma marca, mismo tipo de la misma especie o tamaño parecido) y aclare que no es el mismo; ' +
     'si la imagen no permite identificarlo, pida una foto de la etiqueta o el nombre.]'
   );
 }

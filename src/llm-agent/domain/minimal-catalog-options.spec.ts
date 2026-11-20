@@ -4,6 +4,8 @@ import {
   CATALOG_CHOOSE_QUESTION,
   CATALOG_NARROWING_QUESTION,
   classifyCatalogItem,
+  contextSpeciesFromImageBlock,
+  dropContextSpeciesContradictions,
   planCatalogOptions,
   renderCatalogOptions,
 } from './minimal-catalog-options';
@@ -1115,5 +1117,145 @@ describe('S14: category name joins name/description/brand', () => {
     expect(classifyCatalogItem('alimento para aves', bare, [bare])).toBe(
       'mismatch',
     );
+  });
+});
+
+describe('context species from the customer image (photo of cat food)', () => {
+  // Live eval 2026-11-19 (image-no-match): «Croquetas para gato Felix 1 kg
+  // atún» photo, search «Felix atún 1 kg», only dog food in the catalog.
+  const nupec = item(600, {
+    name: 'Nupec Adulto Razas Medianas 18 kg',
+    brand: 'Nupec',
+    description: 'Alimento seco para perro adulto.',
+  });
+  const proPlan = item(601, {
+    name: 'Pro Plan Adulto Raza Mediana',
+    brand: 'Pro Plan',
+    category: { id: 'c-perro', name: 'Alimento para perros' },
+  });
+  const felix = item(602, {
+    name: 'Felix Atún 1 kg',
+    brand: 'Felix',
+    description: 'Croquetas para gato sabor atún.',
+  });
+  const ASKED = '¿Tienen este? 😊';
+
+  it('only dog items + context «gato» → no options, contradicted, dead end without «Perro»', () => {
+    const plan = planCatalogOptions(
+      'Felix atún 1 kg',
+      [nupec, proPlan],
+      ASKED,
+      'gato',
+    )!;
+    expect(plan.options).toEqual([]);
+    expect(plan.contradicted).toBe(true);
+    expect(plan.requested).toBe('Felix atún para gato');
+    const out = renderCatalogOptions([plan], {
+      restockAvailable: true,
+      style: usted,
+    });
+    expect(out.shown).toEqual([]);
+    expect(out.text).toBe(
+      'Felix atún para gato no tengo por ahora. ¿Quiere que le pregunte al equipo si lo pueden conseguir, o le busco otra cosa?',
+    );
+    expect(out.text).not.toMatch(/perro/i);
+  });
+
+  it('a cat item among dog items is still offered; dog items are dropped', () => {
+    const plan = planCatalogOptions(
+      'Felix atún 1 kg',
+      [nupec, felix, proPlan],
+      ASKED,
+      'gato',
+    )!;
+    expect(plan.options.map((o) => o.item.productId)).toEqual([
+      felix.productId,
+    ]);
+    expect(plan.contradicted).toBe(true);
+  });
+
+  it('without a context species the same search is unchanged (default off)', () => {
+    expect(planCatalogOptions('Felix atún 1 kg', [nupec, proPlan], ASKED)).toBe(
+      null,
+    );
+    expect(
+      planCatalogOptions('Felix atún 1 kg', [nupec, felix], ASKED)!.options,
+    ).toHaveLength(1);
+  });
+
+  it('a species named in q is never overridden by the context species', () => {
+    const plan = planCatalogOptions(
+      'croquetas para perro',
+      [nupec, felix],
+      undefined,
+      'gato',
+    )!;
+    expect(plan.options.map((o) => o.item.productId)).toEqual([
+      nupec.productId,
+    ]);
+    expect(plan.requested).not.toContain('gato');
+  });
+
+  it('the context species never adds stage stems (gatito does not make adult food contradict)', () => {
+    const adultCat = item(603, {
+      name: 'Felix Adulto Atún',
+      brand: 'Felix',
+      description: 'Para gato adulto.',
+    });
+    const plan = planCatalogOptions(
+      'Felix atún',
+      [adultCat],
+      ASKED,
+      'gatitos',
+    )!;
+    expect(plan.options.map((o) => o.item.productId)).toEqual([
+      adultCat.productId,
+    ]);
+  });
+
+  it('fallback filter drops only items contradicting the context species (and never when q names one)', () => {
+    const plain = item(604, { name: 'Collar ajustable' });
+    const all = [nupec, felix, plain];
+    expect(dropContextSpeciesContradictions(all, 'Felix', 'gato')).toEqual([
+      felix,
+      plain,
+    ]);
+    expect(dropContextSpeciesContradictions(all, 'Felix', undefined)).toEqual(
+      all,
+    );
+    expect(
+      dropContextSpeciesContradictions(all, 'croquetas perro', 'gato'),
+    ).toEqual(all);
+  });
+
+  describe('contextSpeciesFromImageBlock', () => {
+    const block = (inner: string) =>
+      `¿Tienen este? 😊\n[Imagen enviada por el cliente: ${inner}. Búsquedas sugeridas: "Felix atún 1 kg". Si no hay coincidencia exacta, ofrezca productos similares reales del catálogo (misma marca, mismo tipo de la misma especie o tamaño parecido) y aclare que no es el mismo.]`;
+
+    it('reads the species of the first field of the image block', () => {
+      expect(
+        contextSpeciesFromImageBlock(
+          block('croquetas para gato, marca Felix, 1 kg'),
+        ),
+      ).toBe('gato');
+      expect(contextSpeciesFromImageBlock(block('croquetas para perro'))).toBe(
+        'perro',
+      );
+    });
+
+    it('is null without a block, without a species, or when the species only appears elsewhere', () => {
+      expect(contextSpeciesFromImageBlock('croquetas para gato')).toBeNull();
+      expect(
+        contextSpeciesFromImageBlock(block('croquetas, marca Felix')),
+      ).toBeNull();
+      expect(
+        contextSpeciesFromImageBlock(
+          block('producto "Felix para gato", marca Felix'),
+        ),
+      ).toBeNull();
+      expect(
+        contextSpeciesFromImageBlock(block('croquetas para perro y gato')),
+      ).toBeNull();
+    });
   });
 });

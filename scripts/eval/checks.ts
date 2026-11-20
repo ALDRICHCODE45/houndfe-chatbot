@@ -1,4 +1,11 @@
-import { customerAllowsEmojis } from '../../src/llm-agent/domain/customer-style';
+import {
+  customerAllowsEmojis,
+  customerOwnText,
+} from '../../src/llm-agent/domain/customer-style';
+import {
+  contextSpeciesFromImageBlock,
+  speciesGroupsNamedIn,
+} from '../../src/llm-agent/domain/minimal-catalog-options';
 import type { RefusalExpectation } from './scenarios';
 
 /** Deterministic reply heuristics; no LLM judge. */
@@ -191,6 +198,49 @@ export function checkExpectedReply(
   ];
 }
 
+const SPECIES_EMOJI: ReadonlyArray<readonly [RegExp, string]> = [
+  [/[\u{1F431}\u{1F408}]/u, 'gato'],
+  [/[\u{1F436}\u{1F415}\u{1F429}]/u, 'perro'],
+];
+
+/**
+ * Species groups the customer asked about: those of their most recent
+ * message that names one (words, 🐱/🐶, or the species of a product photo).
+ * The photo's block is read only through its first field.
+ */
+function askedSpecies(texts: readonly string[]): number[] {
+  for (const text of [...texts].reverse()) {
+    const named = [
+      customerOwnText(text),
+      contextSpeciesFromImageBlock(text) ?? '',
+      ...SPECIES_EMOJI.filter(([emoji]) => emoji.test(text)).map(
+        ([, word]) => word,
+      ),
+    ].join(' ');
+    const groups = speciesGroupsNamedIn(named);
+    if (groups.length > 0) return groups;
+  }
+  return [];
+}
+
+/**
+ * The reply names a species the customer did not ask about and never the
+ * asked one (a cat request answered with dog food). No asked species → pass.
+ */
+function checkSpecies(texts: readonly string[], reply: string): CheckResult {
+  const asked = askedSpecies(texts);
+  if (asked.length === 0) return { check: 'species', severity: 'pass' };
+  const named = speciesGroupsNamedIn(reply);
+  const other = named.filter((group) => !asked.includes(group));
+  return other.length > 0 && !named.some((group) => asked.includes(group))
+    ? {
+        check: 'species',
+        severity: 'fail',
+        detail: 'reply offers another species than the one asked',
+      }
+    : { check: 'species', severity: 'pass' };
+}
+
 export function checkReply(input: {
   customerText: string;
   /** The customer's messages so far, oldest first (default: this one). */
@@ -343,6 +393,8 @@ export function checkReply(input: {
           detail: `internal/operator text: ${leak[0]}`,
         },
   );
+
+  out.push(checkSpecies(input.recentCustomerTexts ?? [customerText], reply));
   return out;
 }
 

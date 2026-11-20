@@ -79,7 +79,7 @@ describe('buildProductImageTurnText', () => {
       '¿Tienen este producto??\n' +
         '[Imagen enviada por el cliente: croquetas para perro, marca Nupec, 18 kg, sabor/variante salmón. ' +
         'Búsquedas sugeridas: "Nupec salmón 18 kg"; "croquetas Nupec"; "croquetas salmón". ' +
-        'Si no hay coincidencia exacta, ofrezca productos similares reales del catálogo (misma marca, mismo tipo o tamaño parecido) y aclare que no es el mismo; ' +
+        'Si no hay coincidencia exacta, ofrezca productos similares reales del catálogo (misma marca, mismo tipo de la misma especie o tamaño parecido) y aclare que no es el mismo; ' +
         'si la imagen no permite identificarlo, pida una foto de la etiqueta o el nombre.]',
     );
   });

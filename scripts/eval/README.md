@@ -48,6 +48,7 @@ The checks are deterministic heuristics; there is no LLM judge. Treat them as fl
 | `refusal` | The literal `esa función aún no está disponible` on a supported request. | Missing on a turn marked `expected`. |
 | `persona` | Mentions technology/retail/punto de venta, or a turn marked `expectPersona` does not mention mascotas. | — |
 | `leak` | Internal text (`selectionRef`, `productId`, `herramienta`, operator copy such as "Primero registra la venta"). | — |
+| `species` | The customer asked about one species (their latest message naming one: a word, 🐱/🐶, or the species of a product photo) and the reply names only other species (e.g. dog food offered for a cat request, including the turn after). | — |
 | `orders` | At the end, the number of distinct checkout idempotency keys ≠ `expectOrders`. Confirm scenarios expect exactly 1; decline and denied-zone scenarios expect 0. | — |
 | `expect` | — | The reply does not match the turn's `expectReply` heuristic (e.g. `returning-customer`: tú after the restart, adult large-breed food for Luna). |
 
