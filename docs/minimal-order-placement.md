@@ -95,6 +95,10 @@ Every definite rejection that rotates the key logs a `warn` `checkout rejected s
 
 - Errors: `CHECKOUT_RETRY_REQUIRED` keeps the key. `ADDRESS_VERSION_CONFLICT` and `SHIPPING_ADDRESS_NOT_FOUND` clear the volatile selection and local confirmation; on a first attempt the customer must re-read saved addresses, select and confirm again. A later rejection still keeps any uncertain earlier order locked. Other codes follow the table above. The corrected full address, mode, address id and expected version are part of the fingerprint; an uncertain request cannot be retried with different corrections.
 
+### Reserved backorder line (restock backorder T5b)
+
+A cart may hold a reserved backorder line ([`backorder-checkout.md`](backorder-checkout.md)). The summary marks it «(pedido apartado {folio})» at its final price; the checkout body sends `backorderId` on that line with `unitPriceCents = finalPriceCents` (only when present, so an ordinary body is unchanged). `expectedTotalCents` = Σ(final price × quantity of backorder lines) + evaluate-cart total of the ordinary lines + shipping charge, which is the snapshot total plus the shipping charge, so `PROMO_RE_QUOTE` works unchanged. A refusal about the line (`BACKORDER_RESERVATION_EXPIRED`, `BACKORDER_NOT_RESERVED`, `BACKORDER_RESERVATION_LOST`, `BACKORDER_NOT_FOUND`, `BACKORDER_MISMATCH`, `PRICE_OUT_OF_DATE {currentPriceCents}`, `BACKORDER_RESERVATION_UNAVAILABLE`) created nothing: the key is rotated and, depending on the code, the line is dropped (lost is never retried), repriced and shown again, or kept with the team called; see the table in that document.
+
 ## Reply priority in one SDK run
 
 EXPIRATION > RESTOCK > checkout, order or shipping presentation (after any cart acknowledgement) > cart reply > model text. A `reviewCheckout` acknowledgement is suppressed when a checkout/order presentation is produced in the same SDK run; real cart mutation acknowledgements still survive. Only one presentation is prepared per run, even if the model calls both `prepareOrder` and `confirmCheckoutDetails`.

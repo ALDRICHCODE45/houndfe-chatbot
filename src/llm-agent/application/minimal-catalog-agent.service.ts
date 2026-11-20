@@ -164,6 +164,12 @@ import { ConversationGates } from '../../conversation-gates/application/conversa
 import { DurablePaymentOffer } from './gates/payment-offer.gate';
 import { statedPurchaseCount } from './backorder-quantity';
 import { MinimalBackorderManageService } from './minimal-backorder-manage.service';
+import { MinimalBackorderConfirmService } from './minimal-backorder-confirm.service';
+import type { BackorderBot } from '../../backorders/domain/backorder';
+import {
+  BACKORDER_CONFIRM_FAILED_REPLY,
+  backorderAddedReply,
+} from '../domain/backorder-copy';
 import { MinimalBackorderOfferService } from './minimal-backorder-offer.service';
 import {
   minimalCheckoutReply,
@@ -238,6 +244,7 @@ const CART_TRACE_ERROR_CODES = new Set([
   'insufficient_stock',
   'invalid_evaluation',
   'order_unresolved',
+  'backorder_line_locked',
 ]);
 
 /**
@@ -1039,6 +1046,10 @@ export class MinimalCatalogAgentService {
     // the chat; optional only as a test seam.
     @Optional()
     private readonly backorderManage?: MinimalBackorderManageService,
+    // Restock backorder S6: confirm a RESERVED backorder (tap or bare yes)
+    // and schedule an expired one again; optional only as a test seam.
+    @Optional()
+    private readonly backorderConfirm?: MinimalBackorderConfirmService,
   ) {
     const llm = config.get<{
       model: string;
@@ -1147,6 +1158,16 @@ export class MinimalCatalogAgentService {
       // returns null for everything else, so those routes run as before.
       if (this.backorderManage !== undefined) {
         const answered = await this.answerBackorderRequest(input);
+        if (answered !== null) return answered;
+      }
+      // Restock backorder S6: a tap of the notice's Confirm button (or of the
+      // reschedule question) names its backorder, so it is answered here, with
+      // the cart and any pending order untouched until the line is verified.
+      if (
+        this.backorderConfirm !== undefined &&
+        input.interactiveReplyId !== undefined
+      ) {
+        const answered = await this.answerBackorderConfirm(input);
         if (answered !== null) return answered;
       }
       let pick: InteractivePick | undefined;
@@ -1326,6 +1347,17 @@ export class MinimalCatalogAgentService {
       if (pick === undefined && input.interactiveReplyId === undefined) {
         const closing = await this.answerClosing(input);
         if (closing !== null) return closing;
+      }
+      // Restock backorder S6: a bare yes / «confirmo» that nothing above
+      // owned confirms the customer's only RESERVED backorder. Last, so every
+      // flow that owns a yes (offers, summaries, payment, cart) answered first.
+      if (
+        this.backorderConfirm !== undefined &&
+        pick === undefined &&
+        input.interactiveReplyId === undefined
+      ) {
+        const answered = await this.answerBackorderConfirm(input);
+        if (answered !== null) return answered;
       }
       return this.decision(await this.runTurn(input, pick));
     }
@@ -1794,6 +1826,9 @@ export class MinimalCatalogAgentService {
       }
       case 'backorder':
       case 'backorder_cancel':
+      case 'backorder_confirm':
+      case 'backorder_reschedule':
+      case 'backorder_reschedule_decline':
         // Reached only without the backorder services: nothing to answer.
         return answer({ reply: STALE_BUTTON_FALLBACK });
       case 'pick': {
@@ -2288,6 +2323,152 @@ export class MinimalCatalogAgentService {
           interactive: styleInteractivePrompt(turn.interactive, style),
         })
       : this.decision({ reply });
+  }
+
+  /**
+   * Restock backorder S6: confirm a RESERVED backorder (tap, or a bare yes
+   * when it is the only reserved one and nothing else could own the yes) or
+   * schedule an expired one again. The service verifies and answers; a verified
+   * confirmation becomes a cart line. `null` leaves the turn to the other
+   * routes. Never throws into the turn and never calls the model.
+   */
+  private async answerBackorderConfirm(input: {
+    senderId: string;
+    text: string;
+    inboundEvent?: unknown;
+    interactiveReplyId?: string;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    let turn: Awaited<ReturnType<MinimalBackorderConfirmService['handle']>>;
+    try {
+      turn = await this.backorderConfirm!.handle({
+        senderId: input.senderId,
+        text: input.text,
+        bareYesAllowed: () => this.bareBackorderYesAllowed(input.senderId),
+        ...(input.interactiveReplyId === undefined
+          ? {}
+          : { interactiveReplyId: input.interactiveReplyId }),
+      });
+    } catch (error) {
+      this.logger.warn(
+        `backorder confirm turn failed: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+      return null;
+    }
+    if (turn === null) return null;
+    this.order?.dismiss(input.senderId);
+    if (turn.kind === 'add')
+      return this.acceptBackorderConfirm(input, turn.backorder);
+    const style = this.customerStyle(input.senderId, input.text);
+    const reply = applyCustomerStyle(turn.reply, style);
+    this.recordTurn(
+      input.senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return turn.interactive === undefined
+      ? this.decision({ reply })
+      : this.decision({
+          reply,
+          interactive: styleInteractivePrompt(turn.interactive, style),
+        });
+  }
+
+  /**
+   * Restock backorder S6: a bare yes is the customer's confirmation only when
+   * no other order is in play (`competingOrderContext`: cart, summary, draft,
+   * placed sale, reorder offer) and the bot's latest message did not ask
+   * anything else: a pending offer or choice, or a question that does not
+   * name the apartado. Fails closed.
+   */
+  private async bareBackorderYesAllowed(senderId: string): Promise<boolean> {
+    try {
+      if (await this.competingOrderContext(senderId)) return false;
+      const turns = this.sessionStore.read(senderId);
+      const last = turns.at(-1);
+      if (
+        last?.reorderOffer !== undefined ||
+        last?.paymentOffer !== undefined ||
+        last?.catalogRestockOffer !== undefined ||
+        last?.interactiveChoice !== undefined ||
+        (last?.cartContext?.pending ?? null) !== null
+      )
+        return false;
+      const previous = lastAssistantText(turns);
+      return !(
+        previous !== null &&
+        /[?¿]/.test(previous) &&
+        !/apartad|\bBO-\d/i.test(previous)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Restock backorder S6: the verified RESERVED backorder becomes its own
+   * cart line (final price, reserved quantity), then the NORMAL checkout
+   * continues exactly as after a reorder: the updated order summary when the
+   * checkout already reached shipping or has confirmed delivery data, else
+   * the cart and the next step.
+   */
+  private async acceptBackorderConfirm(
+    input: { senderId: string; text: string; inboundEvent?: unknown },
+    backorder: BackorderBot,
+  ): Promise<MinimalCatalogAgentDecision> {
+    const { senderId } = input;
+    const cart = this.cart;
+    if (cart === undefined)
+      return this.answerReorder(input, {
+        reply: BACKORDER_CONFIRM_FAILED_REPLY,
+      });
+    const priorShipping = this.shippingAvailable()
+      ? await cart.shippingMode(senderId)
+      : null;
+    const result = await cart.addBackorderLine(senderId, backorder);
+    const code = result.ok
+      ? 'none'
+      : CART_TRACE_ERROR_CODES.has(result.error)
+        ? result.error
+        : 'unrecognized_cart_error';
+    traceLog(
+      this.logger,
+      `minimal_catalog backorder_confirm result=${result.ok ? 'ok' : 'error'} code=${code}`,
+    );
+    if (!result.ok)
+      return this.answerReorder(input, { reply: minimalCartReply(result) });
+    const added = backorderAddedReply(backorder, new Date());
+    let continued: MinimalCheckoutReply | null = null;
+    if (priorShipping !== null)
+      continued = await this.continueAfterCartChange(
+        senderId,
+        input.inboundEvent,
+        priorShipping,
+        added,
+      );
+    else if (
+      this.orderAvailable() &&
+      this.checkoutAvailable() &&
+      (await this.checkout!.confirmedDraft(senderId)) !== null
+    )
+      continued = await this.continueToOrder(
+        senderId,
+        input.inboundEvent,
+        added,
+      ).catch(() => null);
+    return this.answerReorder(
+      input,
+      continued ?? {
+        reply: `${added}\n\n${minimalCartReply(result)}\n\n${REORDER_NEXT_STEP}`,
+        // The same next-step buttons as any cart summary.
+        interactive: await this.cartNextStepInteractive(
+          senderId,
+          this.customerStyle(senderId, input.text),
+        ),
+      },
+    );
   }
 
   /**
@@ -3376,6 +3557,7 @@ export class MinimalCatalogAgentService {
     senderId: string,
     inboundEvent: unknown,
     mode: 'pickup' | 'delivery',
+    lead: string = CART_UPDATED_LEAD,
   ): Promise<MinimalCheckoutReply | null> {
     try {
       if (
@@ -3383,11 +3565,7 @@ export class MinimalCatalogAgentService {
         (await this.shipping!.chooseStorePickup(senderId)).kind !== 'pickup'
       )
         return null;
-      return await this.continueToOrder(
-        senderId,
-        inboundEvent,
-        CART_UPDATED_LEAD,
-      );
+      return await this.continueToOrder(senderId, inboundEvent, lead);
     } catch {
       return null;
     }

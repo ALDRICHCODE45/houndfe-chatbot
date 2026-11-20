@@ -21,6 +21,9 @@ const cartLineSchema = z.strictObject({
   quantity: money.refine((value) => value > 0),
   unitPriceCents: money,
   finalPriceCents: money,
+  // Restock backorder T5b: the line is a RESERVED backorder, distinct from an
+  // ordinary line of the same product. Absent on ordinary lines.
+  backorderId: z.uuid().optional(),
 });
 const cartLinesSchema = z
   .array(cartLineSchema)
@@ -33,7 +36,8 @@ const cartLinesSchema = z
           .some(
             (other) =>
               line.productId === other.productId &&
-              line.variantId === other.variantId,
+              line.variantId === other.variantId &&
+              line.backorderId === other.backorderId,
           ),
     ),
   );
@@ -196,6 +200,7 @@ function sameCartPin(
         (other) =>
           line.productId === other.productId &&
           line.variantId === other.variantId &&
+          line.backorderId === other.backorderId &&
           line.quantity === other.quantity &&
           (ignorePrices ||
             (line.unitPriceCents === other.unitPriceCents &&

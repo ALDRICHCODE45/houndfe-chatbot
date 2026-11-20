@@ -137,6 +137,7 @@ function sameStoredLines(
       return (
         line.productId === fresh.productId &&
         line.variantId === fresh.variantId &&
+        line.backorder?.id === fresh.backorder?.id &&
         line.quantity === fresh.quantity &&
         line.unitPriceCents === fresh.unitPriceCents
       );
@@ -150,14 +151,51 @@ function pinLines(
   quote: Extract<MinimalCartResult, { ok: true }>,
 ): MinimalShippingCartLine[] {
   return quote.items.map(
-    ({ productId, variantId, quantity, unitPriceCents, finalPriceCents }) => ({
+    ({
+      productId,
+      variantId,
+      quantity,
+      unitPriceCents,
+      finalPriceCents,
+      backorder,
+    }) => ({
       productId,
       ...(variantId ? { variantId } : {}),
       quantity,
       unitPriceCents,
       finalPriceCents,
+      ...(backorder ? { backorderId: backorder.id } : {}),
     }),
   );
+}
+
+/**
+ * The backend quote rejects a repeated cart line (`DUPLICATE_CART_LINE`), and
+ * a reserved backorder line may sit next to an ordinary line of the same
+ * product: the quote asks about the units together. A cart with no such pair
+ * is sent exactly as before.
+ */
+function quoteItems(
+  items: Extract<MinimalCartResult, { ok: true }>['items'],
+): Array<{ productId: string; variantId?: string; quantity: number }> {
+  const merged: Array<{
+    productId: string;
+    variantId?: string;
+    quantity: number;
+  }> = [];
+  for (const { productId, variantId, quantity } of items) {
+    const same = merged.find(
+      (line) => line.productId === productId && line.variantId === variantId,
+    );
+    if (same) same.quantity += quantity;
+    else
+      merged.push({
+        productId,
+        ...(variantId ? { variantId } : {}),
+        quantity,
+      });
+  }
+  return merged;
 }
 
 function zipOf(address: MinimalCheckoutDraftAddress): string | null {
@@ -257,11 +295,7 @@ export class MinimalShippingService {
       const phone = parseMexicanWhatsAppPhone(senderId);
       if (phone === null) return refuse('cart_unverified');
       const request = CreateShippingQuoteInputSchema.safeParse({
-        items: quote.items.map(({ productId, variantId, quantity }) => ({
-          productId,
-          ...(variantId ? { variantId } : {}),
-          quantity,
-        })),
+        items: quoteItems(quote.items),
         phoneCountryCode: phone.phoneCountryCode,
         phone: phone.phone,
         destination: quoteDestination(draft.address),

@@ -66,6 +66,10 @@ This unit is pure, so it cannot and does not:
 3. Send messages or own the transport. Invoke `onSent()` only after the transport accepted the summary.
 4. Persist confirmation metadata. Missing-field and local-binding state is exposed through public methods, never written as generic sibling flags.
 
+## Backorder lines (restock backorder T5b)
+
+The delivery-data confirmation is unaffected by a reserved backorder line in the cart: the line only changes the cart pins. The shipping cart pin carries an optional `backorderId` per line (a backorder line and an ordinary line of the same product are two pinned lines), and the order summary that follows marks the line «(pedido apartado {folio})»; see [`backorder-checkout.md`](backorder-checkout.md). A shipping quote asks the backend about the units of such a pair together.
+
 ## Public API
 
 ```ts

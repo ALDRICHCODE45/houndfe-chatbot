@@ -60,6 +60,7 @@ import { HumanRequestsServicesModule } from '../human-requests/human-requests.mo
 import { MinimalExpirationRequestService } from './application/minimal-expiration-request.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { BackorderGates } from './application/gates/backorder.gates';
+import { MinimalBackorderConfirmService } from './application/minimal-backorder-confirm.service';
 import { MinimalBackorderManageService } from './application/minimal-backorder-manage.service';
 import { MinimalBackorderOfferService } from './application/minimal-backorder-offer.service';
 import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
@@ -281,6 +282,14 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
       inject: [BACKORDER_CLIENT],
       useFactory: (backorders: BackorderClient) =>
         new MinimalBackorderManageService({ backorders }),
+    },
+    {
+      // Restock backorder S6 (T5b): confirm a RESERVED backorder (tap or bare
+      // yes) into the cart, and schedule an expired one again. Deterministic.
+      provide: MinimalBackorderConfirmService,
+      inject: [BACKORDER_CLIENT, CHATBOT_API_CLIENT],
+      useFactory: (backorders: BackorderClient, chatbotApi: ChatbotApiClient) =>
+        new MinimalBackorderConfirmService({ backorders, chatbotApi }),
     },
     {
       // WU-B: the RESTOCK confirmation gate. Human decisions are always on,

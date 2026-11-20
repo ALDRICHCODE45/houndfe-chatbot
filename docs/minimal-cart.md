@@ -218,6 +218,10 @@ These traces contain only a position, fixed operation/origin labels and booleans
 
 This instrumentation changes neither cart rules nor reply priority. It is diagnostic evidence, not a fix for live intent interpretation. After deploying, rehearse adding one simple product while a different variantful product is already in the cart: the saved presentation must remain unchanged, the simple product must have no invented presentation, and the total must match the verified prices. This live model check is still pending until performed. After separately authorized deployment, repeat the failed phrase once and inspect the correlated traces; do not automatically retry quantity adjustments.
 
+## Reserved backorder line (restock backorder T5b)
+
+A customer's RESERVED restock backorder enters the cart as its own line (optional `backorder` member of the stored line: id, folio, product/variant name, `reservedUntil`), priced at the backorder's frozen `finalPriceCents` for its reserved quantity. It is outside the promotion base (`evaluate-cart` receives only the ordinary lines), skips the catalog/stock read, never merges with an ordinary line of the same product and cannot change quantity or price (`backorder_line_locked`: «si quiere más, agrego otra línea»; a model cannot supply a backorder or price). Removing it does not cancel the backorder; the reply says it stays apartado until its deadline. A cart without such a line is stored, quoted and worded exactly as above. Details: [`backorder-checkout.md`](backorder-checkout.md).
+
 ## Persistence and rollout
 
 The existing `CartState` format is reused under `conversation_state.data.minimalCart`. The legacy `data.cart` is deliberately untouched: it belongs to the old checkout path and must not silently become the new checkout's authority.

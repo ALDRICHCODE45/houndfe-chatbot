@@ -370,6 +370,18 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['Se lo tenemos apartado', 'Te lo tenemos apartado'],
   ['se lo tenemos apartado', 'te lo tenemos apartado'],
   ['Le aviso en cuanto llegue', 'Te aviso en cuanto llegue'],
+  ['le aviso en cuanto llegue', 'te aviso en cuanto llegue'],
+  // Restock backorder T5b (S6): confirm, checkout refusals and reschedule.
+  [
+    '¿Quiere que se lo agende de nuevo? Quedaría al final de la fila de espera.',
+    '¿Quieres que te lo agende de nuevo? Quedaría al final de la fila de espera.',
+  ],
+  ['Sigue primero en la fila', 'Sigues primero en la fila'],
+  ['ya no se lo tenemos apartado', 'ya no te lo tenemos apartado'],
+  ['el equipo le va a llamar', 'el equipo te va a llamar'],
+  ['Pida ayuda al equipo', 'Pide ayuda al equipo'],
+  ['Si quiere, dígame', 'Si quieres, dime'],
+  ['el equipo le ayuda', 'el equipo te ayuda'],
   ['no paga nada hasta entonces', 'no pagas nada hasta entonces'],
   ['La fecha puede variar.', 'La fecha podría variar.'],
   ['Disculpe, no pude consultar', 'Disculpa, no pude consultar'],
