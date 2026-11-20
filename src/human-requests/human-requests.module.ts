@@ -27,6 +27,10 @@ import {
   CONVERSATION_STORE,
   type ConversationStore,
 } from '../conversation/domain/conversation-store';
+import {
+  BACKORDER_FEED_HANDLER,
+  type BackorderFeedHandler,
+} from './domain/backorder-feed';
 import { readPayInStoreSale } from '../llm-agent/application/minimal-pay-in-store-sale';
 import { LIVE_CONVERSATION_CLIENT } from '../chatbot-api/domain/live-conversation.port';
 import type { LiveConversationClient } from '../chatbot-api/domain/live-conversation.port';
@@ -292,6 +296,7 @@ const CUSTOMER_PORT_TOKENS = [
         scheduling?: SchedulingStateService,
         api?: ChatbotApiClient,
         conversations?: ConversationStore,
+        backorder?: BackorderFeedHandler,
       ) => {
         const ports = customerPorts(handoff, config, pool, profiles);
         // Pay in store S3: the sale.pickup_* notices only with
@@ -305,6 +310,9 @@ const CUSTOMER_PORT_TOKENS = [
           client,
           sender,
           ...ports,
+          // Restock backorder (T5 provides it): without a handler the
+          // backorder.* items are ACKed STALE.
+          ...(backorder === undefined ? {} : { backorder }),
           ...(payInStore
             ? {
                 salePickup: new SalePickupNoticeService({
@@ -372,6 +380,7 @@ const CUSTOMER_PORT_TOKENS = [
         { token: SchedulingStateService, optional: true },
         { token: CHATBOT_API_CLIENT, optional: true },
         { token: CONVERSATION_STORE, optional: true },
+        { token: BACKORDER_FEED_HANDLER, optional: true },
       ],
     },
     {

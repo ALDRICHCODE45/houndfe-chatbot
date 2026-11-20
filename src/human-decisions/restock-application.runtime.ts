@@ -18,6 +18,7 @@ import {
   WHATSAPP_SENDER,
   type WhatsappSenderPort,
 } from '../whatsapp/domain/whatsapp-sender.port';
+import { BackorderOfferRegistry } from '../backorders/domain/backorder-offer';
 import { RestockApplicationCandidateService } from './application/restock-application-candidate.service';
 import { RestockApplicationCoordinator } from './application/restock-application-coordinator';
 import { RestockApplicationPoller } from './application/restock-application-poller';
@@ -52,6 +53,9 @@ export class RestockApplicationRuntime
     private readonly handoff: HandoffModeService,
     // S1: the customer notice in the recipient's stored style.
     @Optional() private readonly profiles?: CustomerProfileService,
+    // Restock backorder S1: late-bound holder of the offer capability the
+    // LLM agent module registers; absent → the offer is worded but not armed.
+    @Optional() private readonly offers?: BackorderOfferRegistry,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -104,6 +108,10 @@ export class RestockApplicationRuntime
         recordRestockApplicationOutcome:
           this.client.recordRestockApplicationOutcome.bind(this.client),
         sendText: this.sender.sendText.bind(this.sender),
+        // Restock backorder S1: the estimate goes out with its two buttons
+        // when the sender supports them (text fallback otherwise).
+        sendInteractive: this.sender.sendInteractive?.bind(this.sender),
+        backorderOffer: () => this.offers?.current() ?? null,
         customerStyle: (senderId: string) =>
           this.profiles?.styleFor(senderId) ?? Promise.resolve(null),
         isHumanMode: (senderId: string) => this.handoff.isHumanMode(senderId),

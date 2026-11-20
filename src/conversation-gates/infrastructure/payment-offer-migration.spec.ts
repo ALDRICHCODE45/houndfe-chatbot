@@ -23,7 +23,11 @@ function run(direction: 'up' | 'down') {
 }
 
 describe('conversation gate payment_offer migration (5400)', () => {
-  it('up re-creates the kind CHECK with exactly the code list', () => {
+  it('up re-creates the kind CHECK with exactly the kinds known at 5400', () => {
+    // 5500 widens the code list with the backorder kinds (own spec).
+    const known = CONVERSATION_GATE_KINDS.filter(
+      (kind) => !kind.startsWith('backorder_'),
+    );
     const [drop, add] = run('up');
     expect(drop).toEqual([
       'drop',
@@ -31,9 +35,8 @@ describe('conversation gate payment_offer migration (5400)', () => {
       'conversation_gates_gate_kind_check',
     ]);
     const check = String(add[3]);
-    for (const kind of CONVERSATION_GATE_KINDS)
-      expect(check).toContain(`'${kind}'`);
-    expect(check.match(/'/g)).toHaveLength(CONVERSATION_GATE_KINDS.length * 2);
+    for (const kind of known) expect(check).toContain(`'${kind}'`);
+    expect(check.match(/'/g)).toHaveLength(known.length * 2);
   });
 
   it('down refuses while an unexpired payment_offer exists, then restores the old CHECK', () => {

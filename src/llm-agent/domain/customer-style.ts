@@ -345,6 +345,32 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['Puede enviarnos el comprobante', 'Puedes enviarnos el comprobante'],
   ['cuando lo tenga.', 'cuando lo tengas.'],
   ['¡Que esté muy bien!', '¡Que estés muy bien!'],
+  // Restock backorder S1: the offer closing of the estimate message first
+  // (the longer phrase), then its short button body and the shorter phrases
+  // of the answering turn (ask the count, confirm, already scheduled, stock
+  // came back) that the closing contains.
+  [
+    '¿Quiere que se lo apartemos en cuanto llegue? Le aviso y no paga nada hasta entonces.',
+    '¿Quieres que te lo apartemos en cuanto llegue? Te aviso y no pagas nada hasta entonces.',
+  ],
+  ['¿Quiere que se lo apartemos?', '¿Quieres que te lo apartemos?'],
+  ['¿Cuántas piezas le aparto?', '¿Cuántas piezas te aparto?'],
+  [
+    '¿Cuántas piezas le agrego al carrito?',
+    '¿Cuántas piezas te agrego al carrito?',
+  ],
+  ['Ya tiene agendado', 'Ya tienes agendado'],
+  // Restock backorder S8 (T6): cancel question, status lines, several orders.
+  [
+    'Tiene varios pedidos por reposición',
+    'Tienes varios pedidos por reposición',
+  ],
+  ['¿Cuál pedido desea cancelar?', '¿Cuál pedido quieres cancelar?'],
+  ['¿Cuál desea cancelar?', '¿Cuál quieres cancelar?'],
+  ['Se lo tenemos apartado', 'Te lo tenemos apartado'],
+  ['se lo tenemos apartado', 'te lo tenemos apartado'],
+  ['Le aviso en cuanto llegue', 'Te aviso en cuanto llegue'],
+  ['no paga nada hasta entonces', 'no pagas nada hasta entonces'],
   ['La fecha puede variar.', 'La fecha podría variar.'],
   ['Disculpe, no pude consultar', 'Disculpa, no pude consultar'],
   ['Elija una opción', 'Elige una opción'],

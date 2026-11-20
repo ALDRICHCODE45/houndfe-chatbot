@@ -16,6 +16,9 @@ rules** and the **same replies**.
 | `checkout_confirmed` | same adapter | Local delivery confirmation: reference, draft binding, revision | sender | **24 h** (see below) | Read on every order attempt. Valid only while the durable draft still equals the confirmed binding. A draft change revokes it. | `Map`, no expiry until restart |
 | `checkout_address` | `MinimalCheckoutService` via `CheckoutAddressGate` | Saved-address reference registry (addresses, pages, next-page cursors, each with its own expiry), the selected reference, the customer from the last unique lookup | sender | 5 min per binding; the row lives as long as its longest binding | Re-read on every resolve or revalidate. Expired bindings resolve to `null`. The oldest page retires at 50 addresses. | Three `Map`s in the service plus a `Map` per registry |
 | `restock_pending` | `MinimalRestockRequestService` | Pending RESTOCK question: origin ids, catalog identity snapshot, canonical digest, presentation, classified message ids (≤16), `armed` | sender | 5 min | One-shot. A trusted, armed accept (exact or classified) spends it and runs **one** RESTOCK route. A decline drops it. Origin replay re-asks it. A new question overwrites it. | `Map` in the service |
+| `payment_offer` | `DurablePaymentOffer` (migration 5400) | The sale the bot's «¿Cómo desea pagar?» question is about | sender | 5 min | Read by the next message; any other recorded turn clears it. | `Map` in the agent session |
+| `backorder_offer` | `DurableBackorderOffer` (migration 5500) | The offer sent after a RESTOCK estimate: decision id (`sourceDecisionId`), product, variant, product name, `estimatedAt`, stated count (or `null`), `stage` (`offer`, `ask_quantity`, `ask_name`) and the chosen count | sender | **24 h** | Armed **outside a customer turn** by the RESTOCK application coordinator, only after Meta accepted the estimate message. A tap, or a bare yes / no, answers it; any other message spends it (`claim`). T6 adds the stage `retry` and an optional `customer` (the first request's customer mode) to the payload, so a retry replays the same body under the same idempotency key; no migration (only `gate_kind` is constrained). See [`minimal-backorder.md`](minimal-backorder.md). | new |
+| `backorder_quantity` | `DurableBackorderQuantity` (migration 5500) | The unit count (2–999) the customer stated when the RESTOCK request was made, per product / variant topic (≤ 8) | sender | **48 h** | Written when the RESTOCK request is recorded; read and removed when the offer is armed (the request itself stores no quantity). | new |
 | *expiration session* | `MinimalExpirationRequestService` | — | — | — | **Not a cross-turn gate.** Its `CatalogSession` (5-minute TTL) is created and used inside one `prepare` call. Nothing survives the call, so nothing has to survive a restart. The durable parts (reservation, post ledger) were already in Postgres. | local variable |
 
 Process-local assumptions that are gone:
@@ -30,7 +33,7 @@ Process-local assumptions that are gone:
 | Column | Notes |
 | --- | --- |
 | `sender_id text` | `char_length` 1–128, collation `C` |
-| `gate_kind text` | `CHECK` in the five kinds above |
+| `gate_kind text` | `CHECK` in the kinds above (widened by migrations 5400 and 5500) |
 | `payload jsonb` | `CHECK` object, `octet_length(payload::text) <= 65536` |
 | `expires_at timestamptz` | indexed for the purge |
 | `created_at`, `updated_at` | `now()` defaults; `updated_at` bumps on upsert |
@@ -74,3 +77,17 @@ All pending gates keep their original 5-minute expiry (`MINIMAL_ORDER_CONFIRMATI
 - Timers are unref'd. Shutdown stops new ticks and waits for the running batch, before `PostgresPoolLifecycle` closes the pool.
 
 The purge only reclaims space: expiry is already enforced on read.
+
+## Gates armed outside a customer turn
+
+`backorder_offer` is the first gate that is **not** created by a customer turn: the RESTOCK application coordinator sends the estimate from a poller. The coordinator (human decisions module) only sees `BackorderOfferCapability`, a port held by `BackorderOfferRegistry`; the LLM agent module registers `MinimalBackorderOfferService` there at boot (same late-bound pattern as `DeliveryZoneResumeRegistry`). `arm` runs `begin(sender)` (load what the sender already has), sets the in-memory offer, `touch`es and `settle`s, so the row is durable before the coordinator goes on. Its expiry (24 h) is absolute from arming.
+
+### The customer cancel question is not a gate
+
+The S8 cancel confirmation («¿Cancelo su pedido …?») and its pick are **not**
+durable gates: they are process-local state of `MinimalBackorderManageService`
+with a 5-minute expiry, so no gate kind (and no migration) was added. The
+buttons carry the backorder id and are re-verified against the customer's active
+list, so a tap survives a restart; only a typed yes/pick is lost. If this ever
+needs to survive a restart it needs a new `gate_kind` and a migration widening
+the CHECK (the pattern of 5400 / 5500).

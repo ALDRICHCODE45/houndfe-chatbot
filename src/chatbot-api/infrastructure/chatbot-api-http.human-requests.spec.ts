@@ -1612,6 +1612,25 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
       ],
       [{ outcome: 'STALE', attemptId: ATTEMPT }, AT],
       [{ outcome: 'STALE', attemptId: ATTEMPT, attemptedAt: AT }, AT],
+      // Restock backorder S15: terminal, backorder items only.
+      [
+        {
+          outcome: 'PROVIDER_REJECTED',
+          attemptId: ATTEMPT,
+          attemptedAt: AT,
+          reason: 'TEMPLATE_NOT_APPROVED',
+        },
+        AT,
+      ],
+      [
+        {
+          outcome: 'PROVIDER_REJECTED',
+          attemptId: ATTEMPT,
+          attemptedAt: AT,
+          reason: 'x'.repeat(280),
+        },
+        AT,
+      ],
     ])(
       'posts exactly the variant keys once (%j)',
       async (input, ackReceivedAt) => {
@@ -1712,6 +1731,51 @@ describe('human requests, feed and delivery outcome (mocked HTTP)', () => {
         { outcome: 'SENT', attemptId: ATTEMPT, attemptedAt: AT },
       ],
       ['extra key', { outcome: 'STALE', attemptId: ATTEMPT, note: 'x' }],
+      [
+        'rejected without reason',
+        { outcome: 'PROVIDER_REJECTED', attemptId: ATTEMPT, attemptedAt: AT },
+      ],
+      [
+        'rejected with an empty reason',
+        {
+          outcome: 'PROVIDER_REJECTED',
+          attemptId: ATTEMPT,
+          attemptedAt: AT,
+          reason: '',
+        },
+      ],
+      [
+        'rejected with a reason over 280 characters',
+        {
+          outcome: 'PROVIDER_REJECTED',
+          attemptId: ATTEMPT,
+          attemptedAt: AT,
+          reason: 'x'.repeat(281),
+        },
+      ],
+      [
+        'rejected with providerMessageId',
+        {
+          outcome: 'PROVIDER_REJECTED',
+          attemptId: ATTEMPT,
+          attemptedAt: AT,
+          reason: 'UNREACHABLE',
+          providerMessageId: 'w',
+        },
+      ],
+      [
+        'rejected without attemptedAt',
+        { outcome: 'PROVIDER_REJECTED', attemptId: ATTEMPT, reason: 'X' },
+      ],
+      [
+        'reason with another outcome',
+        {
+          outcome: 'DELIVERY_UNKNOWN',
+          attemptId: ATTEMPT,
+          attemptedAt: AT,
+          reason: 'X',
+        },
+      ],
     ])(
       'rejects a body that breaks the contract (%s) before any HTTP',
       async (_name, input) => {

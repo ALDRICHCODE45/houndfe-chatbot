@@ -40,6 +40,32 @@ import {
 } from '../../delivery-zones/domain/delivery-zone-requester';
 import { minimalZoneResumeShippingSentence } from '../domain/minimal-shipping';
 import {
+  BACKORDER_ASK_NAME_REPLY,
+  BACKORDER_ASK_QUANTITY_REPLY,
+  BACKORDER_DECLINE_REPLY,
+  BACKORDER_CANCEL_FAILED_REPLY,
+  BACKORDER_CANCEL_PICK_PROMPT,
+  BACKORDER_FAILED_REPLY,
+  BACKORDER_RETRY_REPLY,
+  BACKORDER_STATUS_FAILED_REPLY,
+  backorderAvailableNowReply,
+  backorderCancelKeptReply,
+  backorderCancelledReply,
+  backorderCancelPickReply,
+  backorderCancelPrompt,
+  backorderCancelQuestion,
+  backorderDuplicateReply,
+  backorderInactiveReply,
+  backorderNotCancellableReply,
+  backorderScheduledReply,
+  backorderStatusListReply,
+  backorderStatusReply,
+} from '../domain/backorder-copy';
+import {
+  BACKORDER_OFFER_CLOSING,
+  BACKORDER_OFFER_PROMPT,
+} from '../../backorders/domain/backorder-offer';
+import {
   BUSY_REPLY,
   CHECKOUT_TOOL_CLARIFICATION,
   FORGET_MY_DATA_REPLY,
@@ -176,6 +202,26 @@ const payment = {
   beneficiary: 'HoundFe',
   clabe: '012345678901234567',
   accountNumber: '1234567890',
+};
+
+const BO = {
+  folio: 'BO-000012',
+  quantity: 2,
+  productName: 'Collar',
+  variantName: null,
+};
+const BO_NOW = new Date('2026-11-20T12:00:00.000Z');
+const BO_WAITING = {
+  folio: 'BO-000012',
+  status: 'WAITING' as const,
+  estimatedAt: '2026-11-27T15:00:00.000Z',
+  reservedUntil: null,
+};
+const BO_RESERVED = {
+  folio: 'BO-000012',
+  status: 'RESERVED' as const,
+  estimatedAt: '2026-11-27T15:00:00.000Z',
+  reservedUntil: '2026-11-21T15:00:00.000Z',
 };
 
 const REPLIES: Record<string, string> = {
@@ -451,7 +497,76 @@ const REPLIES: Record<string, string> = {
     }),
   ),
   restockEstimate:
-    '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!',
+    '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar», contados desde su confirmación. La fecha puede variar. ¿Quiere que se lo apartemos en cuanto llegue? Le aviso y no paga nada hasta entonces.',
+  // Restock backorder S1/S14: the offer, its button body and the answers.
+  backorderOfferClosing: BACKORDER_OFFER_CLOSING,
+  backorderOfferPrompt: BACKORDER_OFFER_PROMPT,
+  backorderDecline: BACKORDER_DECLINE_REPLY,
+  backorderAskQuantity: BACKORDER_ASK_QUANTITY_REPLY,
+  backorderAskName: BACKORDER_ASK_NAME_REPLY,
+  backorderRetry: BACKORDER_RETRY_REPLY,
+  backorderFailed: BACKORDER_FAILED_REPLY,
+  backorderScheduled: backorderScheduledReply(
+    {
+      folio: 'BO-000012',
+      quantity: 2,
+      productName: 'Collar',
+      variantName: null,
+      referencePriceCents: 114900,
+      estimatedAt: '2026-11-27T15:00:00.000Z',
+    },
+    new Date('2026-11-20T12:00:00.000Z'),
+  ),
+  backorderAvailableNow: backorderAvailableNowReply('Collar'),
+  backorderDuplicate: backorderDuplicateReply({
+    folio: 'BO-000012',
+    productName: 'Collar',
+    variantName: null,
+  }),
+  backorderDuplicateNoFolio: backorderDuplicateReply(null),
+  // Restock backorder S8 (T6): cancel, status and the inactive replay.
+  backorderCancelQuestion: backorderCancelQuestion(BO),
+  backorderCancelPrompt: backorderCancelPrompt(BO),
+  backorderCancelled: backorderCancelledReply(BO),
+  backorderCancelKept: backorderCancelKeptReply(BO),
+  backorderCancelFailed: BACKORDER_CANCEL_FAILED_REPLY,
+  backorderCancelPickPrompt: BACKORDER_CANCEL_PICK_PROMPT,
+  backorderCancelPick: backorderCancelPickReply([
+    BO,
+    { ...BO, folio: 'BO-000013' },
+  ]),
+  backorderNotCancellableExpired: backorderNotCancellableReply(BO, 'EXPIRED'),
+  backorderNotCancellableConfirmed: backorderNotCancellableReply(
+    BO,
+    'CONFIRMED',
+  ),
+  backorderStatusFailed: BACKORDER_STATUS_FAILED_REPLY,
+  backorderStatusWaiting: backorderStatusReply(BO_WAITING, BO_NOW),
+  backorderStatusWaitingPast: backorderStatusReply(
+    { ...BO_WAITING, estimatedAt: '2026-11-10T15:00:00.000Z' },
+    BO_NOW,
+  ),
+  backorderStatusReserved: backorderStatusReply(BO_RESERVED, BO_NOW),
+  backorderStatusReservedNoDeadline: backorderStatusReply(
+    { ...BO_RESERVED, reservedUntil: null },
+    BO_NOW,
+  ),
+  backorderStatusList: backorderStatusListReply(
+    [BO_WAITING, { ...BO_RESERVED, folio: 'BO-000013' }],
+    BO_NOW,
+  ),
+  backorderInactiveCancelled: backorderInactiveReply({
+    folio: 'BO-000012',
+    status: 'CANCELLED',
+  }),
+  backorderInactiveExpired: backorderInactiveReply({
+    folio: 'BO-000012',
+    status: 'EXPIRED',
+  }),
+  backorderInactiveConfirmed: backorderInactiveReply({
+    folio: 'BO-000012',
+    status: 'CONFIRMED',
+  }),
   restockUnavailable:
     '¡Gracias por la espera! 😊 Por ahora el equipo no pudo confirmar un estimado de reposición para «Collar».',
   // Fixed copy of prepareExpirationReply (unavailable branch).
@@ -528,6 +643,68 @@ describe('customer style over every fixed customer reply (S2)', () => {
     );
     expect(applyCustomerStyle(REPLIES.restockProposal, tu)).toBe(
       'Por ahora no tenemos «Collar» 😕. ¿Quieres que consulte si hay una fecha estimada de reposición?',
+    );
+  });
+});
+
+describe('restock backorder copy in tú (S1/S14)', () => {
+  it('pins the confirmation, the offer and the questions', () => {
+    expect(applyCustomerStyle(REPLIES.backorderScheduled, tu)).toBe(
+      'Listo, quedó agendado tu pedido BO-000012: 2 × Collar a $1149.00 MXN c/u. Te aviso en cuanto llegue (aprox. el 27 de noviembre); no pagas nada hasta entonces.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderOfferPrompt, tu)).toBe(
+      '¿Quieres que te lo apartemos?',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderAskQuantity, tu)).toBe(
+      '¿Cuántas piezas te aparto?',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderAvailableNow, tu)).toBe(
+      '¡Buenas noticias! Ya tenemos Collar disponible. ¿Cuántas piezas te agrego al carrito?',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderDuplicate, tu)).toBe(
+      'Ya tienes agendado tu pedido BO-000012 de Collar. Te aviso en cuanto llegue.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderRetry, tu)).toBe(
+      'No pude agendar tu pedido en este momento. Intenta de nuevo en unos minutos.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderDecline, tu)).toBe(
+      'Entendido. ¡Que estés muy bien!',
+    );
+  });
+});
+
+describe('restock backorder copy in tú (S8 cancel and status)', () => {
+  it('pins the cancel question, replies and the status lines', () => {
+    expect(applyCustomerStyle(REPLIES.backorderCancelQuestion, tu)).toBe(
+      '¿Cancelo tu pedido BO-000012 de 2 × Collar?',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderCancelled, tu)).toBe(
+      'Listo, cancelé tu pedido BO-000012.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderCancelKept, tu)).toBe(
+      'Entendido, tu pedido BO-000012 sigue agendado.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderCancelPick, tu)).toBe(
+      'Tienes varios pedidos por reposición. ¿Cuál quieres cancelar?\n• BO-000012: 2 × Collar\n• BO-000013: 2 × Collar',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderCancelPickPrompt, tu)).toBe(
+      '¿Cuál pedido quieres cancelar?',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderStatusWaiting, tu)).toBe(
+      'Tu pedido BO-000012 sigue en espera; llega aprox. el 27 de noviembre. Te aviso en cuanto llegue.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderStatusReserved, tu)).toBe(
+      '¡Ya llegó! Te lo tenemos apartado hasta el 21 de noviembre a las 9:00 a. m.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderStatusList, tu)).toBe(
+      [
+        'Tienes varios pedidos por reposición:',
+        'Tu pedido BO-000012 sigue en espera; llega aprox. el 27 de noviembre. Te aviso en cuanto llegue.',
+        'Tu pedido BO-000013 ya llegó y te lo tenemos apartado hasta el 21 de noviembre a las 9:00 a. m.',
+      ].join('\n'),
+    );
+    expect(applyCustomerStyle(REPLIES.backorderInactiveCancelled, tu)).toBe(
+      'Tu pedido BO-000012 ya estaba cancelado, así que no está agendado.',
     );
   });
 });

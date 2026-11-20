@@ -162,6 +162,9 @@ import {
 } from './minimal-cart.service';
 import { ConversationGates } from '../../conversation-gates/application/conversation-gates';
 import { DurablePaymentOffer } from './gates/payment-offer.gate';
+import { statedPurchaseCount } from './backorder-quantity';
+import { MinimalBackorderManageService } from './minimal-backorder-manage.service';
+import { MinimalBackorderOfferService } from './minimal-backorder-offer.service';
 import {
   minimalCheckoutReply,
   reviewMinimalCheckout,
@@ -1028,6 +1031,14 @@ export class MinimalCatalogAgentService {
     // Payment step after an order; optional only as a test seam.
     @Optional()
     private readonly payment?: MinimalPaymentService,
+    // Restock backorder S1: the answer to the offer after the RESTOCK
+    // estimate; optional only as a test seam.
+    @Optional()
+    private readonly backorder?: MinimalBackorderOfferService,
+    // Restock backorder S8: cancel / status of a scheduled restock order from
+    // the chat; optional only as a test seam.
+    @Optional()
+    private readonly backorderManage?: MinimalBackorderManageService,
   ) {
     const llm = config.get<{
       model: string;
@@ -1123,6 +1134,21 @@ export class MinimalCatalogAgentService {
         isForgetMyDataRequest(input.text)
       )
         return this.forgetCustomer(input);
+      // Restock backorder S1: the reply right after the estimate's offer
+      // answers it first (a tap, or a bare yes / no), without the model.
+      if (this.backorder !== undefined) {
+        const answered = await this.answerBackorder(input);
+        if (answered !== null) return answered;
+      }
+      // Restock backorder S8: cancel / status of a SCHEDULED restock order
+      // (explicit wording, or generic wording with no other order in play).
+      // Before the RESTOCK question and the order routes so none of their
+      // classifiers (one of them calls the model) sees these messages; it
+      // returns null for everything else, so those routes run as before.
+      if (this.backorderManage !== undefined) {
+        const answered = await this.answerBackorderRequest(input);
+        if (answered !== null) return answered;
+      }
       let pick: InteractivePick | undefined;
       if (input.interactiveReplyId !== undefined) {
         const tapped = await this.consumeInteractive(
@@ -1766,6 +1792,10 @@ export class MinimalCatalogAgentService {
           ? answer({ reply: STALE_BUTTON_FALLBACK })
           : { decision };
       }
+      case 'backorder':
+      case 'backorder_cancel':
+        // Reached only without the backorder services: nothing to answer.
+        return answer({ reply: STALE_BUTTON_FALLBACK });
       case 'pick': {
         const option = this.sessionStore
           .read(senderId)
@@ -2168,6 +2198,126 @@ export class MinimalCatalogAgentService {
   }
 
   /**
+   * Restock backorder S1: the customer's reply to the offer that closed the
+   * RESTOCK estimate. The service decides (tap, yes / no, the count, the
+   * name); `null` leaves the turn to the normal flow (the offer, if any, was
+   * spent by this message). Never throws into the turn.
+   */
+  private async answerBackorder(input: {
+    senderId: string;
+    text: string;
+    interactiveReplyId?: string;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    let turn: Awaited<ReturnType<MinimalBackorderOfferService['handle']>>;
+    try {
+      turn = await this.backorder!.handle({
+        senderId: input.senderId,
+        text: input.text,
+        ...(input.interactiveReplyId === undefined
+          ? {}
+          : { interactiveReplyId: input.interactiveReplyId }),
+      });
+    } catch (error) {
+      this.logger.warn(
+        `backorder offer turn failed: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+      return null;
+    }
+    if (turn === null) return null;
+    this.order?.dismiss(input.senderId);
+    const reply = applyCustomerStyle(
+      turn.kind === 'stale' ? STALE_BUTTON_FALLBACK : turn.reply,
+      this.customerStyle(input.senderId, input.text),
+    );
+    this.recordTurn(
+      input.senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return this.decision({ reply });
+  }
+
+  /**
+   * Restock backorder S8: the customer cancels, or asks about, a scheduled
+   * restock order. The service decides (it only answers with an active
+   * backorder); `null` leaves the turn to the other routes. Never throws into
+   * the turn and never calls the model.
+   */
+  private async answerBackorderRequest(input: {
+    senderId: string;
+    text: string;
+    interactiveReplyId?: string;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    let turn: Awaited<ReturnType<MinimalBackorderManageService['handle']>>;
+    try {
+      turn = await this.backorderManage!.handle({
+        senderId: input.senderId,
+        text: input.text,
+        competingOrderContext: () => this.competingOrderContext(input.senderId),
+        ...(input.interactiveReplyId === undefined
+          ? {}
+          : { interactiveReplyId: input.interactiveReplyId }),
+      });
+    } catch (error) {
+      this.logger.warn(
+        `backorder manage turn failed: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+      return null;
+    }
+    if (turn === null) return null;
+    this.order?.dismiss(input.senderId);
+    const style = this.customerStyle(input.senderId, input.text);
+    const reply = applyCustomerStyle(
+      turn.kind === 'stale' ? STALE_BUTTON_FALLBACK : turn.reply,
+      style,
+    );
+    this.recordTurn(
+      input.senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: reply },
+      ],
+      [],
+    );
+    return turn.kind === 'reply' && turn.interactive !== undefined
+      ? this.decision({
+          reply,
+          interactive: styleInteractivePrompt(turn.interactive, style),
+        })
+      : this.decision({ reply });
+  }
+
+  /**
+   * Restock backorder S8: another order or purchase is in play (a cart, a
+   * pending order summary, a delivery draft or a placed sale), so a message
+   * with only GENERIC wording («ya no quiero el pedido», «¿cómo va mi
+   * pedido?») is about that, not about the restock order. A reorder offer
+   * from the bot's latest turn counts too. Fails closed.
+   */
+  private async competingOrderContext(senderId: string): Promise<boolean> {
+    try {
+      // The bot's latest message offered a reorder: the reply is about that.
+      if (this.pendingReorder(senderId) !== null) return true;
+      if (!(await this.cartIsEmpty(senderId))) return true;
+      if (this.orderAvailable() && this.order!.offerStatus(senderId) !== null)
+        return true;
+      if (this.checkoutAvailable()) {
+        if (this.checkout!.confirmationStatus(senderId) !== null) return true;
+        if (await this.checkout!.hasDraft(senderId)) return true;
+      }
+      return (
+        this.payment !== undefined &&
+        (await this.payment.placedSale(senderId)) !== null
+      );
+    } catch {
+      return true;
+    }
+  }
+
+  /**
    * S13d: the customer accepted the options message's restock offer. The
    * existing preparation runs for the offered productId only (the RESTOCK
    * consent question follows); a closed preparation is the cautious copy.
@@ -2179,6 +2329,14 @@ export class MinimalCatalogAgentService {
     let prepared: Awaited<
       ReturnType<NonNullable<typeof this.restock>['prepare']>
     > | null = null;
+    // Restock backorder S14: the count was stated in the turn that led to
+    // the options message (this turn is only the «sí»).
+    const originTurn = this.sessionStore.read(input.senderId).at(-1);
+    const statedQuantity = statedPurchaseCount(
+      originTurn === undefined
+        ? ''
+        : (customerTexts([originTurn]).at(-1) ?? ''),
+    );
     try {
       prepared =
         (await this.restock?.prepare({
@@ -2189,6 +2347,7 @@ export class MinimalCatalogAgentService {
           ...(offer.variantId === undefined
             ? {}
             : { variantId: offer.variantId }),
+          ...(statedQuantity === undefined ? {} : { statedQuantity }),
         })) ?? null;
     } catch {
       prepared = null;
@@ -3748,12 +3907,15 @@ export class MinimalCatalogAgentService {
             }
             run.attempted = true;
             try {
+              // Restock backorder S14: the count stated in THIS turn.
+              const statedQuantity = statedPurchaseCount(context.text);
               const prepared = await restockService.prepare({
                 senderId: context.senderId,
                 inboundEvent: context.inboundEvent,
                 allowedProductIds: allowedIds,
                 productId,
                 ...(variantId === undefined ? {} : { variantId }),
+                ...(statedQuantity === undefined ? {} : { statedQuantity }),
               });
               if (prepared.kind === 'offer') {
                 run.outcome = {

@@ -79,9 +79,17 @@ const CART_CONTINUE = 'cart_continue';
 const CART_ADD_MORE = 'cart_add';
 const FULFIL_DELIVERY = 'fulfil_delivery';
 const FULFIL_PICKUP = 'fulfil_pickup';
+const BACKORDER = 'backorder';
+const BACKORDER_CANCEL = 'backorder_cancel';
+const BACKORDER_REFERENCE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Customer text a confirm button stands for (the gates' affirmative). */
 export const INTERACTIVE_CONFIRM_TEXT = 'SÍ';
+/** Restock backorder S1: what the «No, gracias» button stands for. */
+export const INTERACTIVE_BACKORDER_DECLINE_TEXT = 'No, gracias';
+/** Restock backorder S8: what the «No» button of the cancel question stands for. */
+export const INTERACTIVE_BACKORDER_KEEP_TEXT = 'No';
 /** Change intents: never an affirmative for the confirmation gates. */
 export const INTERACTIVE_ORDER_CHANGE_TEXT = 'Quiero cambiar algo';
 export const INTERACTIVE_CHECKOUT_CHANGE_TEXT = 'Quiero corregir mis datos';
@@ -108,7 +116,26 @@ export type InteractiveReplyIntent =
   /** Cart-summary buttons; the reference identifies the cart they were sent with. */
   | { kind: 'cart_continue' | 'cart_add_more'; reference: string }
   /** Retest S4: delivery-or-pickup answer, bound to the cart it was asked for. */
-  | { kind: 'fulfilment'; mode: 'delivery' | 'pickup'; reference: string };
+  | { kind: 'fulfilment'; mode: 'delivery' | 'pickup'; reference: string }
+  /**
+   * Restock backorder S1: the buttons under the estimate message; the
+   * reference is the RESTOCK decision id the offer was sent for.
+   */
+  | {
+      kind: 'backorder';
+      action: 'schedule' | 'decline';
+      reference: string;
+    }
+  /**
+   * Restock backorder S8: the cancel question's buttons (`yes` / `no`) and the
+   * pick among several backorders (`pick`); the reference is the BACKORDER id
+   * (self-contained: the answer is re-verified against the customer's list).
+   */
+  | {
+      kind: 'backorder_cancel';
+      action: 'yes' | 'no' | 'pick';
+      reference: string;
+    };
 
 /** Parse a reply id the bot issued; anything else (unknown, forged) is `null`. */
 export function parseInteractiveReplyId(
@@ -147,6 +174,32 @@ export function parseInteractiveReplyId(
             mode: head === FULFIL_PICKUP ? 'pickup' : 'delivery',
             reference: tail,
           };
+    case BACKORDER: {
+      // Tail is `<schedule|decline>:<decisionId>`; both parts are required.
+      const split = tail === null ? -1 : tail.indexOf(':');
+      if (tail === null || split <= 0) return null;
+      const action = tail.slice(0, split);
+      const reference = tail.slice(split + 1);
+      if (
+        (action !== 'schedule' && action !== 'decline') ||
+        !BACKORDER_REFERENCE.test(reference)
+      )
+        return null;
+      return { kind: 'backorder', action, reference };
+    }
+    case BACKORDER_CANCEL: {
+      // Tail is `<yes|no|pick>:<backorderId>`; both parts are required.
+      const split = tail === null ? -1 : tail.indexOf(':');
+      if (tail === null || split <= 0) return null;
+      const action = tail.slice(0, split);
+      const reference = tail.slice(split + 1);
+      if (
+        (action !== 'yes' && action !== 'no' && action !== 'pick') ||
+        !BACKORDER_REFERENCE.test(reference)
+      )
+        return null;
+      return { kind: 'backorder_cancel', action, reference };
+    }
     case PAYMENT_METHOD: {
       // Tail is `<method>:<saleId>`; both parts are required.
       const split = tail === null ? -1 : tail.indexOf(':');
@@ -182,6 +235,20 @@ export function interactiveReplyText(id: unknown, title: unknown): string {
     case 'checkout_confirm':
     case 'reorder_confirm':
       return INTERACTIVE_CONFIRM_TEXT;
+    case 'backorder':
+      // The title «Sí, apártamelo» reads as a tú imperative to the style
+      // detector, which would turn every usted customer who taps it into a
+      // tú customer: the inbound text is the neutral affirmative instead.
+      return intent.action === 'schedule'
+        ? INTERACTIVE_CONFIRM_TEXT
+        : INTERACTIVE_BACKORDER_DECLINE_TEXT;
+    case 'backorder_cancel':
+      // A yes is the neutral affirmative; a no is «No»; a pick keeps its
+      // folio title (it only selects which backorder the question is about).
+      if (intent.action === 'yes') return INTERACTIVE_CONFIRM_TEXT;
+      return intent.action === 'no'
+        ? INTERACTIVE_BACKORDER_KEEP_TEXT
+        : fallback;
     case 'order_change':
     case 'reorder_change':
       return INTERACTIVE_ORDER_CHANGE_TEXT;
@@ -271,6 +338,62 @@ export function paymentMethodButtons(
     buttons: methods.slice(0, INTERACTIVE_LIMITS.buttons).map((method) => ({
       id: `${PAYMENT_METHOD}:${method.id}:${saleId}`,
       title: method.title,
+    })),
+    prompt,
+  };
+}
+
+/**
+ * Restock backorder S8: «Sí, cancelar» / «No» under «¿Cancelo su pedido …?»,
+ * bound to the backorder. Titles are the same in usted and tú.
+ */
+export function backorderCancelButtons(
+  backorderId: string,
+  prompt: string,
+): CustomerReplyInteractive {
+  return {
+    type: 'buttons',
+    buttons: [
+      { id: `${BACKORDER_CANCEL}:yes:${backorderId}`, title: 'Sí, cancelar' },
+      {
+        id: `${BACKORDER_CANCEL}:no:${backorderId}`,
+        title: INTERACTIVE_BACKORDER_KEEP_TEXT,
+      },
+    ],
+    prompt,
+  };
+}
+
+/**
+ * Restock backorder S8: which of several active backorders to cancel. Up to
+ * three are reply buttons titled by folio; four to ten (the cap) are a list
+ * with the count and product as the row description. `null` below two.
+ */
+export function backorderCancelPick(
+  options: ReadonlyArray<{ id: string; folio: string; description: string }>,
+  prompt: string,
+): CustomerReplyInteractive | null {
+  if (options.length < 2) return null;
+  const usable = options.slice(0, INTERACTIVE_LIMITS.rows);
+  if (usable.length <= INTERACTIVE_LIMITS.buttons)
+    return {
+      type: 'buttons',
+      buttons: usable.map((option) => ({
+        id: `${BACKORDER_CANCEL}:pick:${option.id}`,
+        title: fitInteractiveText(option.folio, INTERACTIVE_LIMITS.buttonTitle),
+      })),
+      prompt,
+    };
+  return {
+    type: 'list',
+    buttonText: 'Ver pedidos',
+    rows: usable.map((option) => ({
+      id: `${BACKORDER_CANCEL}:pick:${option.id}`,
+      title: fitInteractiveText(option.folio, INTERACTIVE_LIMITS.rowTitle),
+      description: fitInteractiveText(
+        option.description,
+        INTERACTIVE_LIMITS.rowDescription,
+      ),
     })),
     prompt,
   };

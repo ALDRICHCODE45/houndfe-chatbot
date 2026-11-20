@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import type { Pool } from 'pg';
 import { WhatsappSenderModule } from '../whatsapp/whatsapp-sender.module';
+import { BackordersModule } from '../backorders/backorders.module';
 import { RestockApplicationRuntime } from './restock-application.runtime';
 import { ExpirationPreparationRuntime } from './expiration-preparation.runtime';
 import { ExpirationPostOrchestrator } from './application/expiration-post-orchestrator.service';
@@ -70,6 +71,9 @@ import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-share
     // S7: `HandoffModeService` holds the proactive notices in HUMAN mode.
     ConversationModule,
     WhatsappSenderModule,
+    // Restock backorder S1: the late-bound offer capability the estimate
+    // message arms (registered by the LLM agent module).
+    BackordersModule,
   ],
   providers: [
     RestockApplicationRuntime,

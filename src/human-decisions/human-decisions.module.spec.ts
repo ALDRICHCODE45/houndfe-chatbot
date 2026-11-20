@@ -41,6 +41,7 @@ import { PostgresRestockPostLedgerStore } from './infrastructure/postgres-restoc
 import { PostgresRestockApplicationContextStore } from './infrastructure/postgres-restock-application-context.store';
 import { PostgresSharedReservationStore } from './infrastructure/postgres-shared-reservation.store';
 import { PostgresSharedRouteMarkersStore } from './infrastructure/postgres-shared-route-markers.store';
+import { BackorderOfferRegistry } from '../backorders/domain/backorder-offer';
 import { HandoffModeService } from '../conversation/application/handoff-mode.service';
 import { ExpirationPreparationRuntime } from './expiration-preparation.runtime';
 
@@ -296,6 +297,18 @@ describe('HumanDecisionsModule binding', () => {
       expect((runtime as unknown as { handoff: unknown }).handoff).toBe(
         handoff,
       );
+    inert();
+    await moduleRef.close();
+  });
+
+  it('restock backorder S1: injects the shared offer registry into the RESTOCK runtime', async () => {
+    const moduleRef = await compile([DatabaseModule, HumanDecisionsModule]);
+    const registry = moduleRef.get(BackorderOfferRegistry, { strict: false });
+    expect(registry).toBeInstanceOf(BackorderOfferRegistry);
+    expect(
+      // SAFETY: test-only introspection of the private constructor field.
+      moduleRef.get(RestockApplicationRuntime)['offers'],
+    ).toBe(registry);
     inert();
     await moduleRef.close();
   });

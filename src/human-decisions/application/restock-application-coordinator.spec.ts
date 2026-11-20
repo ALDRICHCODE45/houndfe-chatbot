@@ -286,7 +286,7 @@ describe('application orchestration', () => {
         to: SENDER,
         text:
           action === 'PROVIDE_RESTOCK_ESTIMATE'
-            ? '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!'
+            ? '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¿Quiere que se lo apartemos en cuanto llegue? Le aviso y no paga nada hasta entonces.'
             : '¡Gracias por la espera! 😊 Por ahora el equipo no pudo confirmar un estimado de reposición para «Collar (SKU: COL-01)».',
       });
       expect(p.recordAcceptance).toHaveBeenCalledWith({
@@ -315,7 +315,7 @@ describe('application orchestration', () => {
     expect(await run()).toEqual({ action: 'ack_recorded' });
     expect(p.sendText).toHaveBeenCalledWith({
       to: SENDER,
-      text: '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 1 día para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!',
+      text: '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 1 día para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¿Quiere que se lo apartemos en cuanto llegue? Le aviso y no paga nada hasta entonces.',
     });
   });
 
@@ -1198,7 +1198,7 @@ describe('expired-only reconciliation, never a Meta send (mocked ports only)', (
 
 describe('restock notice in the stored customer style (S1)', () => {
   const USTED =
-    '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!';
+    '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¿Quiere que se lo apartemos en cuanto llegue? Le aviso y no paga nada hasta entonces.';
 
   it('a tú profile with emojis gets the tú text, emoji kept', async () => {
     const h = setup();
@@ -1214,7 +1214,7 @@ describe('restock notice in the stored customer style (S1)', () => {
     );
     expect(h.ports.sendText).toHaveBeenCalledWith({
       to: SENDER,
-      text: '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde esa confirmación. La fecha podría variar. ¡Que estés muy bien!',
+      text: '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde esa confirmación. La fecha podría variar. ¿Quieres que te lo apartemos en cuanto llegue? Te aviso y no pagas nada hasta entonces.',
     });
   });
 
@@ -1284,5 +1284,199 @@ describe('restock notice while the conversation is HUMAN (S7)', () => {
     const h = withMode(() => Promise.resolve(false));
     expect(await h.run()).toEqual({ action: 'ack_recorded' });
     expect(h.ports.sendText).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('backorder offer after the estimate (restock backorder S1)', () => {
+  const OFFER_TEXT =
+    '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde su confirmación. La fecha puede variar. ¿Quiere que se lo apartemos en cuanto llegue? Le aviso y no paga nada hasta entonces.';
+  const DECISION = ID;
+  const PRODUCT = '99999999-9999-4999-8999-999999999999';
+  const ESTIMATED_AT = '2026-06-25T12:00:00.000Z';
+  const BUTTONS = [
+    { id: `backorder:schedule:${DECISION}`, title: 'Sí, apártamelo' },
+    { id: `backorder:decline:${DECISION}`, title: 'No, gracias' },
+  ];
+
+  function withOffer(
+    action: RestockResolution['action'] = ACTIONS[0],
+    stale = false,
+  ) {
+    const h = setup(action, stale);
+    const sendInteractive = jest.fn().mockResolvedValue({
+      providerMessageId: h.f.providerReceipt.providerMessageId,
+      providerMessageIds: [h.f.providerReceipt.providerMessageId],
+    });
+    const capability = {
+      statedQuantity: jest.fn().mockResolvedValue(null),
+      arm: jest.fn().mockResolvedValue(true),
+    };
+    Object.assign(h.ports, {
+      sendInteractive,
+      backorderOffer: () => capability,
+    });
+    return { ...h, sendInteractive, capability };
+  }
+
+  it('sends the estimate with the offer and the two reply buttons, not plain text', async () => {
+    const h = withOffer();
+    expect(await h.run()).toEqual({ action: 'ack_recorded' });
+    expect(h.sendInteractive).toHaveBeenCalledTimes(1);
+    expect(h.sendInteractive).toHaveBeenCalledWith({
+      to: SENDER,
+      body: OFFER_TEXT,
+      interactive: { type: 'buttons', buttons: BUTTONS },
+      shortBody: '¿Quiere que se lo apartemos?',
+    });
+    expect(h.ports.sendText).not.toHaveBeenCalled();
+    expect(h.ports.recordAcceptance).toHaveBeenCalledWith({
+      row: h.f.started,
+      event: h.f.accepted.event,
+    });
+  });
+
+  it('falls back to the same text with the offer when sendInteractive is unavailable', async () => {
+    const h = withOffer();
+    Object.assign(h.ports, { sendInteractive: undefined });
+    expect(await h.run()).toEqual({ action: 'ack_recorded' });
+    expect(h.ports.sendText).toHaveBeenCalledWith({
+      to: SENDER,
+      text: OFFER_TEXT,
+    });
+    // The offer is still armed: the text says «sí» / «no» answers it.
+    expect(h.capability.arm).toHaveBeenCalledTimes(1);
+  });
+
+  it('arms the durable offer only after Meta accepted it, before the acceptance is recorded', async () => {
+    const h = withOffer();
+    await h.run();
+    expect(h.capability.arm).toHaveBeenCalledTimes(1);
+    expect(h.capability.arm).toHaveBeenCalledWith({
+      senderId: SENDER,
+      decisionId: DECISION,
+      productId: PRODUCT,
+      variantId: null,
+      productName: 'Collar',
+      estimatedAt: ESTIMATED_AT,
+      statedQuantity: null,
+    });
+    const order = (mock: jest.Mock) => mock.mock.invocationCallOrder[0];
+    expect(order(h.capability.arm)).toBeGreaterThan(order(h.sendInteractive));
+    expect(order(h.capability.arm)).toBeLessThan(
+      order(h.ports.recordAcceptance),
+    );
+  });
+
+  it('carries the count the customer stated when asking', async () => {
+    const h = withOffer();
+    h.capability.statedQuantity.mockResolvedValue(3);
+    await h.run();
+    expect(h.capability.statedQuantity).toHaveBeenCalledWith(
+      SENDER,
+      PRODUCT,
+      null,
+    );
+    expect(h.capability.arm).toHaveBeenCalledWith(
+      expect.objectContaining({ statedQuantity: 3 }),
+    );
+    // Read before the claim: nothing async between the final check and send.
+    expect(
+      h.capability.statedQuantity.mock.invocationCallOrder[0],
+    ).toBeLessThan(h.ports.claimPending.mock.invocationCallOrder[0]);
+  });
+
+  it('a failed quantity read still offers, with no count (the bot asks later)', async () => {
+    const h = withOffer();
+    h.capability.statedQuantity.mockRejectedValue(new Error('down'));
+    expect(await h.run()).toEqual({ action: 'ack_recorded' });
+    expect(h.capability.arm).toHaveBeenCalledWith(
+      expect.objectContaining({ statedQuantity: null }),
+    );
+  });
+
+  it.each([
+    ['rejects', () => Promise.reject(new Error('gate store down'))],
+    ['resolves false', () => Promise.resolve(false)],
+  ])(
+    'an arm that %s never breaks the ACK chain (the message already went out)',
+    async (_label, result) => {
+      const h = withOffer();
+      h.capability.arm.mockImplementation(result);
+      expect(await h.run()).toEqual({ action: 'ack_recorded' });
+      expect(h.ports.recordAcceptance).toHaveBeenCalledTimes(1);
+      expect(h.ports.recordRestockApplicationOutcome).toHaveBeenCalledTimes(1);
+      expect(h.ports.closeAcknowledged).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('works without a registered capability: same offer text, nothing armed', async () => {
+    const h = withOffer();
+    Object.assign(h.ports, { backorderOffer: () => null });
+    expect(await h.run()).toEqual({ action: 'ack_recorded' });
+    expect(h.sendInteractive).toHaveBeenCalledTimes(1);
+    expect(h.capability.arm).not.toHaveBeenCalled();
+    expect(h.capability.statedQuantity).not.toHaveBeenCalled();
+  });
+
+  it('a rejected interactive send holds: no text fallback (it could duplicate), no arm, no ACK', async () => {
+    const h = withOffer();
+    h.sendInteractive.mockRejectedValue(new Error('uncertain'));
+    expect(await h.run()).toEqual({ action: 'hold' });
+    expect(h.ports.sendText).not.toHaveBeenCalled();
+    expect(h.capability.arm).not.toHaveBeenCalled();
+    expect(h.ports.recordAcceptance).not.toHaveBeenCalled();
+    expect(h.ports.recordRestockApplicationOutcome).not.toHaveBeenCalled();
+  });
+
+  it('a rejected plain-text fallback holds without arming', async () => {
+    const h = withOffer();
+    Object.assign(h.ports, { sendInteractive: undefined });
+    h.ports.sendText.mockRejectedValue(new Error('uncertain'));
+    expect(await h.run()).toEqual({ action: 'hold' });
+    expect(h.capability.arm).not.toHaveBeenCalled();
+  });
+
+  it('the negative estimate is unchanged: plain text, no buttons, nothing read or armed', async () => {
+    const h = withOffer('REPORT_RESTOCK_ESTIMATE_UNAVAILABLE');
+    expect(await h.run()).toEqual({ action: 'ack_recorded' });
+    expect(h.ports.sendText).toHaveBeenCalledWith({
+      to: SENDER,
+      text: '¡Gracias por la espera! 😊 Por ahora el equipo no pudo confirmar un estimado de reposición para «Collar (SKU: COL-01)».',
+    });
+    expect(h.sendInteractive).not.toHaveBeenCalled();
+    expect(h.capability.statedQuantity).not.toHaveBeenCalled();
+    expect(h.capability.arm).not.toHaveBeenCalled();
+  });
+
+  it('an expired (stale) estimate sends nothing and arms nothing', async () => {
+    const h = withOffer(ACTIONS[0], true);
+    expect(await h.run()).toEqual({ action: 'ack_recorded' });
+    expect(h.sendInteractive).not.toHaveBeenCalled();
+    expect(h.ports.sendText).not.toHaveBeenCalled();
+    expect(h.capability.arm).not.toHaveBeenCalled();
+  });
+
+  it('a tú customer gets the tú offer; the button titles are the same', async () => {
+    const h = withOffer();
+    Object.assign(h.ports, {
+      customerStyle: jest
+        .fn()
+        .mockResolvedValue({ register: 'tu', emojis: true, tone: 'casual' }),
+    });
+    await h.run();
+    expect(h.sendInteractive).toHaveBeenCalledWith({
+      to: SENDER,
+      body: '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar (SKU: COL-01)», contados desde esa confirmación. La fecha podría variar. ¿Quieres que te lo apartemos en cuanto llegue? Te aviso y no pagas nada hasta entonces.',
+      interactive: { type: 'buttons', buttons: BUTTONS },
+      shortBody: '¿Quieres que te lo apartemos?',
+    });
+  });
+
+  it('a HUMAN conversation holds the offer like the estimate (no send, no arm)', async () => {
+    const h = withOffer();
+    Object.assign(h.ports, { isHumanMode: jest.fn().mockResolvedValue(true) });
+    expect(await h.run()).toEqual({ action: 'pending' });
+    expect(h.sendInteractive).not.toHaveBeenCalled();
+    expect(h.capability.arm).not.toHaveBeenCalled();
   });
 });
