@@ -27,6 +27,7 @@ import { LlmAgentModule } from './llm-agent.module';
 import { ConversationGates } from '../conversation-gates/application/conversation-gates';
 import { PostgresConversationGateStore } from '../conversation-gates/infrastructure/postgres-conversation-gate.store';
 import { BackorderOfferRegistry } from '../backorders/domain/backorder-offer';
+import { MinimalBackorderManageService } from './application/minimal-backorder-manage.service';
 import { MinimalBackorderOfferService } from './application/minimal-backorder-offer.service';
 import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.service';
 import { LLM_AGENT, type LlmAgentPort } from './domain/llm-agent.port';
@@ -355,6 +356,10 @@ describe('LlmAgentModule integration', () => {
     expect(
       moduleRef.get(BackorderOfferRegistry, { strict: false }).current(),
     ).toBe(offers);
+    // Restock backorder S8: cancel / status of a scheduled order, no gate kind.
+    expect(moduleRef.get(MinimalCatalogAgentService)['backorderManage']).toBe(
+      moduleRef.get(MinimalBackorderManageService),
+    );
     await moduleRef.close();
   });
 

@@ -100,6 +100,50 @@ describe('backorder offer gate survives a restart', () => {
     });
   });
 
+  it.each([
+    [{ mode: 'existing', customerId: '22222222-2222-4222-8222-222222222222' }],
+    [{ mode: 'createIfAbsent', firstName: 'Rosa' }],
+  ] as const)(
+    'keeps the retry stage with the first request’s count and customer %j across a restart (L11)',
+    async (customer) => {
+      const w = world();
+      const first = w.boot();
+      first.offers.arm(SENDER, OFFER);
+      first.gates.touch(SENDER);
+      first.offers.update(SENDER, {
+        stage: 'retry',
+        quantity: 3,
+        customer: { ...customer },
+      });
+      first.gates.touch(SENDER);
+      await first.gates.settle(SENDER);
+      const restarted = w.boot();
+      await restarted.gates.begin(SENDER);
+      expect(restarted.offers.read(SENDER)).toMatchObject({
+        stage: 'retry',
+        quantity: 3,
+        customer,
+        expiresAt: T0 + BACKORDER_OFFER_TTL_MS,
+      });
+    },
+  );
+
+  it('a row written before the retry stage existed (no customer) still loads', async () => {
+    const w = world();
+    await w.store.put({
+      senderId: SENDER,
+      kind: 'backorder_offer',
+      payload: { ...OFFER, stage: 'ask_quantity', quantity: null },
+      expiresAt: new Date(T0 + 60_000),
+    });
+    const restarted = w.boot();
+    await restarted.gates.begin(SENDER);
+    expect(restarted.offers.read(SENDER)).toMatchObject({
+      stage: 'ask_quantity',
+      customer: null,
+    });
+  });
+
   it('claim spends the durable row once (a second process finds nothing)', async () => {
     const w = world();
     const first = w.boot();
@@ -134,6 +178,19 @@ describe('backorder offer gate survives a restart', () => {
     { ...OFFER, statedQuantity: 0, stage: 'offer', quantity: null },
     { ...OFFER, stage: 'offer', quantity: null, extra: true },
     { decisionId: DECISION },
+    { ...OFFER, stage: 'retry', quantity: 2, customer: { mode: 'other' } },
+    {
+      ...OFFER,
+      stage: 'retry',
+      quantity: 2,
+      customer: { mode: 'existing', customerId: 'nope' },
+    },
+    {
+      ...OFFER,
+      stage: 'retry',
+      quantity: 2,
+      customer: { mode: 'createIfAbsent', firstName: 'Rosa', extra: 1 },
+    },
   ])('treats the malformed payload %j as absent and removes it', async (p) => {
     const w = world();
     await w.store.put({

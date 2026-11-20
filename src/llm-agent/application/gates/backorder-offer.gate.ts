@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { BackorderCustomerInput } from '../../../backorders/domain/backorder';
 import type { ConversationGates } from '../../../conversation-gates/application/conversation-gates';
 
 /**
@@ -11,7 +12,16 @@ export const BACKORDER_OFFER_TTL_MS = 24 * 60 * 60 * 1000;
 /** Largest unit count the bot schedules from a chat reply. */
 export const BACKORDER_QUANTITY_MAX = 999;
 
-export type BackorderOfferStage = 'offer' | 'ask_quantity' | 'ask_name';
+/**
+ * `retry`: the create request was already built and sent (it failed in a way
+ * that may be retried), so `quantity` and `customer` are frozen for the next
+ * yes: the same idempotency key must always carry the same body (L11).
+ */
+export type BackorderOfferStage =
+  | 'offer'
+  | 'ask_quantity'
+  | 'ask_name'
+  | 'retry';
 
 /** What the estimate message offered (the gate payload, without bookkeeping). */
 export interface BackorderOfferData {
@@ -31,8 +41,19 @@ export interface BackorderOfferState extends BackorderOfferData {
   readonly stage: BackorderOfferStage;
   /** The count chosen after asking; `null` until then. */
   readonly quantity: number | null;
+  /** The customer mode of the first request; `null` until one was built. */
+  readonly customer: BackorderCustomerInput | null;
   readonly expiresAt: number;
 }
+
+const customerSchema = z.discriminatedUnion('mode', [
+  z.strictObject({ mode: z.literal('existing'), customerId: z.uuid() }),
+  z.strictObject({
+    mode: z.literal('createIfAbsent'),
+    firstName: z.string().min(1).max(100),
+    lastName: z.string().min(1).max(100).optional(),
+  }),
+]);
 
 const payloadSchema = z.strictObject({
   decisionId: z.uuid(),
@@ -46,8 +67,10 @@ const payloadSchema = z.strictObject({
     .min(1)
     .max(BACKORDER_QUANTITY_MAX)
     .nullable(),
-  stage: z.enum(['offer', 'ask_quantity', 'ask_name']),
+  stage: z.enum(['offer', 'ask_quantity', 'ask_name', 'retry']),
   quantity: z.number().int().min(1).max(BACKORDER_QUANTITY_MAX).nullable(),
+  // Absent in rows written before the retry stage existed.
+  customer: customerSchema.nullable().optional(),
 });
 
 /**
@@ -77,6 +100,9 @@ export class DurableBackorderOffer {
                 statedQuantity: offer.statedQuantity,
                 stage: offer.stage,
                 quantity: offer.quantity,
+                ...(offer.customer === null
+                  ? {}
+                  : { customer: offer.customer }),
               },
               expiresAt: offer.expiresAt,
             };
@@ -93,6 +119,7 @@ export class DurableBackorderOffer {
         }
         this.offers.set(senderId, {
           ...parsed.data,
+          customer: parsed.data.customer ?? null,
           expiresAt: state.expiresAt,
         });
         return true;
@@ -106,6 +133,7 @@ export class DurableBackorderOffer {
       ...data,
       stage: 'offer',
       quantity: null,
+      customer: null,
       expiresAt: this.gates.now() + BACKORDER_OFFER_TTL_MS,
     });
   }
@@ -113,7 +141,11 @@ export class DurableBackorderOffer {
   /** Moves the live offer to its next stage; the expiry never moves. */
   update(
     senderId: string,
-    patch: { stage?: BackorderOfferStage; quantity?: number | null },
+    patch: {
+      stage?: BackorderOfferStage;
+      quantity?: number | null;
+      customer?: BackorderCustomerInput | null;
+    },
   ): void {
     const offer = this.live(senderId);
     if (offer === null) return;

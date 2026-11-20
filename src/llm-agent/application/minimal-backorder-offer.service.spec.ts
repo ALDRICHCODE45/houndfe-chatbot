@@ -83,7 +83,7 @@ function world(
       .fn<Promise<CreateBackorderResult>, [CreateBackorderInput, string]>()
       .mockResolvedValue({ created: true, backorder: created }),
     getBackorder: jest.fn().mockResolvedValue(created),
-    listBackorders: jest.fn(),
+    listBackorders: jest.fn().mockResolvedValue([]),
     cancelBackorder: jest.fn(),
   } satisfies Record<keyof BackorderClient, jest.Mock>;
   const api = {
@@ -729,7 +729,6 @@ describe('what the backend answers', () => {
       '409 SOURCE_DECISION_NOT_ESTIMATED',
       apiError(409, 'SOURCE_DECISION_NOT_ESTIMATED'),
     ],
-    ['409 IDEMPOTENCY_KEY_CONFLICT', apiError(409, 'IDEMPOTENCY_KEY_CONFLICT')],
     ['404 PRODUCT_NOT_FOUND', apiError(404, 'PRODUCT_NOT_FOUND')],
     ['422 PRICE_UNAVAILABLE', apiError(422, 'PRICE_UNAVAILABLE')],
     ['403 missing scope', apiError(403, null)],
@@ -768,5 +767,215 @@ describe('what the backend answers', () => {
       expect.stringContaining('status=422 code=PRICE_UNAVAILABLE'),
     );
     expect(JSON.stringify(warn.mock.calls)).not.toContain('do-not-log');
+  });
+});
+
+describe('L11 note 1: a retry never changes the body under the same idempotency key', () => {
+  const notFound = {
+    status: 'not_found',
+    customer: null,
+    addresses: [],
+    nextAfterAddressId: null,
+  };
+  const unique = {
+    status: 'unique',
+    customer: { customerId: CUSTOMER, firstName: 'Rosa', lastName: null },
+    addresses: [],
+    nextAfterAddressId: null,
+  };
+
+  it('a timeout after resolving a NEW customer retries with the same body even if the customer exists now', async () => {
+    const w = world({ customer: notFound, profile: { preferredName: 'Rosa' } });
+    w.client.createBackorder.mockRejectedValueOnce(
+      new UpstreamError('t', null),
+    );
+    await w.arm(2);
+    await expect(w.turn({ text: 'sí' })).resolves.toEqual({
+      kind: 'reply',
+      reply:
+        'No pude agendar su pedido en este momento. Intente de nuevo en unos minutos.',
+    });
+    // The first request may have created the customer meanwhile.
+    w.api.getCustomerCheckoutContext.mockResolvedValue(unique);
+    await expect(w.turn({ text: 'sí' })).resolves.toEqual({
+      kind: 'reply',
+      reply: SCHEDULED_REPLY,
+    });
+    const [first, second] = w.client.createBackorder.mock.calls;
+    expect(second).toEqual(first);
+    expect(first[0].customer).toEqual({
+      mode: 'createIfAbsent',
+      firstName: 'Rosa',
+    });
+    expect(w.api.getCustomerCheckoutContext).toHaveBeenCalledTimes(1);
+  });
+
+  it('a count asked after the yes is kept for the retry (it cannot change under the key)', async () => {
+    const w = world();
+    w.client.createBackorder.mockRejectedValueOnce(apiError(503, null));
+    await w.arm(null);
+    await w.turn({ text: 'sí' });
+    await w.turn({ text: '3' });
+    // The retry is a yes, not a new count.
+    await expect(w.turn({ text: 'sí' })).resolves.toMatchObject({
+      reply: SCHEDULED_REPLY,
+    });
+    const [first, second] = w.client.createBackorder.mock.calls;
+    expect(first[0].quantity).toBe(3);
+    expect(second).toEqual(first);
+  });
+
+  it('the retry state is durable: a restart replays the very same body', async () => {
+    const w = world({ customer: notFound, profile: { preferredName: 'Rosa' } });
+    w.client.createBackorder.mockRejectedValueOnce(apiError(500, null));
+    await w.arm(2);
+    await w.turn({ text: 'sí' });
+    w.api.getCustomerCheckoutContext.mockResolvedValue(unique);
+    const restarted = w.boot();
+    await w.turnOn(restarted, { text: 'sí' });
+    const [first, second] = w.client.createBackorder.mock.calls;
+    expect(second).toEqual(first);
+    await expect(w.store.get(SENDER, 'backorder_offer')).resolves.toBeNull();
+  });
+
+  it('a decline in the retry stage ends the offer', async () => {
+    const w = world();
+    w.client.createBackorder.mockRejectedValueOnce(apiError(500, null));
+    await w.arm(2);
+    await w.turn({ text: 'sí' });
+    await expect(w.turn({ text: 'no' })).resolves.toEqual({
+      kind: 'reply',
+      reply: 'Entendido. ¡Que esté muy bien!',
+    });
+    expect(w.client.createBackorder).toHaveBeenCalledTimes(1);
+  });
+
+  it('any other message in the retry stage spends the offer', async () => {
+    const w = world();
+    w.client.createBackorder.mockRejectedValueOnce(apiError(500, null));
+    await w.arm(2);
+    await w.turn({ text: 'sí' });
+    await expect(w.turn({ text: '¿y el envío?' })).resolves.toBeNull();
+    await expect(w.turn({ text: 'sí' })).resolves.toBeNull();
+    expect(w.client.createBackorder).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('L11 note 1: 409 IDEMPOTENCY_KEY_CONFLICT recovers the backorder the first attempt created', () => {
+  const conflict = () => apiError(409, 'IDEMPOTENCY_KEY_CONFLICT');
+
+  it('confirms the active backorder of this product created from this offer as scheduled', async () => {
+    const w = world();
+    w.client.createBackorder.mockRejectedValue(conflict());
+    w.client.listBackorders.mockResolvedValue([
+      backorder({ scheduledAt: new Date(T0 + 60_000).toISOString() }),
+    ]);
+    await w.arm(2);
+    await expect(w.turn({ text: 'sí' })).resolves.toEqual({
+      kind: 'reply',
+      reply: SCHEDULED_REPLY,
+    });
+    expect(w.client.listBackorders).toHaveBeenCalledWith({
+      phoneCountryCode: '52',
+      phone: '5512349901',
+      status: 'WAITING,RESERVED',
+    });
+    expect(w.client.createBackorder).toHaveBeenCalledTimes(1);
+    await expect(w.turn({ text: 'sí' })).resolves.toBeNull();
+  });
+
+  it.each([
+    ['none exists', []],
+    [
+      'another product',
+      [backorder({ productId: '77777777-7777-4777-8777-777777777777' })],
+    ],
+    ['another variant', [backorder({ variantId: VARIANT })]],
+    [
+      'one scheduled before this offer was made',
+      [backorder({ scheduledAt: new Date(T0 - 60_000).toISOString() })],
+    ],
+  ])('is still «No pude agendar» when %s', async (_label, listed) => {
+    const w = world();
+    w.client.createBackorder.mockRejectedValue(conflict());
+    w.client.listBackorders.mockResolvedValue(listed);
+    await w.arm(2);
+    await expect(w.turn({ text: 'sí' })).resolves.toEqual({
+      kind: 'reply',
+      reply: 'No pude agendar su pedido por ahora.',
+    });
+    await expect(w.turn({ text: 'sí' })).resolves.toBeNull();
+  });
+
+  it('a failing lookup keeps the offer for a retry', async () => {
+    const w = world();
+    w.client.createBackorder.mockRejectedValue(conflict());
+    w.client.listBackorders.mockRejectedValueOnce(apiError(503, null));
+    await w.arm(2);
+    await expect(w.turn({ text: 'sí' })).resolves.toEqual({
+      kind: 'reply',
+      reply:
+        'No pude agendar su pedido en este momento. Intente de nuevo en unos minutos.',
+    });
+    w.client.listBackorders.mockResolvedValue([
+      backorder({ scheduledAt: new Date(T0 + 1).toISOString() }),
+    ]);
+    await expect(w.turn({ text: 'sí' })).resolves.toMatchObject({
+      reply: SCHEDULED_REPLY,
+    });
+  });
+});
+
+describe('L11 note 2: a replayed create that is no longer active is not «quedó agendado»', () => {
+  it.each([
+    [
+      'CANCELLED',
+      'Su pedido BO-000012 ya estaba cancelado, así que no está agendado.',
+    ],
+    ['EXPIRED', 'Su pedido BO-000012 ya venció, así que no está agendado.'],
+    ['CONFIRMED', 'Su pedido BO-000012 ya está confirmado.'],
+  ] as const)('%s', async (status, reply) => {
+    const w = world();
+    w.client.createBackorder.mockResolvedValue({
+      created: false,
+      backorder: backorder({ status }),
+    });
+    await w.arm(2);
+    const result = await w.turn({ text: 'sí' });
+    expect(result).toEqual({ kind: 'reply', reply });
+    expect(JSON.stringify(result)).not.toMatch(/quedó agendado|le aviso/i);
+    // Nothing is rescheduled here: one request, offer spent.
+    expect(w.client.createBackorder).toHaveBeenCalledTimes(1);
+    await expect(w.turn({ text: 'sí' })).resolves.toBeNull();
+  });
+
+  it('RESERVED says it arrived (no «le aviso en cuanto llegue»)', async () => {
+    const w = world();
+    w.client.createBackorder.mockResolvedValue({
+      created: false,
+      backorder: backorder({
+        status: 'RESERVED',
+        reservedUntil: '2026-11-21T15:00:00.000Z',
+      }),
+    });
+    await w.arm(2);
+    await expect(w.turn({ text: 'sí' })).resolves.toEqual({
+      kind: 'reply',
+      reply:
+        '¡Ya llegó! Se lo tenemos apartado hasta el 21 de noviembre a las 9:00 a. m.',
+    });
+  });
+
+  it('a WAITING replay is still confirmed as scheduled', async () => {
+    const w = world();
+    w.client.createBackorder.mockResolvedValue({
+      created: false,
+      backorder: backorder({ status: 'WAITING' }),
+    });
+    await w.arm(2);
+    await expect(w.turn({ text: 'sí' })).resolves.toEqual({
+      kind: 'reply',
+      reply: SCHEDULED_REPLY,
+    });
   });
 });

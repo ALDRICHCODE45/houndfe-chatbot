@@ -1,11 +1,15 @@
-# Restock backorder: the offer and scheduling (T4: S1, S2, S14)
+# Restock backorder: the offer and scheduling (T4: S1, S2, S14) and cancel / status (T6: S8)
 
 After the team's RESTOCK estimate reaches the customer, the bot offers to
 schedule the order. Accepting creates a backorder in the backend
 (`POST /chatbot-api/backorders`); nothing is paid until the product arrives.
 Contract: [`contracts/restock-backorder-bot-contract.md`](contracts/restock-backorder-bot-contract.md).
 Tracker: `odd/tasks/restock-backorder.md`. The arrival notice, confirm and
-checkout (T5), the ETA slip and cancel (T6) and the feed (T8) are other tasks.
+checkout (T5), the ETA slip (T6, S7) and the feed (T8) are other tasks. The
+customer cancel and status from the chat (T6, S8) and the two verify
+follow-ups of T4 (retry body, replay status) are described in
+[§6](#6-customer-cancel-and-status-from-the-chat-t6-s8) and
+[§7](#7-retries-conflicts-and-replays-t6-follow-ups-of-the-t4-verify).
 
 ## Flow
 
@@ -63,10 +67,13 @@ Durable, one per sender, TTL 24 h (`conversation_gates`, migration
 ```json
 { "decisionId": "uuid", "productId": "uuid", "variantId": "uuid|null",
   "productName": "…", "estimatedAt": "ISO UTC", "statedQuantity": 3,
-  "stage": "offer|ask_quantity|ask_name", "quantity": null }
+  "stage": "offer|ask_quantity|ask_name|retry", "quantity": null,
+  "customer": null }
 ```
 
-`stage` / `quantity` are the bookkeeping of the multi-step answer; the
+`stage` / `quantity` / `customer` are the bookkeeping of the multi-step answer
+(`customer` is only written in the `retry` stage, see
+[§7](#7-retries-conflicts-and-replays-t6-follow-ups-of-the-t4-verify)); the
 documented offer payload is the first six fields.
 
 **Bridge.** The coordinator lives in `HumanDecisionsModule` and runs outside any
@@ -155,6 +162,139 @@ Dates are converted from UTC to America/Mexico_City; money is `$1149.00 MXN`.
 
 Failures are logged as `backorder schedule failed: status=… code=…` (never the
 body). No reply promises anything the backend did not confirm.
+
+The two rows that change in T6 (retry and replay) are in
+[§7](#7-retries-conflicts-and-replays-t6-follow-ups-of-the-t4-verify); a
+`409 IDEMPOTENCY_KEY_CONFLICT` is no longer a plain failure and a replayed `200`
+is no longer always «quedó agendado».
+
+## 6. Customer cancel and status from the chat (T6, S8)
+
+`MinimalBackorderManageService` (`src/llm-agent/application`) answers two typed
+requests about a **scheduled** restock order, deterministically (no model call;
+the only I/O is `BackorderClient.listBackorders` /
+`cancelBackorder`). It runs in `MinimalCatalogAgentService.handleTurn` right
+after the offer answer and **before** the RESTOCK question and every order
+route, because the RESTOCK question's classifier can call a model.
+
+### Trigger (conservative)
+
+`classifyBackorderRequest` (`domain/backorder-requests.ts`) reads the whole
+message (accent-free, ≤ 140 chars). A message is ours only when **all** of:
+
+1. It reads as a **cancel** (`cancela`, `anula`, `ya no quiero/necesito …`) or a
+   **status** request (`¿cómo va…`, `¿ya llegó…`, `¿cuándo llega…`, `estatus`,
+   `¿qué pasó con…`) about an order, **and**
+2. the sender is a Mexican WhatsApp number and has an **active** backorder
+   (`GET /chatbot-api/backorders?phoneCountryCode&phone&status=WAITING,RESERVED`;
+   no active one → `null`, the existing flows answer exactly as before), **and**
+3. the wording is **explicit**, or nothing else is in play:
+
+| Wording | Examples | Needs |
+| --- | --- | --- |
+| explicit | «por reposición», «lo que aparté / agendé / me apartaron», «pedido apartado / agendado / programado», «lo apartado», a `BO-000012` folio; «ver mi pedido por reposición» | an active backorder |
+| generic | «ya no quiero el pedido», «cancela mi pedido», «¿cómo va mi pedido?», «¿ya llegó mi pedido?» | an active backorder **and** `competingOrderContext() === false` |
+
+`competingOrderContext` (agent) is true when there is a non-empty **cart**, a
+pending **reorder offer** (the bot's latest turn carries one), a pending **order summary**, a pending delivery-data **confirmation** or
+**draft**, or a **placed sale** (paid or not). If the check throws it is
+treated as true (fails closed). So the generic wording only reaches the backorder
+when it is the customer's only order; with an unpaid placed sale the existing
+sale path keeps «¿cómo va mi pedido?» unless the text names the restock/apartado
+order.
+
+Never a request: a bare `cancela` / `sí` / `no` (the confirmation gates own
+them), cart removal (`quita…`, `elimina…`), a product the customer no longer
+wants («ya no quiero las croquetas»), a negation («no quiero cancelar»), a
+question about generic cancel wording («¿se puede cancelar mi pedido?»), a
+previous order («pedido anterior», «la vez pasada»), a bare «ver mi pedido»
+(the order summary). A message that is no request never reaches the backend.
+
+**Why it cannot steal the other flows.** The first test is a regex over the
+message (no I/O); the other flows' triggers (`isOrderSummaryRequest`,
+`isPaymentQuestion`, cart verbs, bare yes/no) are all either excluded by it or
+need the backorder to be named. Generic wording is handed back whenever a cart,
+summary, draft or placed sale exists, which is exactly when those flows own the
+message. The remaining exposure is documented in the risks of the T6 report: a
+customer whose only order in this conversation is the backorder, who asks
+«¿cómo va mi pedido?» about an older delivered order the conversation does not
+know about.
+
+### Cancel
+
+```
+«cancela lo que aparté» ─▶ list active ─┬─ 1 ─▶ «¿Cancelo su pedido BO-000012 de 2 × Croquetas…?»  [Sí, cancelar] [No]
+                                        └─ n ─▶ «Tiene varios pedidos por reposición. ¿Cuál desea cancelar?» + folios
+                                                 (≤ 3 reply buttons titled by folio, 4-10 a list; a typed folio also picks)
+tap / «sí» ─▶ POST /chatbot-api/backorders/:id/cancel
+```
+
+| Backend | Reply |
+| --- | --- |
+| 200 | «Listo, cancelé su pedido {folio}.» |
+| 409 `BACKORDER_NOT_CANCELLABLE` `{status: CANCELLED}` (a retried cancel) | the same success |
+| 409 … `{status: EXPIRED}` | «Su pedido {folio} ya venció, así que no hay nada que cancelar.» |
+| 409 … `{status: CONFIRMED}` | «Su pedido {folio} ya está confirmado, así que ya no puedo cancelarlo desde aquí.» |
+| anything else (5xx, 404, timeout, 409 without status) | «No pude cancelarlo por ahora.» |
+| [No] / «no» / «mejor no» | «Entendido, su pedido {folio} sigue agendado.» |
+
+State of the question (**no new gate kind, no migration**): the confirm/pick
+question is process-local with a 5-minute expiry. A tapped button carries the
+backorder id (`backorder_cancel:<yes|no|pick>:<backorderId>`) and is
+re-verified against the customer's own active list, so it works after a restart
+and a button of a backorder that is no longer active is the generic stale reply
+(nothing is cancelled). A *typed* yes/pick after a restart is lost (it falls to
+the normal turn, never cancels). Any other message or button spends the
+question; a typed yes is only the closed confirmation lexicon (`sí`, `ok`,
+`cancela`, …), «sí, pero cambia la cantidad» never cancels. A double yes cancels
+once.
+
+If the list cannot be read: explicit wording answers «No pude cancelarlo por
+ahora» (status: «No pude consultar su pedido por ahora»); generic wording is left
+to the other flows. A shared phone (`CUSTOMER_PHONE_AMBIGUOUS`) is never guessed.
+
+### Status
+
+| State | Reply |
+| --- | --- |
+| WAITING, estimate in the future | «Su pedido {folio} sigue en espera; llega aprox. el {26 de noviembre}. Le aviso en cuanto llegue.» |
+| WAITING, estimate in the past | «Su pedido {folio} sigue en espera; estamos confirmando la fecha con el equipo. Le aviso en cuanto llegue.» |
+| RESERVED | «¡Ya llegó! Se lo tenemos apartado hasta el {21 de noviembre a las 9:00 a. m.}» (no checkout offer: T5 owns it; past or unknown deadline → «…Estamos confirmando con el equipo hasta cuándo se lo tenemos apartado.») |
+| several | «Tiene varios pedidos por reposición:» and one line each, folio named (max 5) |
+
+All dates and times are converted from UTC to America/Mexico_City. The tú
+variants are curated pairs in `customer-style.ts`; button titles are the same in
+both registers.
+
+## 7. Retries, conflicts and replays (T6, follow-ups of the T4 verify)
+
+**One request body per idempotency key.** The key is
+`backorder:<decisionId>:<senderId>`, so the body must never change under it.
+When the request was built and failed in a retryable way (5xx, 429, timeout,
+`IDEMPOTENCY_KEY_IN_FLIGHT`) the offer is put back in the new stage `retry`
+with the **count** and the **customer mode** it carried (`existing` +
+`customerId`, or `createIfAbsent` + `firstName`). The next yes replays exactly
+that body: no new customer lookup (the customer may exist by now) and no new
+count question. The two fields ride the same durable `backorder_offer` payload
+(optional `customer`, stage `retry`), so they survive a restart; no migration:
+only the `gate_kind` CHECK is closed, not the payload.
+
+**`409 IDEMPOTENCY_KEY_CONFLICT`** (older rows, or any earlier attempt that
+built a different body): it means a backorder was already created under the key.
+The bot lists the customer's `WAITING,RESERVED` backorders and, if one exists
+for this product/variant that was scheduled **after the offer was armed**
+(`backorder.scheduledAt ≥ expiresAt − 24 h`), confirms it as scheduled. The list
+has no `sourceDecisionId`, so that is the closest proof of «created from this
+offer». Otherwise the answer is «No pude agendar su pedido por ahora.» (the
+offer is spent; nothing is rescheduled). A lookup that fails keeps the offer for
+a retry.
+
+**Replay status.** A `200` replay (or a recovered backorder) is worded by its
+status: `WAITING` → the usual «quedó agendado» confirmation; `RESERVED` → the
+status reply above; `CANCELLED` → «Su pedido {folio} ya estaba cancelado, así
+que no está agendado.»; `EXPIRED` → «Su pedido {folio} ya venció, así que no
+está agendado.»; `CONFIRMED` → «Su pedido {folio} ya está confirmado.» A
+cancelled or expired backorder is **never** rescheduled automatically here.
 
 ## Deploy notes
 

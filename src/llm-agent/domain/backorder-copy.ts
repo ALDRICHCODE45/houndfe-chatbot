@@ -108,3 +108,178 @@ export function backorderDuplicateReply(
     ? 'Ya tiene agendado ese producto. Le aviso en cuanto llegue.'
     : `Ya tiene agendado su pedido ${backorder.folio} de ${label(backorder)}. Le aviso en cuanto llegue.`;
 }
+
+// --- T6: replay of a decision whose backorder is no longer active ---------
+
+/** «el 21 de noviembre a las 9:00 a. m.» in Mexico City time. */
+export function backorderDateTime(iso: string, now: Date): string | null {
+  const day = backorderDate(iso, now);
+  const at = new Date(iso);
+  if (day === null || Number.isNaN(at.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: BACKORDER_TIME_ZONE,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).formatToParts(at);
+  const part = (type: string) =>
+    parts.find((candidate) => candidate.type === type)?.value ?? '';
+  const period = part('dayPeriod').toUpperCase() === 'PM' ? 'p. m.' : 'a. m.';
+  return `el ${day} a las ${part('hour')}:${part('minute')} ${period}`;
+}
+
+/** The backorder states that still wait for the customer or for stock. */
+export const isActiveBackorder = (backorder: Pick<BackorderBot, 'status'>) =>
+  backorder.status === 'WAITING' || backorder.status === 'RESERVED';
+
+/**
+ * L11 note 2: a replayed create (200) can answer a backorder that is no
+ * longer active. «Quedó agendado» would be false, so the reply states what
+ * the backend says. Nothing is rescheduled here.
+ */
+export function backorderInactiveReply(
+  backorder: Pick<BackorderBot, 'folio' | 'status'>,
+): string {
+  switch (backorder.status) {
+    case 'CANCELLED':
+      return `Su pedido ${backorder.folio} ya estaba cancelado, así que no está agendado.`;
+    case 'EXPIRED':
+      return `Su pedido ${backorder.folio} ya venció, así que no está agendado.`;
+    case 'CONFIRMED':
+      return `Su pedido ${backorder.folio} ya está confirmado.`;
+    default:
+      return BACKORDER_FAILED_REPLY;
+  }
+}
+
+// --- T6 / S8: customer cancel and status from the chat ---------------------
+
+export const BACKORDER_CANCEL_FAILED_REPLY = 'No pude cancelarlo por ahora.';
+export const BACKORDER_STATUS_FAILED_REPLY =
+  'No pude consultar su pedido por ahora.';
+/** Short body of the pick list when the full text exceeds Meta's limit. */
+export const BACKORDER_CANCEL_PICK_PROMPT = '¿Cuál pedido desea cancelar?';
+export const BACKORDER_CANCEL_YES_TITLE = 'Sí, cancelar';
+export const BACKORDER_CANCEL_NO_TITLE = 'No';
+
+type Labelled = Pick<
+  BackorderBot,
+  'folio' | 'quantity' | 'productName' | 'variantName'
+>;
+
+/** S8: asked once, naming the backorder. */
+export function backorderCancelQuestion(backorder: Labelled): string {
+  return `¿Cancelo su pedido ${backorder.folio} de ${backorder.quantity} × ${label(backorder)}?`;
+}
+
+/** Short body of the confirm buttons when the question is too long. */
+export function backorderCancelPrompt(backorder: Pick<Labelled, 'folio'>) {
+  return `¿Cancelo su pedido ${backorder.folio}?`;
+}
+
+export function backorderCancelledReply(
+  backorder: Pick<BackorderBot, 'folio'>,
+): string {
+  return `Listo, cancelé su pedido ${backorder.folio}.`;
+}
+
+export function backorderCancelKeptReply(
+  backorder: Pick<BackorderBot, 'folio'>,
+): string {
+  return `Entendido, su pedido ${backorder.folio} sigue agendado.`;
+}
+
+/** 409 BACKORDER_NOT_CANCELLABLE for a state that is not CANCELLED. */
+export function backorderNotCancellableReply(
+  backorder: Pick<BackorderBot, 'folio'>,
+  status: string | null,
+): string {
+  if (status === 'EXPIRED')
+    return `Su pedido ${backorder.folio} ya venció, así que no hay nada que cancelar.`;
+  if (status === 'CONFIRMED')
+    return `Su pedido ${backorder.folio} ya está confirmado, así que ya no puedo cancelarlo desde aquí.`;
+  return BACKORDER_CANCEL_FAILED_REPLY;
+}
+
+/** Several active backorders: the text lists them, the buttons/rows pick. */
+export function backorderCancelPickReply(
+  backorders: readonly Labelled[],
+): string {
+  return [
+    'Tiene varios pedidos por reposición. ¿Cuál desea cancelar?',
+    ...backorders.map(
+      (backorder) =>
+        `• ${backorder.folio}: ${backorder.quantity} × ${label(backorder)}`,
+    ),
+  ].join('\n');
+}
+
+const waitingLine = (
+  backorder: Pick<BackorderBot, 'folio' | 'estimatedAt'>,
+  now: Date,
+): string => {
+  const date =
+    Date.parse(backorder.estimatedAt) > now.getTime()
+      ? backorderDate(backorder.estimatedAt, now)
+      : null;
+  return date === null
+    ? `Su pedido ${backorder.folio} sigue en espera; estamos confirmando la fecha con el equipo. Le aviso en cuanto llegue.`
+    : `Su pedido ${backorder.folio} sigue en espera; llega aprox. el ${date}. Le aviso en cuanto llegue.`;
+};
+
+/** «a. m.» already ends with its period: never «a. m..». */
+const endSentence = (text: string): string =>
+  text.endsWith('.') ? text : `${text}.`;
+
+const reservedWhen = (
+  backorder: Pick<BackorderBot, 'reservedUntil'>,
+  now: Date,
+): string | null =>
+  backorder.reservedUntil !== null &&
+  Date.parse(backorder.reservedUntil) > now.getTime()
+    ? backorderDateTime(backorder.reservedUntil, now)
+    : null;
+
+/**
+ * S8 status of ONE active backorder. T5 owns the arrival notice and the
+ * confirm checkout, so a RESERVED answer only says it is set aside.
+ */
+export function backorderStatusReply(
+  backorder: Pick<
+    BackorderBot,
+    'folio' | 'status' | 'estimatedAt' | 'reservedUntil'
+  >,
+  now: Date,
+): string {
+  if (backorder.status === 'RESERVED') {
+    const when = reservedWhen(backorder, now);
+    return when === null
+      ? '¡Ya llegó! Estamos confirmando con el equipo hasta cuándo se lo tenemos apartado.'
+      : `¡Ya llegó! Se lo tenemos apartado hasta ${endSentence(when)}`;
+  }
+  return waitingLine(backorder, now);
+}
+
+/** S8 status of several active backorders, one line each (folio named). */
+export function backorderStatusListReply(
+  backorders: readonly Pick<
+    BackorderBot,
+    'folio' | 'status' | 'estimatedAt' | 'reservedUntil'
+  >[],
+  now: Date,
+): string {
+  const shown = backorders.slice(0, 5);
+  const lines = shown.map((backorder) => {
+    if (backorder.status !== 'RESERVED') return waitingLine(backorder, now);
+    const when = reservedWhen(backorder, now);
+    return when === null
+      ? `Su pedido ${backorder.folio} ya llegó; estamos confirmando con el equipo hasta cuándo se lo tenemos apartado.`
+      : `Su pedido ${backorder.folio} ya llegó y se lo tenemos apartado hasta ${endSentence(when)}`;
+  });
+  const more = backorders.length - shown.length;
+  return [
+    'Tiene varios pedidos por reposición:',
+    ...lines,
+    ...(more > 0 ? [`Y ${more} más.`] : []),
+  ].join('\n');
+}

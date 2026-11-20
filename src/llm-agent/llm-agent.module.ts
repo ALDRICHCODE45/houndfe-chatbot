@@ -60,6 +60,7 @@ import { HumanRequestsServicesModule } from '../human-requests/human-requests.mo
 import { MinimalExpirationRequestService } from './application/minimal-expiration-request.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
 import { BackorderGates } from './application/gates/backorder.gates';
+import { MinimalBackorderManageService } from './application/minimal-backorder-manage.service';
 import { MinimalBackorderOfferService } from './application/minimal-backorder-offer.service';
 import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
 import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
@@ -271,6 +272,15 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
         registry.register(service);
         return service;
       },
+    },
+    {
+      // Restock backorder S8 (T6): cancel / status of a scheduled restock
+      // order from the chat. Deterministic; its cancel question is
+      // process-local with a short expiry, so it adds no gate kind.
+      provide: MinimalBackorderManageService,
+      inject: [BACKORDER_CLIENT],
+      useFactory: (backorders: BackorderClient) =>
+        new MinimalBackorderManageService({ backorders }),
     },
     {
       // WU-B: the RESTOCK confirmation gate. Human decisions are always on,

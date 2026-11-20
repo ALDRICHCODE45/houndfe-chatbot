@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import {
   BACKORDER_ERROR,
   backorderIdempotencyKey,
+  type BackorderBot,
   type BackorderClient,
   type BackorderCustomerInput,
 } from '../../backorders/domain/backorder';
@@ -22,13 +23,17 @@ import {
   BACKORDER_RETRY_REPLY,
   backorderAvailableNowReply,
   backorderDuplicateReply,
+  backorderInactiveReply,
   backorderScheduledReply,
+  backorderStatusReply,
+  isActiveBackorder,
 } from '../domain/backorder-copy';
 import { classifyConfirmationReply } from '../domain/confirmation-reply';
 import { parseInteractiveReplyId } from '../domain/customer-reply';
 import { statedUnitCount } from '../domain/minimal-cart-request';
 import { BackorderGates } from './gates/backorder.gates';
 import {
+  BACKORDER_OFFER_TTL_MS,
   BACKORDER_QUANTITY_MAX,
   type BackorderOfferState,
 } from './gates/backorder-offer.gate';
@@ -230,6 +235,13 @@ export class MinimalBackorderOfferService implements BackorderOfferCapability {
           return this.spend(senderId, offer);
         return this.schedule(senderId, offer, offer.quantity, name);
       }
+      case 'retry':
+        // The request was already built: a yes replays it unchanged.
+        return verdict === 'accept' &&
+          offer.quantity !== null &&
+          offer.customer !== null
+          ? this.schedule(senderId, offer, offer.quantity, null)
+          : this.spend(senderId, offer);
     }
   }
 
@@ -286,7 +298,12 @@ export class MinimalBackorderOfferService implements BackorderOfferCapability {
     if (!(await this.claim(senderId, offer))) return null;
     const phone = parseMexicanWhatsAppPhone(senderId);
     if (phone === null) return this.reply(BACKORDER_FAILED_REPLY);
-    const resolved = await this.resolveCustomer(senderId, phone, name);
+    // A retry replays the first request's customer: the same idempotency key
+    // must never carry a different body (the customer may exist by now).
+    const resolved: Resolved =
+      offer.stage === 'retry' && offer.customer !== null
+        ? { kind: 'customer', customer: offer.customer }
+        : await this.resolveCustomer(senderId, phone, name);
     if (resolved.kind === 'name_required') {
       this.rearm(senderId, { ...offer, stage: 'ask_name', quantity });
       return this.reply(BACKORDER_ASK_NAME_REPLY);
@@ -301,7 +318,13 @@ export class MinimalBackorderOfferService implements BackorderOfferCapability {
       customer: resolved.customer,
     });
     if (outcome.kind === 'retry') {
-      this.rearm(senderId, offer);
+      // Keep exactly what was sent: the next yes replays this body.
+      this.rearm(senderId, {
+        ...offer,
+        stage: 'retry',
+        quantity,
+        customer: resolved.customer,
+      });
       return this.reply(BACKORDER_RETRY_REPLY);
     }
     if (outcome.kind === 'failed') return this.reply(BACKORDER_FAILED_REPLY);
@@ -398,18 +421,64 @@ export class MinimalBackorderOfferService implements BackorderOfferCapability {
         },
         backorderIdempotencyKey(offer.decisionId, senderId),
       );
-      return {
-        kind: 'done',
-        reply: backorderScheduledReply(backorder, new Date(this.clock())),
-      };
+      return { kind: 'done', reply: this.stateReply(backorder) };
     } catch (error) {
-      return this.failed(error, offer);
+      return this.failed(error, offer, who);
     }
+  }
+
+  /**
+   * L11 note 2: a replay (200) can answer a backorder that is not active any
+   * more; «quedó agendado» is only said for a WAITING one.
+   */
+  private stateReply(backorder: BackorderBot): string {
+    const now = new Date(this.clock());
+    if (backorder.status === 'WAITING')
+      return backorderScheduledReply(backorder, now);
+    return backorder.status === 'RESERVED'
+      ? backorderStatusReply(backorder, now)
+      : backorderInactiveReply(backorder);
+  }
+
+  /**
+   * L11 note 1: the same key with a different body means an earlier attempt
+   * already created the backorder. When the customer's active list holds one
+   * for this product/variant created after this offer was armed, it is the
+   * one: confirm it. Otherwise it is an honest failure (never a reschedule).
+   */
+  private async recoverScheduled(
+    offer: BackorderOfferState,
+    who: { phoneCountryCode: string; phone: string },
+  ): Promise<Outcome> {
+    let active: BackorderBot[];
+    try {
+      active = (
+        await this.deps.backorders.listBackorders({
+          phoneCountryCode: who.phoneCountryCode,
+          phone: who.phone,
+          status: 'WAITING,RESERVED',
+        })
+      ).filter(isActiveBackorder);
+    } catch (error) {
+      this.logFailure('conflict lookup', error);
+      return { kind: 'retry' };
+    }
+    const armedAt = offer.expiresAt - BACKORDER_OFFER_TTL_MS;
+    const found = active.find(
+      (backorder) =>
+        backorder.productId === offer.productId &&
+        (backorder.variantId ?? null) === (offer.variantId ?? null) &&
+        Date.parse(backorder.scheduledAt) >= armedAt,
+    );
+    return found === undefined
+      ? { kind: 'failed' }
+      : { kind: 'done', reply: this.stateReply(found) };
   }
 
   private async failed(
     error: unknown,
     offer: BackorderOfferState,
+    who: { phoneCountryCode: string; phone: string },
   ): Promise<Outcome> {
     this.logFailure('schedule', error);
     if (!(error instanceof ChatbotApiError)) return { kind: 'failed' };
@@ -421,6 +490,8 @@ export class MinimalBackorderOfferService implements BackorderOfferCapability {
       };
     if (status === 409 && code === BACKORDER_ERROR.BACKORDER_DUPLICATE)
       return { kind: 'done', reply: await this.duplicateReply(error) };
+    if (status === 409 && code === BACKORDER_ERROR.IDEMPOTENCY_KEY_CONFLICT)
+      return this.recoverScheduled(offer, who);
     const retryable =
       status === null ||
       status === 429 ||

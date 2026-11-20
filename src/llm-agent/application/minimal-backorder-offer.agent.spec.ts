@@ -12,6 +12,7 @@ import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
 import { CostGuardService } from './cost-guard.service';
 import { BackorderGates } from './gates/backorder.gates';
+import { MinimalBackorderManageService } from './minimal-backorder-manage.service';
 import { MinimalBackorderOfferService } from './minimal-backorder-offer.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
 
@@ -73,8 +74,8 @@ function world() {
   const backorders = {
     createBackorder,
     getBackorder: jest.fn(),
-    listBackorders: jest.fn(),
-    cancelBackorder: jest.fn(),
+    listBackorders: jest.fn(() => Promise.resolve([backorder(2)])),
+    cancelBackorder: jest.fn(() => Promise.resolve(backorder(2))),
   } as unknown as BackorderClient;
   const api = {
     getCustomerCheckoutContext: jest.fn(() =>
@@ -133,6 +134,7 @@ function world() {
       undefined,
       undefined,
       service,
+      new MinimalBackorderManageService({ backorders, clock: () => T0 }),
     );
     return { agent, service, gates };
   };
@@ -141,6 +143,7 @@ function world() {
     ...first,
     boot,
     createBackorder,
+    backorders,
     modelCalls: () => seen.length,
     say: (
       p: ReturnType<typeof boot>,
@@ -265,5 +268,42 @@ describe('the offer after the RESTOCK estimate, through the customer turn', () =
     ]);
     expect(w.createBackorder).toHaveBeenCalledTimes(1);
     expect([a, b].filter((d) => d.kind === 'handled')).toHaveLength(2);
+  });
+});
+
+describe('the offer and the S8 cancel share the turn', () => {
+  it('a cancel request spends a live offer; the next yes cancels, it never schedules', async () => {
+    const w = world();
+    await w.service.arm(OFFER);
+    const asked = await w.say(w, 'cancela mi pedido por reposición');
+    expect(asked).toMatchObject({
+      kind: 'handled',
+      reply: '¿Cancelo su pedido BO-000012 de 2 × Croquetas Adulto 18 kg?',
+    });
+    await expect(w.say(w, 'sí')).resolves.toMatchObject({
+      reply: 'Listo, cancelé su pedido BO-000012.',
+    });
+    expect(w.createBackorder).not.toHaveBeenCalled();
+    expect(w.modelCalls()).toBe(0);
+  });
+
+  it('a tapped offer button is still the offer’s, not the cancel flow’s', async () => {
+    const w = world();
+    await w.service.arm(OFFER);
+    await expect(w.say(w, 'SÍ', SCHEDULE)).resolves.toEqual({
+      kind: 'handled',
+      reply: scheduled(2),
+    });
+    expect(w.backorders.cancelBackorder).not.toHaveBeenCalled();
+  });
+
+  it('with a live offer a bare yes still answers the offer (not a cancel)', async () => {
+    const w = world();
+    await w.service.arm(OFFER);
+    await expect(w.say(w, 'sí')).resolves.toEqual({
+      kind: 'handled',
+      reply: scheduled(2),
+    });
+    expect(w.backorders.listBackorders).not.toHaveBeenCalled();
   });
 });

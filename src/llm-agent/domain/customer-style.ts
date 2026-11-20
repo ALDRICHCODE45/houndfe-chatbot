@@ -360,6 +360,15 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     '¿Cuántas piezas te agrego al carrito?',
   ],
   ['Ya tiene agendado', 'Ya tienes agendado'],
+  // Restock backorder S8 (T6): cancel question, status lines, several orders.
+  [
+    'Tiene varios pedidos por reposición',
+    'Tienes varios pedidos por reposición',
+  ],
+  ['¿Cuál pedido desea cancelar?', '¿Cuál pedido quieres cancelar?'],
+  ['¿Cuál desea cancelar?', '¿Cuál quieres cancelar?'],
+  ['Se lo tenemos apartado', 'Te lo tenemos apartado'],
+  ['se lo tenemos apartado', 'te lo tenemos apartado'],
   ['Le aviso en cuanto llegue', 'Te aviso en cuanto llegue'],
   ['no paga nada hasta entonces', 'no pagas nada hasta entonces'],
   ['La fecha puede variar.', 'La fecha podría variar.'],
