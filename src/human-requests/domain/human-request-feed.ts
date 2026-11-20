@@ -1,7 +1,8 @@
-import type {
-  DeliveryOutcome,
-  DeliveryOutcomeInput,
-  FeedItem,
+import {
+  isBackorderItem,
+  type DeliveryOutcome,
+  type DeliveryOutcomeInput,
+  type FeedItem,
 } from '../../chatbot-api/domain/dtos/human-requests.dto';
 import {
   applyCustomerStyle,
@@ -459,9 +460,23 @@ export function ackBodyFor(row: DeliveryRow): DeliveryOutcomeInput | null {
           };
     case 'DEFERRED_WINDOW_CLOSED':
     case 'DEFERRED_HUMAN_SESSION':
+      // Backorder items are never deferred (the backend answers 422
+      // OUTCOME_NOT_ALLOWED): a safety net, the delivery service never
+      // plans a deferral for them. STALE is the only safe answer.
+      if (isBackorderItem(row.item))
+        return {
+          outcome: 'STALE',
+          attemptId,
+          ...(attemptedAt === undefined ? {} : { attemptedAt }),
+        };
       return attemptedAt === undefined
         ? null
         : { outcome: row.ackOutcome, attemptId, attemptedAt };
+    case 'PROVIDER_REJECTED':
+      // The ledger cannot store the `reason` (no column; the migration CHECK
+      // does not know the outcome), so no row ever owes it yet. Null =
+      // invalid body, never a made-up reason. T5 adds the storage.
+      return null;
     case 'STALE':
       return {
         outcome: 'STALE',

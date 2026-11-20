@@ -553,6 +553,53 @@ export type SalePickupItem =
 export const isSalePickupItem = (item: FeedItem): item is SalePickupItem =>
   item.type !== 'unknown' && isSalePickupType(item.type);
 
+/** Restock backorder (backend T2, docs/contracts/restock-backorder-bot-contract.md,
+ *  "Feed envelope"): every feed type of the `backorder.` family. Items carry
+ *  `requestId: null` and NO `saleId`; the backorder id is inside the payload.
+ *  Types the bot does not handle yet (`backorder.future` included) still
+ *  parse, so a strict parser never rejects a page and stalls the feed. */
+export const BACKORDER_TYPE_PREFIX = 'backorder.';
+export const isBackorderType = (type: string): boolean =>
+  type.startsWith(BACKORDER_TYPE_PREFIX) &&
+  type.length > BACKORDER_TYPE_PREFIX.length;
+
+/** The payload members every backorder item carries, read loosely (a
+ *  missing or mistyped one is `null`); every member, those too and the
+ *  per-type ones, stays in `raw` so new optional members never break. */
+export interface BackorderFeedPayload {
+  backorderId: string;
+  folio: string | null;
+  productName: string | null;
+  variantName: string | null;
+  quantity: number | null;
+  branchName: string | null;
+  customerFirstName: string | null;
+  version: number | null;
+  /** The whole payload as received (type-specific members live here). */
+  raw: Record<string, unknown>;
+}
+
+export interface BackorderFeedItem {
+  type: `backorder.${string}`;
+  cursor: string;
+  deliveryId: string;
+  /** Always `null`: a backorder item belongs to no request. */
+  requestId: null;
+  /** The customer's mirrored chat, `null` when none or several (then the
+   *  customer is resolved through `GET /chatbot-api/backorders/:id`).
+   *  Carries the customer's phone: never log it unmasked. */
+  conversationRef: string | null;
+  notBefore: string | null;
+  expiresAt: string | null;
+  /** Never deferred: the backend answers 422 to a DEFERRED_* outcome. */
+  deferredReason?: never;
+  payload: BackorderFeedPayload;
+}
+
+/** True for the typed backorder items. */
+export const isBackorderItem = (item: FeedItem): item is BackorderFeedItem =>
+  item.type !== 'unknown' && isBackorderType(item.type);
+
 /** A type this bot does not know (or a malformed known one): ACK or skip
  *  it by `deliveryId`, never crash. */
 export interface UnknownFeedItem {
@@ -571,6 +618,7 @@ export type FeedItem =
   | LiveConversationItem
   | ScheduledConversationItem
   | SalePickupItem
+  | BackorderFeedItem
   | UnknownFeedItem;
 
 export type ReadFeedResult =
@@ -604,7 +652,17 @@ export type DeliveryOutcomeInput =
       attemptId: string;
       attemptedAt: string;
     }
-  | { outcome: 'STALE'; attemptId: string; attemptedAt?: string };
+  | { outcome: 'STALE'; attemptId: string; attemptedAt?: string }
+  /** Restock backorder S15: terminal, `backorder.*` items only (`422
+   *  OUTCOME_NOT_ALLOWED` on any other). `reason` 1-280 characters (e.g.
+   *  TEMPLATE_NOT_APPROVED, UNREACHABLE), never a providerMessageId. On
+   *  backorder.reserved / reservation_reminder the backend alerts staff. */
+  | {
+      outcome: 'PROVIDER_REJECTED';
+      attemptId: string;
+      attemptedAt: string;
+      reason: string;
+    };
 
 export type DeliveryOutcome = DeliveryOutcomeInput['outcome'];
 
@@ -744,7 +802,13 @@ const OUTCOME_KEYS: Record<
     optional: [],
   },
   STALE: { required: ['attemptId', 'outcome'], optional: ['attemptedAt'] },
+  PROVIDER_REJECTED: {
+    required: ['attemptId', 'outcome', 'attemptedAt', 'reason'],
+    optional: [],
+  },
 };
+
+export const PROVIDER_REJECTED_REASON_MAX_LENGTH = 280;
 
 /** Exact outcome body for the wire, or null when it breaks the contract. */
 export function normalizeDeliveryOutcome(
@@ -772,6 +836,16 @@ export function normalizeDeliveryOutcome(
     if (!isCanonicalUtcMs(input.attemptedAt)) return null;
   if ('providerMessageId' in input && input.providerMessageId !== undefined)
     if (!isProviderMessageId(input.providerMessageId)) return null;
+  if (input.outcome === 'PROVIDER_REJECTED') {
+    const { reason } = input;
+    if (
+      typeof reason !== 'string' ||
+      reason.length < 1 ||
+      reason.length > PROVIDER_REJECTED_REASON_MAX_LENGTH ||
+      reason.trim() === ''
+    )
+      return null;
+  }
   const body: Record<string, unknown> = {};
   for (const key of present) body[key] = input[key];
   return body as DeliveryOutcomeInput;
@@ -1111,6 +1185,18 @@ export function parseFeedItem(item: unknown): FeedItem | null {
   if (isSalePickupType(item.type))
     return (
       parseSalePickupItem(item, item.cursor, item.deliveryId) ?? {
+        type: 'unknown',
+        rawType: item.type,
+        cursor: item.cursor,
+        deliveryId: item.deliveryId,
+        raw: item,
+      }
+    );
+  // Restock backorder: a malformed backorder item is ACKed STALE as unknown
+  // too; an unknown future backorder.* type still parses as a typed item.
+  if (isBackorderType(item.type))
+    return (
+      parseBackorderItem(item, item.cursor, item.deliveryId) ?? {
         type: 'unknown',
         rawType: item.type,
         cursor: item.cursor,
@@ -1602,6 +1688,52 @@ function parseSalePickupItem(
       },
     };
   return null;
+}
+
+/** `backorder.*` (restock backorder T2): needs `requestId` null (or absent),
+ *  a record payload naming its `backorderId`, and nullable envelope fields.
+ *  The common payload members are read loosely (wrong type → `null`) and the
+ *  whole payload is kept in `raw`, so a new optional member or an unknown
+ *  future type never breaks the page. Null (→ unknown) when malformed. */
+function parseBackorderItem(
+  item: Record<string, unknown>,
+  cursor: string,
+  deliveryId: string,
+): BackorderFeedItem | null {
+  const optional = (value: unknown): value is string | null | undefined =>
+    value === undefined || isNullableString(value);
+  const { payload } = item;
+  if (
+    (item.requestId !== undefined && item.requestId !== null) ||
+    !optional(item.conversationRef) ||
+    !optional(item.notBefore) ||
+    !optional(item.expiresAt) ||
+    !isRecord(payload) ||
+    !isText(payload.backorderId)
+  )
+    return null;
+  const text = (value: unknown): string | null =>
+    isText(value) ? value : null;
+  return {
+    type: item.type as `backorder.${string}`,
+    cursor,
+    deliveryId,
+    requestId: null,
+    conversationRef: text(item.conversationRef),
+    notBefore: item.notBefore ?? null,
+    expiresAt: item.expiresAt ?? null,
+    payload: {
+      backorderId: payload.backorderId,
+      folio: text(payload.folio),
+      productName: text(payload.productName),
+      variantName: text(payload.variantName),
+      quantity: isCount(payload.quantity) ? payload.quantity : null,
+      branchName: text(payload.branchName),
+      customerFirstName: text(payload.customerFirstName),
+      version: isCount(payload.version) ? payload.version : null,
+      raw: payload,
+    },
+  };
 }
 
 function parseItems(items: unknown): FeedItem[] | null {

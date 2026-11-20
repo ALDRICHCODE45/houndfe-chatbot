@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { HumanRequestsClient } from '../../chatbot-api/domain/chatbot-api.client';
 import {
+  isBackorderItem,
   isLiveConversationItem,
   isSalePickupItem,
   isSalePickupType,
@@ -29,6 +30,7 @@ import type {
 import type { SendResult } from '../../whatsapp/domain/whatsapp-sender.port';
 import type { ScheduledConversationHandler } from './scheduled-conversation.service';
 import type { SalePickupHandler } from './sale-pickup-notice.service';
+import type { BackorderFeedHandler } from '../domain/backorder-feed';
 import {
   CANCEL_NOTICE,
   LEDGER_RETENTION_MS,
@@ -91,6 +93,11 @@ export interface HumanRequestDeliveryPorts {
    *  PAY_IN_STORE_ENABLED is on; without it those items stay the STALE of
    *  T1 (UNKNOWN_TYPE, nothing sent). */
   salePickup?: SalePickupHandler;
+  /** Restock backorder S15/T5: the `backorder.*` notices (domain port
+   *  `BackorderFeedHandler`). Without it every backorder item is ACKed STALE
+   *  with no customer message. Their notices are never deferred (the backend
+   *  answers 422 to DEFERRED_*): HUMAN mode or a closed window is STALE. */
+  backorder?: BackorderFeedHandler;
   /** Unit 14 T4: a staff cancel drops the cancelled request's stored
    *  appointment. Optional; a failure is logged, never blocks the notice. */
   schedule?: {
@@ -1046,6 +1053,24 @@ export class HumanRequestDeliveryService {
         `feed item ${row.deliveryId} of type ${item.type} has no handler wired: STALE`,
       );
       return { action: 'stale', decision: 'UNKNOWN_TYPE' };
+    }
+
+    if (isBackorderItem(item)) {
+      if (this.ports.backorder === undefined) {
+        // Restock backorder S15: expected items before T5, not an anomaly.
+        // Never log the raw item: it carries the customer's conversationRef.
+        this.logger.log(
+          `feed item ${row.deliveryId} ${sanitizeErrorText(item.type)}: no backorder handler wired: STALE`,
+        );
+        return { action: 'stale', decision: 'UNKNOWN_TYPE' };
+      }
+      const planned = await this.ports.backorder.plan(row, item);
+      // A notice that may not wait (the backend refuses DEFERRED_* for
+      // backorder items): a HUMAN chat is an immediate STALE
+      // (HUMAN_SESSION), a closed window at send time is STALE.
+      return planned.action === 'send'
+        ? { ...planned, cancellation: true }
+        : { action: 'stale', decision: planned.decision };
     }
 
     if (isSalePickupItem(item)) {
