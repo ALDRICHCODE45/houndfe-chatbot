@@ -50,9 +50,9 @@ const configuration = () => ({
   },
   backorder: {
     // Default off (restock backorder T5a, S9): the owner turns it on once
-    // Meta approved the four pedido_reposicion_* templates. Off → reserved /
+    // Meta approved the six pedido_reposicion_* templates. Off → reserved /
     // reminder outside the 24 h window are PROVIDER_REJECTED
-    // TEMPLATE_NOT_APPROVED (staff calls), the other notices STALE.
+    // TEMPLATE_NOT_APPROVED (staff calls), the other notices (eta included) STALE.
     templatesEnabled: envBoolean(process.env.BACKORDER_TEMPLATES_ENABLED),
     // Approved template names (`es_MX`); defaults are the proposed ones.
     templateNames: {
@@ -64,6 +64,11 @@ const configuration = () => ({
       expired:
         process.env.BACKORDER_TEMPLATE_EXPIRED || 'pedido_reposicion_vencido',
       lost: process.env.BACKORDER_TEMPLATE_LOST || 'pedido_reposicion_lote',
+      etaUpdated:
+        process.env.BACKORDER_TEMPLATE_ETA_UPDATED || 'pedido_reposicion_fecha',
+      etaUnavailable:
+        process.env.BACKORDER_TEMPLATE_ETA_UNAVAILABLE ||
+        'pedido_reposicion_sin_fecha',
     },
   },
   chatbotApi: {

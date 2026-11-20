@@ -453,6 +453,29 @@ describe('cancel from the chat, through the customer turn', () => {
     expect(h.seen).toHaveLength(0);
   });
 
+  it('the tapped [Seguir esperando] of an ETA notice is answered by code: no model, no cancel (S7)', async () => {
+    const h = setup();
+    expect(
+      reply(
+        await h.turn('Seguir esperando', [say('Inventado')], {
+          interactiveReplyId: `backorder_wait:${BACKORDER_ID}`,
+        }),
+      ),
+    ).toBe('Perfecto, le aviso en cuanto llegue.');
+    expect(h.backorders.cancelBackorder).not.toHaveBeenCalled();
+    expect(h.seen).toHaveLength(0);
+  });
+
+  it('the tapped [Ya no lo quiero] of an ETA notice asks the cancel question (S7)', async () => {
+    const h = setup();
+    const asked = await h.turn('Ya no lo quiero', [say('Inventado')], {
+      interactiveReplyId: `backorder_cancel:pick:${BACKORDER_ID}`,
+    });
+    expect(reply(asked)).toBe(QUESTION);
+    expect(h.backorders.cancelBackorder).not.toHaveBeenCalled();
+    expect(h.seen).toHaveLength(0);
+  });
+
   it('keeps the customer style (tú)', async () => {
     const h = setup();
     const asked = await h.turn('oye, cancela lo que aparté');

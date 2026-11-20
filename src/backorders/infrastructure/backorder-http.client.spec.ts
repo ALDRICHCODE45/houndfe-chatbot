@@ -322,6 +322,50 @@ describe('backorder HTTP adapter', () => {
     });
   });
 
+  describe('phoneCountryCode / phone (backend T4b, optional)', () => {
+    it('are parsed when present (a number or null) and absent otherwise', async () => {
+      request.mockReturnValue(
+        of(
+          response({
+            backorder: {
+              ...backorder,
+              phoneCountryCode: '52',
+              phone: '5512349901',
+            },
+          }),
+        ),
+      );
+      await expect(client.getBackorder(ID)).resolves.toMatchObject({
+        phoneCountryCode: '52',
+        phone: '5512349901',
+      });
+      request.mockReturnValue(
+        of(
+          response({
+            backorder: { ...backorder, phoneCountryCode: null, phone: null },
+          }),
+        ),
+      );
+      await expect(client.getBackorder(ID)).resolves.toMatchObject({
+        phoneCountryCode: null,
+        phone: null,
+      });
+      request.mockReturnValue(of(response({ backorder })));
+      const without = await client.getBackorder(ID);
+      expect(without).not.toHaveProperty('phone');
+      expect(without).not.toHaveProperty('phoneCountryCode');
+    });
+
+    it('a non-text phone is an invalid backorder', async () => {
+      request.mockReturnValue(
+        of(response({ backorder: { ...backorder, phone: 5512349901 } })),
+      );
+      await expect(client.getBackorder(ID)).rejects.toBeInstanceOf(
+        UpstreamError,
+      );
+    });
+  });
+
   describe('undeliveredResumeAfter (feed recovery, backend T2)', () => {
     it('sends updatedSince and returns backorderUndeliveredResumeAfter', async () => {
       request.mockReturnValue(

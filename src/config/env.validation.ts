@@ -263,6 +263,8 @@ const innerEnvValidationSchema = Joi.object({
   BACKORDER_TEMPLATE_REMINDER: metaTemplateName,
   BACKORDER_TEMPLATE_EXPIRED: metaTemplateName,
   BACKORDER_TEMPLATE_LOST: metaTemplateName,
+  BACKORDER_TEMPLATE_ETA_UPDATED: metaTemplateName,
+  BACKORDER_TEMPLATE_ETA_UNAVAILABLE: metaTemplateName,
 
   // N18: destination/origin receipt fields inside `extracted` (backend
   // aebb60ef). Kill switch only; default on.

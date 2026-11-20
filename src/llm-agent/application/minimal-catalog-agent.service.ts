@@ -1829,6 +1829,7 @@ export class MinimalCatalogAgentService {
       case 'backorder_confirm':
       case 'backorder_reschedule':
       case 'backorder_reschedule_decline':
+      case 'backorder_wait':
         // Reached only without the backorder services: nothing to answer.
         return answer({ reply: STALE_BUTTON_FALLBACK });
       case 'pick': {

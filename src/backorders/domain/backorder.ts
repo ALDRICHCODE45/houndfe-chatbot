@@ -65,6 +65,10 @@ const backorderSchema = z.object({
    *  backend adds it with its T4 (a reschedule after expiry needs it); an
    *  older backend omits it. */
   sourceDecisionId: z.string().nullish(),
+  /** The customer's phone (backend T4b), `null`/`null` when they have none;
+   *  an older backend omits both. Never logged. */
+  phoneCountryCode: z.string().nullish(),
+  phone: z.string().nullish(),
 });
 
 export type BackorderBot = z.infer<typeof backorderSchema>;

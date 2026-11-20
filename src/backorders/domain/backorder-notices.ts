@@ -25,6 +25,7 @@ export const BACKORDER_CONFIRM_TITLE = 'Confirmar pedido';
 export const BACKORDER_NO_LONGER_TITLE = 'Ya no lo quiero';
 export const BACKORDER_RESCHEDULE_TITLE = 'Sí, agéndalo';
 export const BACKORDER_RESCHEDULE_DECLINE_TITLE = 'No, gracias';
+export const BACKORDER_WAIT_TITLE = 'Seguir esperando';
 
 export const backorderConfirmButtonId = (backorderId: string): string =>
   `backorder_confirm:${backorderId}`;
@@ -34,6 +35,9 @@ export const backorderCancelPickButtonId = (backorderId: string): string =>
   `backorder_cancel:pick:${backorderId}`;
 export const backorderRescheduleButtonId = (backorderId: string): string =>
   `backorder_reschedule:${backorderId}`;
+/** S7: «Seguir esperando» is answered locally by the manage service. */
+export const backorderWaitButtonId = (backorderId: string): string =>
+  `backorder_wait:${backorderId}`;
 export const backorderRescheduleDeclineButtonId = (
   backorderId: string,
 ): string => `backorder_reschedule_decline:${backorderId}`;
@@ -42,6 +46,17 @@ export const backorderConfirmButtons = (
   backorderId: string,
 ): ReadonlyArray<{ id: string; title: string }> => [
   { id: backorderConfirmButtonId(backorderId), title: BACKORDER_CONFIRM_TITLE },
+  {
+    id: backorderCancelPickButtonId(backorderId),
+    title: BACKORDER_NO_LONGER_TITLE,
+  },
+];
+
+/** S7: the two buttons of the ETA-slip notices. */
+export const backorderEtaButtons = (
+  backorderId: string,
+): ReadonlyArray<{ id: string; title: string }> => [
+  { id: backorderWaitButtonId(backorderId), title: BACKORDER_WAIT_TITLE },
   {
     id: backorderCancelPickButtonId(backorderId),
     title: BACKORDER_NO_LONGER_TITLE,
@@ -67,6 +82,9 @@ export const BACKORDER_CONFIRM_QUESTION = '¿Lo confirmamos?';
 export const BACKORDER_RESCHEDULE_QUESTION =
   '¿Quiere que se lo vuelva a agendar?';
 
+/** S7: asked under both ETA-slip notices (and the short body of the buttons). */
+export const BACKORDER_ETA_QUESTION = '¿Seguimos con su pedido?';
+
 /** Phrases the shared `customer-style.ts` pairs do not cover (the notices
  *  say «Se lo apartamos», «Le recuerdo», «le aviso en cuanto llegue», …).
  *  Applied before the shared pairs for tú customers. */
@@ -76,6 +94,16 @@ const TU_PAIRS: ReadonlyArray<readonly [string, string]> = [
   [BACKORDER_RESCHEDULE_QUESTION, '¿Quieres que te lo vuelva a agendar?'],
   ['el lote que le apartamos', 'el lote que te apartamos'],
   ['le aviso en cuanto llegue', 'te aviso en cuanto llegue'],
+  ['le actualizo su pedido', 'te actualizo tu pedido'],
+  ['Le actualizo su pedido', 'Te actualizo tu pedido'],
+  [
+    'Se lo aparto en cuanto llegue y le aviso',
+    'Te lo aparto en cuanto llegue y te aviso',
+  ],
+  ['Con gusto se lo tengo listo', 'Con gusto te lo tengo listo'],
+  [BACKORDER_ETA_QUESTION, '¿Seguimos con tu pedido?'],
+  ['Su lugar sigue apartado', 'Tu lugar sigue apartado'],
+  ['se lo separo y le aviso', 'te lo separo y te aviso'],
 ];
 
 /** A skeleton in the customer's style, then its `{placeholders}` filled. */
@@ -220,6 +248,66 @@ export function lostNotice(
   );
 }
 
+/**
+ * S7 (owner: «solo le estas diciendo al cliente que no ha llegado pero no
+ * estas mostrando mucho interes realmente de venderle el producto»): the new
+ * estimate, said with interest in selling. The date comes from the backend
+ * (a human estimate, not a guarantee); an estimate already past, or unreadable,
+ * is never shown: the team is still confirming it.
+ */
+export function etaUpdatedNotice(
+  input: {
+    firstName: string | null;
+    folio: string;
+    quantity: number;
+    label: string;
+    /** Output of `backorderEstimateDate`; `null` when past or unreadable. */
+    estimateDate: string | null;
+  },
+  style: CustomerStyle | null,
+): string {
+  const lead =
+    input.firstName === null
+      ? 'Le actualizo su pedido'
+      : '{name}, le actualizo su pedido';
+  return renderNotice(
+    `${lead} {folio} ({quantity} × {label}): {when}. ` +
+      'Se lo aparto en cuanto llegue y le aviso; sigue sin pagar nada hasta entonces. ' +
+      `Con gusto se lo tengo listo. ${BACKORDER_ETA_QUESTION}`,
+    {
+      name: input.firstName ?? '',
+      folio: input.folio,
+      quantity: String(input.quantity),
+      label: input.label,
+      when:
+        input.estimateDate === null
+          ? 'el equipo está confirmando la nueva fecha de llegada'
+          : `el equipo nos confirmó que llega aprox. el ${input.estimateDate}`,
+    },
+    style,
+  );
+}
+
+/** S7: the supplier gave no date. Honest, and the place in the queue is kept. */
+export function etaUnavailableNotice(
+  input: { firstName: string | null; productName: string; folio: string },
+  style: CustomerStyle | null,
+): string {
+  const lead =
+    input.firstName === null ? 'El proveedor' : '{name}, el proveedor';
+  return renderNotice(
+    `${lead} todavía no nos confirma fecha para {product} (pedido {folio}). ` +
+      'Su lugar sigue apartado: en cuanto llegue se lo separo y le aviso. ' +
+      BACKORDER_ETA_QUESTION,
+    {
+      name: input.firstName ?? '',
+      product: input.productName,
+      folio: input.folio,
+    },
+    style,
+  );
+}
+
 /** Staff cancelled it; the staff's reason is verbatim, never restyled. */
 export function cancelledNotice(
   input: { folio: string; reason: string | null },
@@ -245,6 +333,8 @@ export const BACKORDER_TEMPLATE_DEFAULTS = {
   reminder: 'pedido_reposicion_recordatorio',
   expired: 'pedido_reposicion_vencido',
   lost: 'pedido_reposicion_lote',
+  etaUpdated: 'pedido_reposicion_fecha',
+  etaUnavailable: 'pedido_reposicion_sin_fecha',
 } as const;
 
 export type BackorderTemplateNames = {

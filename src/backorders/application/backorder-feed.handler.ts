@@ -1,5 +1,6 @@
 import { Logger } from '@nestjs/common';
 import type { BackorderFeedItem } from '../../chatbot-api/domain/dtos/human-requests.dto';
+import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
 import type { CustomerStyle } from '../../customer-profile/domain/notice-style';
 import type {
   BackorderFeedHandler,
@@ -13,16 +14,20 @@ import {
 } from '../../human-requests/domain/human-request-feed';
 import {
   BACKORDER_CONFIRM_QUESTION,
+  BACKORDER_ETA_QUESTION,
   BACKORDER_RESCHEDULE_QUESTION,
   BACKORDER_TEMPLATE_DEFAULTS,
   BACKORDER_TEMPLATE_LANGUAGE,
   backorderConfirmButtons,
   backorderDeadline,
+  backorderEtaButtons,
   backorderEstimateDate,
   backorderLabel,
   backorderMoney,
   backorderRescheduleButtons,
   cancelledNotice,
+  etaUnavailableNotice,
+  etaUpdatedNotice,
   expiredNotice,
   lostNotice,
   renderNotice,
@@ -48,13 +53,21 @@ export interface BackorderFeedNoticePorts {
   /** The conversation of a customer whose feed item carries no
    *  `conversationRef` (none or several mirrored chats): `wa:<id>` or `null`
    *  when unknown. Rejects on a transient failure (the page is read again).
-   *  Today `GET /chatbot-api/backorders/:id` names no phone, so nothing is
-   *  wired and those items are unresolved (see docs/minimal-backorder.md). */
+   *  Consulted only when the item's own `phoneCountryCode` + `phone` (backend
+   *  T4b) do not name a Mexican WhatsApp number; nothing is wired today, so
+   *  those items are unresolved (see docs/minimal-backorder.md). */
   resolveConversation?(backorderId: string): Promise<string | null>;
   clock?: () => Date;
 }
 
-type NoticeKind = 'reserved' | 'reminder' | 'expired' | 'lost' | 'cancelled';
+type NoticeKind =
+  | 'reserved'
+  | 'reminder'
+  | 'expired'
+  | 'lost'
+  | 'cancelled'
+  | 'eta_updated'
+  | 'eta_unavailable';
 
 const KIND: Record<string, NoticeKind | undefined> = {
   'backorder.reserved': 'reserved',
@@ -62,6 +75,8 @@ const KIND: Record<string, NoticeKind | undefined> = {
   'backorder.reservation_expired': 'expired',
   'backorder.reservation_lost': 'lost',
   'backorder.cancelled_by_staff': 'cancelled',
+  'backorder.eta_updated': 'eta_updated',
+  'backorder.eta_unavailable': 'eta_unavailable',
 };
 
 const DECISION: Record<NoticeKind, DeliveryDecision> = {
@@ -70,6 +85,10 @@ const DECISION: Record<NoticeKind, DeliveryDecision> = {
   expired: 'BACKORDER_EXPIRED_NOTICE',
   lost: 'BACKORDER_LOST_NOTICE',
   cancelled: 'BACKORDER_CANCELLED_NOTICE',
+  // The ledger CHECK has no value of its own for the ETA notices (a new one
+  // needs a migration): the existing one is reused.
+  eta_updated: 'BACKORDER_ETA_PENDING',
+  eta_unavailable: 'BACKORDER_ETA_PENDING',
 };
 
 /** The two notices the customer can still act on: when they cannot be
@@ -112,12 +131,18 @@ const cents = (value: unknown): number | null =>
  *   - expired: text, plus [Sí, agéndalo] [No, gracias] only when the backend
  *     names `sourceDecisionId` (a reschedule needs the source decision).
  *   - lost: the apology. cancelled_by_staff: the team's reason.
- *   - eta_updated / eta_unavailable: STALE until T6 (S7).
+ *   - eta_updated / eta_unavailable (S7): the new estimate (or the honest «no
+ *     date yet») with [Seguir esperando] [Ya no lo quiero]; not staff-alert
+ *     types (outside the window without templates, or HUMAN: STALE).
  *   - Outside the 24 h window: approved templates when
  *     `BACKORDER_TEMPLATES_ENABLED`; otherwise reserved / reminder are
  *     `PROVIDER_REJECTED TEMPLATE_NOT_APPROVED` (staff calls the customer)
  *     and the rest `STALE`.
- *   - A customer whose chat cannot be resolved is never messaged.
+ *   - Recipient: the item's `conversationRef`; when it is null, the payload's
+ *     own `phoneCountryCode` + `phone` (backend T4b) through the bot's
+ *     Mexican number normalisation; only when that is missing or not a
+ *     Mexican WhatsApp number is the optional resolver asked. A customer who
+ *     cannot be resolved is never messaged.
  *
  * Nothing here logs the conversation ref or the phone.
  */
@@ -133,16 +158,6 @@ export class BackorderFeedNoticeService implements BackorderFeedHandler {
     row: DeliveryRow,
     item: BackorderFeedItem,
   ): Promise<BackorderFeedPlan> {
-    if (
-      item.type === 'backorder.eta_updated' ||
-      item.type === 'backorder.eta_unavailable'
-    ) {
-      // Backend T4: the ETA slip is handled by T6 (S7); STALE for now.
-      this.logger.log(
-        `feed item ${row.deliveryId} ${item.type}: not handled yet (S7): STALE`,
-      );
-      return { action: 'stale', decision: 'BACKORDER_ETA_PENDING' };
-    }
     const kind = KIND[item.type];
     if (kind === undefined) {
       this.logger.log(
@@ -250,7 +265,8 @@ export class BackorderFeedNoticeService implements BackorderFeedHandler {
     const quantity = payload.quantity;
     if (kind !== 'reminder' && kind !== 'cancelled' && productName === null)
       return null;
-    if (kind === 'reserved' && quantity === null) return null;
+    if ((kind === 'reserved' || kind === 'eta_updated') && quantity === null)
+      return null;
 
     let deadline = '';
     let reservedUntilMs = Number.POSITIVE_INFINITY;
@@ -295,6 +311,10 @@ export class BackorderFeedNoticeService implements BackorderFeedHandler {
         );
       return senderId;
     }
+    // S13 / backend T4b: no mirrored chat; the item's own phone names the
+    // customer. Only that phone: never one read from anywhere else.
+    const fromPhone = await this.senderFromPhone(item);
+    if (fromPhone !== null) return fromPhone;
     const resolved =
       this.ports.resolveConversation === undefined
         ? null
@@ -305,6 +325,36 @@ export class BackorderFeedNoticeService implements BackorderFeedHandler {
         `feed item ${row.deliveryId} ${item.type}: no conversationRef and the customer could not be resolved: nothing is sent`,
       );
     return senderId;
+  }
+
+  /**
+   * The WhatsApp sender of the item's `phoneCountryCode` + `phone` (the
+   * inverse of `parseMexicanWhatsAppPhone`): `null` when either is missing or
+   * is not a Mexican WhatsApp number (`52` + ten digits). Meta identifies the
+   * same number as `521` + ten digits (legacy) or `52` + ten digits, and the
+   * local window / style are keyed by the form the customer last wrote from:
+   * the form with an open window wins, else the current `52` + ten digits.
+   * A window read that fails rejects (the page is read again).
+   */
+  private async senderFromPhone(
+    item: BackorderFeedItem,
+  ): Promise<string | null> {
+    const { phoneCountryCode, phone } = item.payload.raw;
+    if (typeof phoneCountryCode !== 'string' || typeof phone !== 'string')
+      return null;
+    const country = phoneCountryCode.trim().replace(/^\+/, '');
+    const modern = `${country}${phone}`;
+    const parsed = parseMexicanWhatsAppPhone(modern);
+    // The number must read back to exactly the payload's (no padding, no
+    // pre-fixed country code, no stray characters).
+    if (
+      parsed === null ||
+      country !== parsed.phoneCountryCode ||
+      phone !== parsed.phone
+    )
+      return null;
+    if (await this.ports.isWindowOpen(`521${phone}`)) return `521${phone}`;
+    return modern;
   }
 
   private async readStyle(senderId: string): Promise<CustomerStyle | null> {
@@ -367,6 +417,26 @@ export class BackorderFeedNoticeService implements BackorderFeedHandler {
           { folio: content.folio, reason: content.reason },
           style,
         );
+      case 'eta_updated':
+        return etaUpdatedNotice(
+          {
+            firstName: content.firstName,
+            folio: content.folio,
+            quantity: content.quantity,
+            label: content.label,
+            estimateDate: backorderEstimateDate(content.estimatedAt, now),
+          },
+          style,
+        );
+      case 'eta_unavailable':
+        return etaUnavailableNotice(
+          {
+            firstName: content.firstName,
+            productName: content.label,
+            folio: content.folio,
+          },
+          style,
+        );
     }
   }
 
@@ -386,6 +456,11 @@ export class BackorderFeedNoticeService implements BackorderFeedHandler {
       return {
         buttons: backorderConfirmButtons(id),
         shortBody: renderNotice(BACKORDER_CONFIRM_QUESTION, {}, style),
+      };
+    if (kind === 'eta_updated' || kind === 'eta_unavailable')
+      return {
+        buttons: backorderEtaButtons(id),
+        shortBody: renderNotice(BACKORDER_ETA_QUESTION, {}, style),
       };
     if (kind === 'expired' && content.offerReschedule)
       return {
@@ -448,6 +523,21 @@ export class BackorderFeedNoticeService implements BackorderFeedHandler {
         ];
         break;
       }
+      case 'eta_updated': {
+        templateName = names.etaUpdated;
+        const date = backorderEstimateDate(content.estimatedAt, this.clock());
+        values = [
+          name,
+          content.folio,
+          `${content.quantity} × ${content.label}`,
+          date === null ? 'por confirmar con el equipo' : `aprox. el ${date}`,
+        ];
+        break;
+      }
+      case 'eta_unavailable':
+        templateName = names.etaUnavailable;
+        values = [name, content.label, content.folio];
+        break;
       case 'cancelled':
         return null;
     }

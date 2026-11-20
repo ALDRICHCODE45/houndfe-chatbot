@@ -121,7 +121,9 @@ export type DeliveryDecision =
   | 'BACKORDER_LOST_NOTICE'
   /** backorder.cancelled_by_staff sent. */
   | 'BACKORDER_CANCELLED_NOTICE'
-  /** backorder.eta_updated / eta_unavailable: not handled yet (T6 S7): STALE. */
+  /** backorder.eta_updated / eta_unavailable (S7): the ETA-slip notice sent
+   *  (text or template), or its STALE when it cannot be delivered. The name
+   *  is kept (migration 5600's CHECK lists it; a new value needs a migration). */
   | 'BACKORDER_ETA_PENDING'
   /** A backorder notice whose payload cannot be worded. */
   | 'BACKORDER_PAYLOAD_INVALID'

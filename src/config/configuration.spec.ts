@@ -67,6 +67,8 @@ describe('configuration()', () => {
     'BACKORDER_TEMPLATE_REMINDER',
     'BACKORDER_TEMPLATE_EXPIRED',
     'BACKORDER_TEMPLATE_LOST',
+    'BACKORDER_TEMPLATE_ETA_UPDATED',
+    'BACKORDER_TEMPLATE_ETA_UNAVAILABLE',
     'OPS_CHANNEL_PHONE',
     // Removed shipping vars (U6): kept here so the test restores them.
     'SHIPPING_QUOTES_ENABLED',
@@ -398,14 +400,20 @@ describe('configuration()', () => {
         reminder: 'pedido_reposicion_recordatorio',
         expired: 'pedido_reposicion_vencido',
         lost: 'pedido_reposicion_lote',
+        etaUpdated: 'pedido_reposicion_fecha',
+        etaUnavailable: 'pedido_reposicion_sin_fecha',
       });
       process.env.BACKORDER_TEMPLATE_RESERVED = 'llego_v2';
       process.env.BACKORDER_TEMPLATE_LOST = 'lote_v2';
+      process.env.BACKORDER_TEMPLATE_ETA_UPDATED = 'fecha_v2';
+      process.env.BACKORDER_TEMPLATE_ETA_UNAVAILABLE = 'sin_fecha_v2';
       expect(configuration().backorder.templateNames).toEqual({
         reserved: 'llego_v2',
         reminder: 'pedido_reposicion_recordatorio',
         expired: 'pedido_reposicion_vencido',
         lost: 'lote_v2',
+        etaUpdated: 'fecha_v2',
+        etaUnavailable: 'sin_fecha_v2',
       });
     });
 
