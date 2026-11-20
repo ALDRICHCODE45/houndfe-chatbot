@@ -200,3 +200,56 @@ Standard item with `requestId: null` and **no `saleId` key**; `backorderId` is i
 1. The chatbot feed consumer must accept `requestId: null` without `saleId`, the `backorder.*` types (ACK `STALE` for types not handled yet) and be able to report `PROVIDER_REJECTED` **before** the backend deploys T2.
 2. Backend T2 must not go live before the chatbot can check out a reservation (backend T3 + chatbot T5).
 3. Backend migrations `20261120010000_backorder_stock_movements`, `20261121000000_backorder_feed`, `20261121000100_backorder_feed`; the bot must not report `PROVIDER_REJECTED` against a database without the last one (500).
+
+## Update: backend T3 built — confirm = checkout with backorderId (backend main a0c8ea03, live on dev :3003)
+
+`POST /chatbot-api/checkouts` accepts optional `sale.items[i].backorderId` (UUID; null = omitted). Only on checkouts: legacy `POST /chatbot-api/sales` rejects it (400). Success response unchanged (same 201); the backorder line appears in the sale with priceSource `custom` and customPriceCents = finalPriceCents.
+
+```json
+{
+  "phoneCountryCode": "52", "phone": "5512349901",
+  "customer": { "mode": "existing", "customerId": "uuid" },
+  "sale": {
+    "cashierUserId": "uuid",
+    "items": [
+      { "productId": "uuid", "productName": "Croquetas Adulto Raza Grande 18 kg",
+        "quantity": 2, "unitPriceCents": 109900, "backorderId": "uuid-of-the-reserved-backorder" },
+      { "productId": "uuid", "productName": "Collar", "quantity": 1, "unitPriceCents": 50000 }
+    ],
+    "expectedTotalCents": 269800,
+    "shipping": { "mode": "pickup" }
+  }
+}
+```
+
+Rules for a line with `backorderId`:
+1. Backorder exists in the sucursal, `RESERVED`, `reservedUntil > now`.
+2. An expired reserved lot is swapped silently (committed before the checkout) or the reservation is lost (never sell an expired lot).
+3. Same customer, productId, variantId (omitted = null) and quantity.
+4. `unitPriceCents = finalPriceCents`; that line skips the list-price check and promotions, is its own line (never stacks with another line of the same product). Other lines keep today's rules. The bypass exists only for a valid reservation.
+5. Reserved units consumed by the sale in the same transaction; backorder → `CONFIRMED` with `saleId`, `confirmedAt`, `version + 1`.
+
+```
+expectedTotalCents = Σ(finalPriceCents × quantity of backorder lines)
+                   + total of the ordinary lines (evaluate-cart of ONLY those lines)
+                   + shipping charge
+```
+Backorder lines are outside the promotion base. Wrong total → `409 PROMO_RE_QUOTE {recomputedTotalCents, …}` computed the same way.
+
+| Status | `error` (+ detail) | When / bot action |
+| --- | --- | --- |
+| 404 | `BACKORDER_NOT_FOUND` | no such backorder in this sucursal |
+| 409 | `BACKORDER_NOT_RESERVED {status}` | WAITING/CONFIRMED/EXPIRED/CANCELLED (second checkout of a confirmed one → `{status:"CONFIRMED"}`) |
+| 409 | `BACKORDER_RESERVATION_EXPIRED` | `reservedUntil` passed (even before the sweep) |
+| 409 | `BACKORDER_RESERVATION_LOST` | reserved lot expired, no valid stock; back to WAITING and `backorder.reservation_lost` is also emitted: apologise, do not retry |
+| 409 | `BACKORDER_MISMATCH {field}` | customerId/productId/variantId/quantity |
+| 409 | `PRICE_OUT_OF_DATE {currentPriceCents}` | unitPriceCents ≠ finalPriceCents (detail = finalPriceCents). Ordinary line stale price = old code-only PRICE_OUT_OF_DATE |
+| 409 | `BACKORDER_RESERVATION_UNAVAILABLE` | data fault; tell the customer staff will call |
+| 400 | `INVALID_CHECKOUT_REQUEST` | backorderId not a UUID or repeated in the cart |
+| 503 | `BACKORDER_CHECKOUT_UNAVAILABLE` | backend misconfigured |
+
+A refused checkout charges nothing; the same `X-Idempotency-Key` may be retried (except after RESERVATION_LOST). `backorderId` joins the request hash only when present; same key with another/no backorderId → `409 IDEMPOTENCY_KEY_CONFLICT`. Races with sweep/cancel/allocator: exactly one wins; nothing charged twice. Mixed carts, shipping/pickup and pay-in-store hold unchanged; if the sale is later cancelled or its hold expires, units return to general stock and the next WAITING backorder is reserved; the CONFIRMED backorder stays CONFIRMED.
+
+Dev :3003: all backorder migrations applied; scopes backorders:* added to credentials «dev-chatbot-human-intervention» and «dev-chatbot-e2e (all scopes) 2026-11-06». Test: schedule on an out-of-stock product, then a positive POST /inventory/adjustments reserves it and emits backorder.reserved.
+
+Deploy (T3): no backend migration; deploy the bot's handling of BACKORDER_* and PRICE_OUT_OF_DATE {currentPriceCents} with or before the backend; backend T2 must not go live before the bot sends backorderId.
