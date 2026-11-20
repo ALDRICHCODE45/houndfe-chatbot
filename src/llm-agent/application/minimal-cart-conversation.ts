@@ -64,7 +64,7 @@ const NON_COUNT_NUMBER =
  * 300 pesos», «perro de 10 años», «tengo 2»). Used only to carry a count
  * across turns.
  */
-function statesCountToBuy(text: string): boolean {
+export function statesCountToBuy(text: string): boolean {
   return BUY_REQUEST.test(text) && !NON_COUNT_NUMBER.test(text);
 }
 

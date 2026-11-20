@@ -79,9 +79,14 @@ const CART_CONTINUE = 'cart_continue';
 const CART_ADD_MORE = 'cart_add';
 const FULFIL_DELIVERY = 'fulfil_delivery';
 const FULFIL_PICKUP = 'fulfil_pickup';
+const BACKORDER = 'backorder';
+const BACKORDER_REFERENCE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Customer text a confirm button stands for (the gates' affirmative). */
 export const INTERACTIVE_CONFIRM_TEXT = 'SÍ';
+/** Restock backorder S1: what the «No, gracias» button stands for. */
+export const INTERACTIVE_BACKORDER_DECLINE_TEXT = 'No, gracias';
 /** Change intents: never an affirmative for the confirmation gates. */
 export const INTERACTIVE_ORDER_CHANGE_TEXT = 'Quiero cambiar algo';
 export const INTERACTIVE_CHECKOUT_CHANGE_TEXT = 'Quiero corregir mis datos';
@@ -108,7 +113,16 @@ export type InteractiveReplyIntent =
   /** Cart-summary buttons; the reference identifies the cart they were sent with. */
   | { kind: 'cart_continue' | 'cart_add_more'; reference: string }
   /** Retest S4: delivery-or-pickup answer, bound to the cart it was asked for. */
-  | { kind: 'fulfilment'; mode: 'delivery' | 'pickup'; reference: string };
+  | { kind: 'fulfilment'; mode: 'delivery' | 'pickup'; reference: string }
+  /**
+   * Restock backorder S1: the buttons under the estimate message; the
+   * reference is the RESTOCK decision id the offer was sent for.
+   */
+  | {
+      kind: 'backorder';
+      action: 'schedule' | 'decline';
+      reference: string;
+    };
 
 /** Parse a reply id the bot issued; anything else (unknown, forged) is `null`. */
 export function parseInteractiveReplyId(
@@ -147,6 +161,19 @@ export function parseInteractiveReplyId(
             mode: head === FULFIL_PICKUP ? 'pickup' : 'delivery',
             reference: tail,
           };
+    case BACKORDER: {
+      // Tail is `<schedule|decline>:<decisionId>`; both parts are required.
+      const split = tail === null ? -1 : tail.indexOf(':');
+      if (tail === null || split <= 0) return null;
+      const action = tail.slice(0, split);
+      const reference = tail.slice(split + 1);
+      if (
+        (action !== 'schedule' && action !== 'decline') ||
+        !BACKORDER_REFERENCE.test(reference)
+      )
+        return null;
+      return { kind: 'backorder', action, reference };
+    }
     case PAYMENT_METHOD: {
       // Tail is `<method>:<saleId>`; both parts are required.
       const split = tail === null ? -1 : tail.indexOf(':');
@@ -182,6 +209,13 @@ export function interactiveReplyText(id: unknown, title: unknown): string {
     case 'checkout_confirm':
     case 'reorder_confirm':
       return INTERACTIVE_CONFIRM_TEXT;
+    case 'backorder':
+      // The title «Sí, apártamelo» reads as a tú imperative to the style
+      // detector, which would turn every usted customer who taps it into a
+      // tú customer: the inbound text is the neutral affirmative instead.
+      return intent.action === 'schedule'
+        ? INTERACTIVE_CONFIRM_TEXT
+        : INTERACTIVE_BACKORDER_DECLINE_TEXT;
     case 'order_change':
     case 'reorder_change':
       return INTERACTIVE_ORDER_CHANGE_TEXT;

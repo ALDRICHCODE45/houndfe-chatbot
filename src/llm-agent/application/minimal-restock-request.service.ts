@@ -29,6 +29,7 @@ import { runRestockRoute } from '../../sale-flow/application/tools/request-human
 import type { RestockToolCapability } from '../../sale-flow/application/tool-deps';
 import type { ConversationGates } from '../../conversation-gates/application/conversation-gates';
 import { processLocalConversationGates } from '../../conversation-gates/infrastructure/process-local-conversation-gates';
+import type { DurableBackorderQuantity } from './gates/backorder-quantity.gate';
 import {
   restoreRestockPending,
   serializeRestockPending,
@@ -57,6 +58,11 @@ export const minimalRestockAlreadyReply = (l: string) =>
 export const minimalRestockProposal = (l: string) =>
   `Por ahora no tenemos «${l}» 😕. ¿Quiere que consulte si hay una fecha ` +
   `estimada de reposición?`;
+const validStatedQuantity = (value: unknown): value is number =>
+  typeof value === 'number' &&
+  Number.isInteger(value) &&
+  value >= 2 &&
+  value <= 999;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LABEL_BYTES = 2048;
 // Deterministic consent comes from the shared closed lexicon; anything else
@@ -71,6 +77,11 @@ export interface MinimalRestockDeps {
   readonly clock?: () => number;
   /** S4 durable gates; absent means a process-local store. */
   readonly gates?: ConversationGates;
+  /**
+   * Restock backorder S14: where the stated count waits for the estimate.
+   * Absent → the count is not kept (the bot will ask when offering).
+   */
+  readonly backorderQuantities?: DurableBackorderQuantity;
 }
 
 export interface MinimalRestockPrepareInput {
@@ -79,6 +90,11 @@ export interface MinimalRestockPrepareInput {
   readonly allowedProductIds: ReadonlySet<string>;
   readonly productId: string;
   readonly variantId?: string;
+  /**
+   * Restock backorder S14: the unit count the customer stated in the turn
+   * that led to this question (2–999), when there is one.
+   */
+  readonly statedQuantity?: number;
 }
 
 /**
@@ -144,6 +160,7 @@ interface PendingRestock {
   /** Bounded memo of message ids already sent to the classifier. */
   readonly seen: Set<string>;
   armed: boolean;
+  readonly statedQuantity?: number;
 }
 
 /**
@@ -329,6 +346,9 @@ export class MinimalRestockRequestService {
         proposal: question,
         seen: new Set<string>(),
         armed: false,
+        ...(validStatedQuantity(input.statedQuantity)
+          ? { statedQuantity: input.statedQuantity }
+          : {}),
       };
       this.pending.set(senderId, pending);
       this.gates.touch(senderId);
@@ -486,6 +506,22 @@ export class MinimalRestockRequestService {
     return await this.write(senderId, pending, event);
   }
 
+  /**
+   * S14: the request is recorded, so the count the customer stated now waits
+   * for the estimate (the request itself stores none). Never erases an earlier
+   * note; persisted by the turn's gate touch.
+   */
+  private noteStatedQuantity(senderId: string, pending: PendingRestock): void {
+    if (pending.statedQuantity === undefined) return;
+    this.deps.backorderQuantities?.note(
+      senderId,
+      pending.digest.productId,
+      pending.digest.variantId ?? null,
+      pending.statedQuantity,
+    );
+    this.gates.touch(senderId);
+  }
+
   /** Runs the ONE existing deterministic RESTOCK route for the consumed turn. */
   private async write(
     senderId: string,
@@ -507,12 +543,14 @@ export class MinimalRestockRequestService {
       },
     );
     if (result.ok && result.outcome === 'historical_intake_recorded') {
+      this.noteStatedQuantity(senderId, pending);
       return {
         kind: 'handled',
         reply: minimalRestockConfirmedReply(pending.presentation),
       };
     }
     if (result.ok && result.outcome === 'existing_restock_recorded') {
+      this.noteStatedQuantity(senderId, pending);
       return {
         kind: 'handled',
         reply: minimalRestockAlreadyReply(pending.presentation),

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { Logger } from '@nestjs/common';
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import type { WhatsappSenderPort } from '../../whatsapp/domain/whatsapp-sender.port';
 import {
@@ -10,6 +11,13 @@ import {
   applyCustomerStyle,
   type CustomerStyle,
 } from '../../customer-profile/domain/notice-style';
+import { backorderEstimatedAt } from '../../backorders/domain/backorder';
+import {
+  BACKORDER_OFFER_CLOSING,
+  BACKORDER_OFFER_PROMPT,
+  backorderOfferButtons,
+  type BackorderOfferCapability,
+} from '../../backorders/domain/backorder-offer';
 import type { RestockApplicationCandidateService } from './restock-application-candidate.service';
 import type { PostgresRestockApplicationPreparationStore } from '../infrastructure/postgres-restock-application-preparation.store';
 import type { PostgresRestockApplicationClaimStore } from '../infrastructure/postgres-restock-application-claim.store';
@@ -31,9 +39,16 @@ type Ports = Pick<RestockApplicationCandidateService, 'pollForSender'> &
   Partial<Pick<RestockApplicationLedgerPort, 'readByDecision'>> &
   Pick<PostgresRestockApplicationCompletionStore, 'closeAcknowledged'> &
   Pick<ChatbotApiClient, 'recordRestockApplicationOutcome'> &
-  Pick<WhatsappSenderPort, 'sendText'> & {
+  Pick<WhatsappSenderPort, 'sendText'> &
+  Partial<Pick<WhatsappSenderPort, 'sendInteractive'>> & {
     /** S1: the stored customer style; null/failure keeps the usted text. */
     customerStyle?(senderId: string): Promise<CustomerStyle | null>;
+    /**
+     * Restock backorder S1: the late-bound capability that arms the offer
+     * the estimate closes with. `null` (not registered yet) still sends the
+     * offer wording but arms nothing.
+     */
+    backorderOffer?(): BackorderOfferCapability | null;
   } & Partial<HandoffModeReader>;
 type TerminalRow = Extract<
   RestockApplicationLedgerRow,
@@ -47,6 +62,8 @@ type Candidate = Extract<RestockCandidateResult, { action: 'candidate' }>;
 const HOLD = Object.freeze({ action: 'hold' as const });
 const PENDING = Object.freeze({ action: 'pending' as const });
 const ACK = Object.freeze({ action: 'ack_recorded' as const });
+
+const logger = new Logger('RestockApplicationCoordinator');
 
 function format(decision: RestockDecisionResolved): string {
   const { productName, sku } = decision.snapshot;
@@ -62,7 +79,7 @@ function format(decision: RestockDecisionResolved): string {
   return (
     `¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de ${label} ` +
     `para la reposición de «${subject}», contados desde su confirmación. ` +
-    'La fecha puede variar. ¡Que esté muy bien!'
+    `La fecha puede variar. ${BACKORDER_OFFER_CLOSING}`
   );
 }
 
@@ -98,6 +115,91 @@ export class RestockApplicationCoordinator {
         : { isHumanMode: (id) => isHumanMode.call(this.ports, id) },
       senderId,
     );
+  }
+
+  private offerCapability(): BackorderOfferCapability | null {
+    try {
+      return this.ports.backorderOffer?.() ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async readStatedQuantity(
+    capability: BackorderOfferCapability,
+    senderId: string,
+    decision: RestockDecisionResolved,
+  ): Promise<number | null> {
+    try {
+      return await capability.statedQuantity(
+        senderId,
+        decision.snapshot.productId,
+        decision.snapshot.variantId,
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The estimate with the offer and its two reply buttons; plain text with
+   * the same wording when the sender cannot send buttons. A rejected send is
+   * never retried as text (the buttons may already be out): it propagates to
+   * the caller's HOLD like a rejected text.
+   */
+  private async sendOffer(
+    senderId: string,
+    decisionId: string,
+    text: string,
+    style: CustomerStyle | null,
+  ): Promise<{ providerMessageId: string }> {
+    const { sendInteractive, sendText } = this.ports;
+    if (sendInteractive === undefined)
+      return sendText.call(this.ports, { to: senderId, text });
+    const prompt =
+      style === null
+        ? BACKORDER_OFFER_PROMPT
+        : applyCustomerStyle(BACKORDER_OFFER_PROMPT, style);
+    return sendInteractive.call(this.ports, {
+      to: senderId,
+      body: text,
+      interactive: {
+        type: 'buttons',
+        buttons: backorderOfferButtons(decisionId),
+      },
+      shortBody: prompt,
+    });
+  }
+
+  private async armOffer(
+    capability: BackorderOfferCapability,
+    senderId: string,
+    decision: RestockDecisionResolved,
+    statedQuantity: number | null,
+  ): Promise<void> {
+    try {
+      const { resolution, snapshot } = decision;
+      const estimatedAt =
+        resolution.action === 'PROVIDE_RESTOCK_ESTIMATE'
+          ? backorderEstimatedAt(resolution.resolvedAt, resolution.restockDays)
+          : null;
+      if (estimatedAt === null) return;
+      const armed = await capability.arm({
+        senderId,
+        decisionId: decision.id,
+        productId: snapshot.productId,
+        variantId: snapshot.variantId,
+        productName: snapshot.productName,
+        estimatedAt,
+        statedQuantity,
+      });
+      if (!armed)
+        logger.warn('backorder offer was sent but could not be armed');
+    } catch (error) {
+      logger.warn(
+        `backorder offer was sent but could not be armed: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+    }
   }
 
   async applyOnce(
@@ -137,6 +239,15 @@ export class RestockApplicationCoordinator {
           ? format(decision)
           : applyCustomerStyle(format(decision), style);
       if (!text.trim() || text.length > 4096) return HOLD;
+      // Restock backorder S1: only the estimate carries the offer. The count
+      // the customer stated is read here, before the claim, for the same
+      // reason as the style: nothing async between the final check and send.
+      const offered = decision.resolution.action === 'PROVIDE_RESTOCK_ESTIMATE';
+      const capability = offered ? this.offerCapability() : null;
+      const statedQuantity =
+        capability === null
+          ? null
+          : await this.readStatedQuantity(capability, senderId, decision);
       const prepared = await ports.preparePending(candidate);
       if (prepared.action !== 'prepared') return HOLD;
       const sendToken = tokenFactory();
@@ -195,9 +306,16 @@ export class RestockApplicationCoordinator {
         )
           return HOLD;
         // Nothing asynchronous may intervene between the final check and send.
-        const receipt = await ports.sendText({ to: senderId, text });
+        const receipt = offered
+          ? await this.sendOffer(senderId, decision.id, text, style)
+          : await ports.sendText({ to: senderId, text });
         const providerAcceptedObservedAt =
           Date.prototype.toISOString.call(clock());
+        // Meta accepted the estimate: the offer it carries can now be armed.
+        // Best effort and before the acceptance is recorded, so a failure
+        // here never touches HOLD/ACK semantics (the message already went).
+        if (capability !== null)
+          await this.armOffer(capability, senderId, decision, statedQuantity);
         const event = Object.freeze({
           kind: 'provider_accepted' as const,
           attemptId: row.attemptId,

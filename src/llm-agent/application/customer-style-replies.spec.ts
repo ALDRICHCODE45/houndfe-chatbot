@@ -40,6 +40,20 @@ import {
 } from '../../delivery-zones/domain/delivery-zone-requester';
 import { minimalZoneResumeShippingSentence } from '../domain/minimal-shipping';
 import {
+  BACKORDER_ASK_NAME_REPLY,
+  BACKORDER_ASK_QUANTITY_REPLY,
+  BACKORDER_DECLINE_REPLY,
+  BACKORDER_FAILED_REPLY,
+  BACKORDER_RETRY_REPLY,
+  backorderAvailableNowReply,
+  backorderDuplicateReply,
+  backorderScheduledReply,
+} from '../domain/backorder-copy';
+import {
+  BACKORDER_OFFER_CLOSING,
+  BACKORDER_OFFER_PROMPT,
+} from '../../backorders/domain/backorder-offer';
+import {
   BUSY_REPLY,
   CHECKOUT_TOOL_CLARIFICATION,
   FORGET_MY_DATA_REPLY,
@@ -451,7 +465,33 @@ const REPLIES: Record<string, string> = {
     }),
   ),
   restockEstimate:
-    '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar», contados desde su confirmación. La fecha puede variar. ¡Que esté muy bien!',
+    '¡Gracias por la espera! 😊 El equipo nos confirmó un estimado de 3 días para la reposición de «Collar», contados desde su confirmación. La fecha puede variar. ¿Quiere que se lo apartemos en cuanto llegue? Le aviso y no paga nada hasta entonces.',
+  // Restock backorder S1/S14: the offer, its button body and the answers.
+  backorderOfferClosing: BACKORDER_OFFER_CLOSING,
+  backorderOfferPrompt: BACKORDER_OFFER_PROMPT,
+  backorderDecline: BACKORDER_DECLINE_REPLY,
+  backorderAskQuantity: BACKORDER_ASK_QUANTITY_REPLY,
+  backorderAskName: BACKORDER_ASK_NAME_REPLY,
+  backorderRetry: BACKORDER_RETRY_REPLY,
+  backorderFailed: BACKORDER_FAILED_REPLY,
+  backorderScheduled: backorderScheduledReply(
+    {
+      folio: 'BO-000012',
+      quantity: 2,
+      productName: 'Collar',
+      variantName: null,
+      referencePriceCents: 114900,
+      estimatedAt: '2026-11-27T15:00:00.000Z',
+    },
+    new Date('2026-11-20T12:00:00.000Z'),
+  ),
+  backorderAvailableNow: backorderAvailableNowReply('Collar'),
+  backorderDuplicate: backorderDuplicateReply({
+    folio: 'BO-000012',
+    productName: 'Collar',
+    variantName: null,
+  }),
+  backorderDuplicateNoFolio: backorderDuplicateReply(null),
   restockUnavailable:
     '¡Gracias por la espera! 😊 Por ahora el equipo no pudo confirmar un estimado de reposición para «Collar».',
   // Fixed copy of prepareExpirationReply (unavailable branch).
@@ -528,6 +568,32 @@ describe('customer style over every fixed customer reply (S2)', () => {
     );
     expect(applyCustomerStyle(REPLIES.restockProposal, tu)).toBe(
       'Por ahora no tenemos «Collar» 😕. ¿Quieres que consulte si hay una fecha estimada de reposición?',
+    );
+  });
+});
+
+describe('restock backorder copy in tú (S1/S14)', () => {
+  it('pins the confirmation, the offer and the questions', () => {
+    expect(applyCustomerStyle(REPLIES.backorderScheduled, tu)).toBe(
+      'Listo, quedó agendado tu pedido BO-000012: 2 × Collar a $1149.00 MXN c/u. Te aviso en cuanto llegue (aprox. el 27 de noviembre); no pagas nada hasta entonces.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderOfferPrompt, tu)).toBe(
+      '¿Quieres que te lo apartemos?',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderAskQuantity, tu)).toBe(
+      '¿Cuántas piezas te aparto?',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderAvailableNow, tu)).toBe(
+      '¡Buenas noticias! Ya tenemos Collar disponible. ¿Cuántas piezas te agrego al carrito?',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderDuplicate, tu)).toBe(
+      'Ya tienes agendado tu pedido BO-000012 de Collar. Te aviso en cuanto llegue.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderRetry, tu)).toBe(
+      'No pude agendar tu pedido en este momento. Intenta de nuevo en unos minutos.',
+    );
+    expect(applyCustomerStyle(REPLIES.backorderDecline, tu)).toBe(
+      'Entendido. ¡Que estés muy bien!',
     );
   });
 });

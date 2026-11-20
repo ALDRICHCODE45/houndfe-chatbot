@@ -26,6 +26,8 @@ import { DELIVERY_ZONE_INTAKE } from '../delivery-zones/application/delivery-zon
 import { LlmAgentModule } from './llm-agent.module';
 import { ConversationGates } from '../conversation-gates/application/conversation-gates';
 import { PostgresConversationGateStore } from '../conversation-gates/infrastructure/postgres-conversation-gate.store';
+import { BackorderOfferRegistry } from '../backorders/domain/backorder-offer';
+import { MinimalBackorderOfferService } from './application/minimal-backorder-offer.service';
 import { MinimalCatalogAgentService } from './application/minimal-catalog-agent.service';
 import { LLM_AGENT, type LlmAgentPort } from './domain/llm-agent.port';
 import { TOOL_REGISTRY, type ToolRegistry } from './domain/tool-registry.port';
@@ -337,6 +339,8 @@ describe('LlmAgentModule integration', () => {
     expect(gates['store']).toBeInstanceOf(PostgresConversationGateStore);
     expect(moduleRef.get(MinimalCatalogAgentService)['gates']).toBe(gates);
     expect([...gates['participants'].keys()].sort()).toEqual([
+      'backorder_offer',
+      'backorder_quantity',
       'checkout_address',
       'checkout_confirmation',
       'checkout_confirmed',
@@ -344,6 +348,13 @@ describe('LlmAgentModule integration', () => {
       'payment_offer',
       'restock_pending',
     ]);
+    // Restock backorder S1: the offer service owns the two backorder gates,
+    // answers the customer turn and is what the RESTOCK coordinator resolves.
+    const offers = moduleRef.get(MinimalBackorderOfferService);
+    expect(moduleRef.get(MinimalCatalogAgentService)['backorder']).toBe(offers);
+    expect(
+      moduleRef.get(BackorderOfferRegistry, { strict: false }).current(),
+    ).toBe(offers);
     await moduleRef.close();
   });
 

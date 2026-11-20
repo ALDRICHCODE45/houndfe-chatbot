@@ -12,6 +12,7 @@ import { PostgresRestockApplicationLedgerStore } from './infrastructure/postgres
 import { PostgresRestockApplicationCompletionStore } from './infrastructure/postgres-restock-application-completion.store';
 import type { HandoffModeService } from '../conversation/application/handoff-mode.service';
 import type { RestockCandidateResult } from './application/restock-application-candidate.service';
+import { BackorderOfferRegistry } from '../backorders/domain/backorder-offer';
 
 const source = 'ABCDEF12-1234-4234-8234-123456789ABC';
 const senderId = 'synthetic-sender';
@@ -393,6 +394,88 @@ describe('RestockApplicationRuntime in isolation', () => {
     expect(f.pool.query).not.toHaveBeenCalled();
     expect(f.pool.connect).not.toHaveBeenCalled();
     await f.runtime.onModuleDestroy();
+  });
+
+  describe('restock backorder S1 wiring (offer buttons and capability)', () => {
+    type Ports = {
+      sendInteractive?: (...args: unknown[]) => unknown;
+      backorderOffer?: () => unknown;
+    };
+    const boot = (
+      sender: Record<string, jest.Mock>,
+      offers?: BackorderOfferRegistry,
+    ) => {
+      const f = fixture();
+      const runtime = new RestockApplicationRuntime(
+        {
+          get: jest.fn((key: string) =>
+            key.includes('branch') ? branch : phone,
+          ),
+        } as unknown as ConfigService,
+        f.pool as unknown as Pool,
+        f.client as unknown as ChatbotApiClient,
+        sender as never,
+        f.handoff as unknown as HandoffModeService,
+        undefined,
+        offers,
+      );
+      let ports!: Ports;
+      jest
+        .spyOn(RestockApplicationCoordinator.prototype, 'applyOnce')
+        .mockImplementation(function (this: RestockApplicationCoordinator) {
+          ports = (this as unknown as { ports: Ports }).ports;
+          return Promise.resolve(HOLD);
+        });
+      runtime.onApplicationBootstrap();
+      runtime.enqueue(senderId, source);
+      return {
+        runtime,
+        ports: async () => {
+          await jest.advanceTimersByTimeAsync(5000);
+          return ports;
+        },
+      };
+    };
+
+    it('passes the sender sendInteractive through, bound to the sender', async () => {
+      const sender = {
+        sendText: jest.fn(),
+        sendTemplate: jest.fn(),
+        sendInteractive: jest.fn(),
+      };
+      const b = boot(sender);
+      const ports = await b.ports();
+      ports.sendInteractive?.({ to: senderId });
+      expect(sender.sendInteractive).toHaveBeenCalledTimes(1);
+      expect(sender.sendInteractive.mock.contexts[0]).toBe(sender);
+      await b.runtime.onModuleDestroy();
+    });
+
+    it('leaves sendInteractive undefined when the sender cannot send buttons (text fallback)', async () => {
+      const b = boot({ sendText: jest.fn(), sendTemplate: jest.fn() });
+      expect((await b.ports()).sendInteractive).toBeUndefined();
+      await b.runtime.onModuleDestroy();
+    });
+
+    it('resolves the offer capability at call time from the registry', async () => {
+      const registry = new BackorderOfferRegistry();
+      const b = boot(
+        { sendText: jest.fn(), sendTemplate: jest.fn() },
+        registry,
+      );
+      const ports = await b.ports();
+      expect(ports.backorderOffer?.()).toBeNull();
+      const capability = { statedQuantity: jest.fn(), arm: jest.fn() };
+      registry.register(capability);
+      expect(ports.backorderOffer?.()).toBe(capability);
+      await b.runtime.onModuleDestroy();
+    });
+
+    it('works without a registry (no capability)', async () => {
+      const b = boot({ sendText: jest.fn(), sendTemplate: jest.fn() });
+      expect((await b.ports()).backorderOffer?.()).toBeNull();
+      await b.runtime.onModuleDestroy();
+    });
   });
 
   describe('S7 handoff hold (wired from HandoffModeService)', () => {

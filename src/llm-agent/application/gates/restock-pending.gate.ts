@@ -17,6 +17,11 @@ export interface RestockPendingData {
   readonly proposal: string;
   readonly seen: ReadonlySet<string>;
   readonly armed: boolean;
+  /**
+   * Restock backorder S14: the unit count (2–999) the customer stated in the
+   * turn this question was prepared; kept for the backorder offer.
+   */
+  readonly statedQuantity?: number;
 }
 
 const payloadSchema = z.strictObject({
@@ -32,6 +37,7 @@ const payloadSchema = z.strictObject({
   presentation: z.string().min(1).max(2048),
   seen: z.array(z.string().min(1)).max(16),
   armed: z.boolean(),
+  statedQuantity: z.number().int().min(2).max(999).optional(),
 });
 
 /** Payload of the durable `restock_pending` gate, or `null` when unusable. */
@@ -49,6 +55,9 @@ export function serializeRestockPending(
       presentation: pending.presentation,
       seen: [...pending.seen],
       armed: pending.armed,
+      ...(pending.statedQuantity === undefined
+        ? {}
+        : { statedQuantity: pending.statedQuantity }),
     },
     expiresAt: pending.expiresAt,
   };

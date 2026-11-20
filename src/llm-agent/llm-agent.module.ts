@@ -1,5 +1,11 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { BackordersModule } from '../backorders/backorders.module';
+import {
+  BACKORDER_CLIENT,
+  type BackorderClient,
+} from '../backorders/domain/backorder';
+import { BackorderOfferRegistry } from '../backorders/domain/backorder-offer';
 import { ChatbotApiModule } from '../chatbot-api/chatbot-api.module';
 import {
   CHATBOT_API_CLIENT,
@@ -53,6 +59,9 @@ import { HumanHandoffModule } from '../human-handoff/human-handoff.module';
 import { HumanRequestsServicesModule } from '../human-requests/human-requests.module';
 import { MinimalExpirationRequestService } from './application/minimal-expiration-request.service';
 import { MinimalRestockRequestService } from './application/minimal-restock-request.service';
+import { BackorderGates } from './application/gates/backorder.gates';
+import { MinimalBackorderOfferService } from './application/minimal-backorder-offer.service';
+import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
 import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
 import { InMemoryMinimalCatalogSessionStore } from './infrastructure/in-memory-minimal-catalog-session.store';
 import { LLM_AGENT } from './domain/llm-agent.port';
@@ -107,6 +116,9 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
     DeliveryZonesModule,
     // S1: persistent customer memory (style, names, pet, last order).
     CustomerProfileModule,
+    // Restock backorder S1: the backorder port and the late-bound holder of
+    // the offer capability the RESTOCK estimate coordinator resolves.
+    BackordersModule,
     // S6: askTeam → HumanRequestCreateService (services only, no consumer).
     HumanRequestsServicesModule,
   ],
@@ -224,6 +236,43 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
         }),
     },
     {
+      // Restock backorder: the two durable gates (each kind registers once),
+      // shared by the RESTOCK confirmation (writes the stated count) and the
+      // offer service (arms and answers the offer).
+      provide: BackorderGates,
+      inject: [ConversationGates],
+      useFactory: (gates: ConversationGates) => new BackorderGates(gates),
+    },
+    {
+      // Restock backorder S1/S14: arms and answers the offer that closes the
+      // RESTOCK estimate. The RESTOCK application coordinator (human
+      // decisions module, outside any turn) resolves it through the registry.
+      provide: MinimalBackorderOfferService,
+      inject: [
+        BackorderGates,
+        BACKORDER_CLIENT,
+        CHATBOT_API_CLIENT,
+        BackorderOfferRegistry,
+        CustomerProfileService,
+      ],
+      useFactory: (
+        gates: BackorderGates,
+        backorders: BackorderClient,
+        chatbotApi: ChatbotApiClient,
+        registry: BackorderOfferRegistry,
+        profiles: CustomerProfileService,
+      ) => {
+        const service = new MinimalBackorderOfferService({
+          backorders,
+          chatbotApi,
+          gates,
+          profiles,
+        });
+        registry.register(service);
+        return service;
+      },
+    },
+    {
       // WU-B: the RESTOCK confirmation gate. Human decisions are always on,
       // so the capability is always built.
       provide: MinimalRestockRequestService,
@@ -235,6 +284,7 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
         RESTOCK_EXISTING_REQUEST_STATUS_SERVICE,
         RestockApplicationRuntime,
         ConversationGates,
+        BackorderGates,
       ],
       useFactory: (
         chatbotApi: ChatbotApiClient,
@@ -244,11 +294,14 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
         recovery: RestockExistingRequestStatusService,
         runtime: RestockApplicationRuntime,
         gates: ConversationGates,
+        backorder: BackorderGates,
       ) =>
         new MinimalRestockRequestService({
           chatbotApi,
           store,
           gates,
+          // S14: the stated count waits here for the estimate.
+          backorderQuantities: backorder.quantities,
           restock: {
             markers,
             coordinator,
