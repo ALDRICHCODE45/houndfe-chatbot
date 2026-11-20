@@ -493,3 +493,16 @@ bare yes must confirm the customer's `RESERVED` backorder.
   answers «No pude agendar su pedido por ahora.».
 - The estimate message now always carries the offer wording; if the offer
   capability is not registered (it always is in production) nothing is armed.
+
+## Dev rehearsal
+
+`pnpm e2e:backorder` (`scripts/e2e/backorder-e2e.ts`, details in
+`scripts/e2e/README.md`) rehearses the whole path against the dev backend on
+`localhost:3003` with the chatbot's own clients: RESTOCK intake, team estimate
+(staff session), `createBackorder` → `WAITING`, a stock adjustment → `RESERVED`
+and `backorder.reserved` on the feed, a refused checkout (`PRICE_OUT_OF_DATE`
+mapped with `currentPriceCents`), then the real checkout with `backorderId` →
+`CONFIRMED`. It cleans up (cancel the sale, stock back to 0) in a `finally`,
+never messages anyone (the feed item is ACKed `STALE`) and refuses any base URL
+other than `localhost:3003`. It is the live proof of the money path that the
+unit specs only mock.

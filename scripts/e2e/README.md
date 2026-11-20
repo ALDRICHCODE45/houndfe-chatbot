@@ -5,6 +5,7 @@ These scripts call a running **dev** backend. They write dev data, so never poin
 - `contract-smoke.ts`: live contract smoke test of `ChatbotApiHttpClient`. See `docs/e2e-contract-smoke.md`.
 - `human-requests-feed-e2e.ts`: spec S7 run of the human request feed (create → staff resolve/cancel → feed item → outcome ACK), plus a read-only look at the 5c recovery route.
 - `human-requests-feed-e2e.ts --phase schedule` / `schedule-feed`: unit 14 scheduled conversations (offer, booking, change, cancel, reminder and staff reschedule items).
+- `backorder-e2e.ts`: restock backorder rehearsal (RESTOCK → team estimate → schedule → stock arrives → reserved → checkout with `backorderId`), with cleanup. See `backorder-e2e` below.
 - `conversation-mirror-e2e.ts`: spec S8 run of the conversation mirror and media (backend unit 9): upload, mirror, idempotent resend and delivery statuses. `--phase outbox` runs the full delivery stack (outbox, drain worker, adapters, media service) instead.
 
 ## human-requests-feed-e2e
@@ -188,3 +189,35 @@ The worker is ticked until nothing is PENDING/IN_FLIGHT or 3 minutes pass. Outpu
 - `[pass2]`: a new OUT product-photo row with the same URL is enqueued and drained. It must resolve from the cache with the same `mediaId` and no new `POST /media`.
 
 Exit code 1 on any DEAD row, any row left open (RETRY/PENDING/IN_FLIGHT), no photo `mediaId`, a cache miss in pass 2, or a Meta download. It writes dev data on the backend (one media file, the conversation and its messages). The default Nest logger prints the adapters' log lines, with the conversation masked.
+
+## backorder-e2e
+
+Rehearsal of the restock backorder (spec `odd/tasks/restock-backorder.md` T7, S1-S9) against the dev backend on `http://localhost:3003`. It uses the chatbot's own clients (`ChatbotApiHttpClient`: RESTOCK intake and poll, feed, delivery ACK, checkout; `BackorderHttpClient`) and a staff session only for what the team does (answer the RESTOCK, raise the stock, cancel the sale).
+
+```sh
+# load the dev environment into the shell first (never edit or print the env file)
+pnpm e2e:backorder
+```
+
+Environment (never printed):
+
+| Variable                                 | Meaning                                                                                    |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `CHATBOT_API_BASE_URL` (required)        | Must be `http://localhost:3003` (or `127.0.0.1:3003`); any other value is refused          |
+| `SERVICE_KEY` (required)                 | Chatbot `svc_` key with the `backorders:*`, catalog, checkout and `human-decisions` scopes |
+| `CHATBOT_API_BRANCH_ID`                  | Branch header; default the dev branch of the other e2e scripts                             |
+| `CHATBOT_API_CASHIER_USER_ID`            | Sale cashier; default the dev bot cashier                                                  |
+| `E2E_STAFF_EMAIL` / `E2E_STAFF_PASSWORD` | Staff login; default the documented dev demo account (safe: the base URL is local only)    |
+| `E2E_BACKORDER_ACK=0`                    | Observe `backorder.reserved` without ACKing it (default: ACK `STALE`, nobody is messaged)  |
+
+Steps (each prints PASS, WARN or FAIL with the HTTP status and the error code):
+
+0. Staff login; preflight (product «Premios Pro Plan Biscuits Pollo 300 g» has stock 0, no variants and no active backorder, otherwise abort without changes); feed tail.
+1. RESTOCK intake through `submitRestockIntake` (keeps the decision id).
+2. Staff reads the decision version and answers `PROVIDE_RESTOCK_ESTIMATE` (7 days); the bot's `getRestockDecision` poll shows it; `request.answered` is only observed (WARN if it does not appear).
+3. `createBackorder` (quantity 2, test customer) → 201 `WAITING`; the same key replays 200; the phone list contains it.
+4. Staff stock adjustment +2 → backorder `RESERVED` (`finalPriceCents`, `reservedUntil` about 24 h, phone present); `backorder.reserved` on the feed (same price, phone) and ACK `STALE`.
+5. A deliberately wrong checkout (`finalPriceCents + 1`) must be `409 PRICE_OUT_OF_DATE`, mapped by `backorderCheckoutFailure` with `currentPriceCents`; then the real pickup checkout (`sale.items[0].backorderId`, total `finalPriceCents × 2`) → 201 and the backorder is `CONFIRMED` with the sale id.
+6. Cleanup in a `finally` (also after a failure): cancel the sale (`ORDER_ERROR`) or the active backorder, adjust the stock back to 0 (`DATA_ENTRY_CORRECTION`), then verify stock 0 and no active backorder. Whatever it could not clean is printed as `NOT_CLEANED` and the exit code is 1. The RESTOCK decision and the test customer cannot be deleted and stay in the dev database.
+
+Exit code: 0 all steps passed and clean; 1 a step failed or something is not cleaned; 2 missing env or a refused base URL. Writes DEV data only.
