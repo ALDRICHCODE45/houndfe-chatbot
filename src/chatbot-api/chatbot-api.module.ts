@@ -5,6 +5,7 @@ import {
   HUMAN_REQUESTS_CLIENT,
 } from './domain/chatbot-api.client';
 import { CONVERSATION_MIRROR_CLIENT } from './domain/conversation-mirror.port';
+import { CUSTOMER_PETS_CLIENT } from './domain/customer-pets.port';
 import { LIVE_CONVERSATION_CLIENT } from './domain/live-conversation.port';
 import { SCHEDULING_CLIENT } from './domain/scheduling.port';
 import { ChatbotApiHttpClient } from './infrastructure/chatbot-api-http.client';
@@ -33,6 +34,10 @@ import { ChatbotApiHttpClient } from './infrastructure/chatbot-api-http.client';
       provide: SCHEDULING_CLIENT,
       useExisting: ChatbotApiHttpClient,
     },
+    {
+      provide: CUSTOMER_PETS_CLIENT,
+      useExisting: ChatbotApiHttpClient,
+    },
   ],
   exports: [
     CHATBOT_API_CLIENT,
@@ -40,6 +45,7 @@ import { ChatbotApiHttpClient } from './infrastructure/chatbot-api-http.client';
     CONVERSATION_MIRROR_CLIENT,
     LIVE_CONVERSATION_CLIENT,
     SCHEDULING_CLIENT,
+    CUSTOMER_PETS_CLIENT,
     ChatbotApiHttpClient,
   ],
 })

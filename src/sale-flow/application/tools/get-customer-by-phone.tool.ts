@@ -8,7 +8,9 @@ import { mapChatbotError } from '../error-mapping';
  *
  * AGENTS.md §4.4.4: GET `/chatbot-api/customers/by-phone`
  * (`customers:read`). Stateless; the customer record (or `found: false`)
- * is returned as-is.
+ * is returned as-is, except `customer.pets` (customer-pets T4a): pets reach
+ * the model only through the pet memory (T4b), so the tool output stays the
+ * one it was before the backend added them.
  */
 export function makeGetCustomerByPhoneTool(deps: ToolDeps) {
   return tool({
@@ -24,7 +26,10 @@ export function makeGetCustomerByPhoneTool(deps: ToolDeps) {
           input.phoneCountryCode,
           input.phone,
         );
-        return { ok: true, ...lookup };
+        if (lookup.customer?.pets === undefined) return { ok: true, ...lookup };
+        const { pets: omitted, ...customer } = lookup.customer;
+        void omitted;
+        return { ok: true, ...lookup, customer };
       } catch (err) {
         return mapChatbotError(err);
       }

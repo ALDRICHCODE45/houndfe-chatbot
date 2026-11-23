@@ -128,6 +128,137 @@ describe('getOrderHistory response parsing', () => {
     ).rejects.toBeInstanceOf(UpstreamError);
   });
 
+  describe('T4a: per-line pet and ?petId (customer-pets contract §6)', () => {
+    const petId = '8d0e0f6e-5b87-4c2c-8d3a-1f6f0c7a9b11';
+    const line = order.items[0];
+    const withPets = {
+      ...order,
+      items: [
+        {
+          ...line,
+          pet: { id: petId, name: 'Bruno', species: 'DOG', status: 'ACTIVE' },
+        },
+        { ...line, productName: 'Shampoo', pet: null },
+        {
+          ...line,
+          productName: 'Arena',
+          pet: { id: null, name: 'Max', species: 'CAT', status: null },
+        },
+        { ...line, productName: 'Juguete' },
+      ],
+    };
+
+    it('tolerates and parses pet: object, snapshot-only object, null and absent (deploy prerequisite)', async () => {
+      request.mockReturnValue(of(response([withPets])));
+      const [parsed] = await client.getOrderHistory('5512345678', '52');
+      expect(parsed.items[0].pet).toEqual({
+        id: petId,
+        name: 'Bruno',
+        species: 'DOG',
+        status: 'ACTIVE',
+      });
+      expect(parsed.items[1].pet).toBeNull();
+      expect(parsed.items[2].pet).toEqual({
+        id: null,
+        name: 'Max',
+        species: 'CAT',
+        status: null,
+      });
+      expect('pet' in parsed.items[3]).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('strips unknown members inside pet', async () => {
+      request.mockReturnValue(
+        of(
+          response([
+            {
+              ...order,
+              items: [
+                {
+                  ...line,
+                  pet: {
+                    id: petId,
+                    name: 'Bruno',
+                    species: 'DOG',
+                    status: 'ARCHIVED',
+                    extra: 1,
+                  },
+                },
+              ],
+            },
+          ]),
+        ),
+      );
+      const [parsed] = await client.getOrderHistory('5512345678', '52');
+      expect(parsed.items[0].pet).toEqual({
+        id: petId,
+        name: 'Bruno',
+        species: 'DOG',
+        status: 'ARCHIVED',
+      });
+    });
+
+    it.each([
+      [
+        'an object of nulls',
+        { id: null, name: null, species: null, status: null },
+      ],
+      [
+        'id without status',
+        { id: petId, name: 'Bruno', species: 'DOG', status: null },
+      ],
+      [
+        'a bad status',
+        { id: petId, name: 'Bruno', species: 'DOG', status: 'GONE' },
+      ],
+    ])('maps a pet with %s to UpstreamError', async (_label, pet) => {
+      request.mockReturnValue(
+        of(response([{ ...order, items: [{ ...line, pet }] }])),
+      );
+      await expect(
+        client.getOrderHistory('5512345678', '52'),
+      ).rejects.toBeInstanceOf(UpstreamError);
+    });
+
+    it('sends ?petId= only when asked', async () => {
+      request.mockReturnValue(of(response([withPets])));
+      await client.getOrderHistory('5512345678', '52', { petId });
+      expect(request.mock.calls[0][0].params).toEqual({
+        phoneCountryCode: '52',
+        petId,
+      });
+      await client.getOrderHistory('5512345678', '52', {});
+      expect(request.mock.calls[1][0].params).toEqual({
+        phoneCountryCode: '52',
+      });
+    });
+
+    it('surfaces 404 PET_NOT_FOUND for ?petId as a NotFoundError with the code', async () => {
+      request.mockReturnValue(
+        throwError(() =>
+          Object.assign(new Error('HTTP 404'), {
+            response: {
+              status: 404,
+              headers: {},
+              data: {
+                statusCode: 404,
+                error: 'PET_NOT_FOUND',
+                message: 'PET_NOT_FOUND',
+              },
+            },
+          }),
+        ),
+      );
+      await expect(
+        client.getOrderHistory('5512345678', '52', { petId }),
+      ).rejects.toMatchObject({
+        statusCode: 404,
+        errorCode: 'PET_NOT_FOUND',
+      });
+    });
+  });
+
   it.each(['', '   '])(
     'refuses a blank phoneCountryCode %j before any request',
     async (cc) => {

@@ -95,6 +95,10 @@ export const CreateCheckoutInputSchema = z
                  *  confirms (`unitPriceCents` = its `finalPriceCents`). Sent
                  *  only when present; `null` = omitted. */
                 backorderId: uuid.nullish(),
+                /** Customer-pets contract §5: an ACTIVE pet of the
+                 *  checkout's customer. Sent only when present (it joins the
+                 *  idempotency hash only then); `null` = omitted. */
+                petId: uuid.nullish(),
               })
               .strict(),
           )

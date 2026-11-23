@@ -148,6 +148,96 @@ describe('atomic checkout mocked HTTP contract', () => {
     ).rejects.toMatchObject({ errorCode: 'INVALID_CHECKOUT_REQUEST' });
     expect(request).not.toHaveBeenCalled();
   });
+  describe('T4a: sale.items[i].petId (customer-pets contract §5)', () => {
+    const petId = '8d0e0f6e-5b87-4c2c-8d3a-1f6f0c7a9b11';
+    /** The wire body of `input` as sent before pets existed (pinned). */
+    const legacyWire =
+      '{"phoneCountryCode":"52","phone":"5512345678",' +
+      `"customer":{"mode":"existing","customerId":"${id}"},` +
+      `"deliveryAddress":{"mode":"existing","addressId":"${id}","expectedVersion":"2026-06-22T00:00:00.000Z"},` +
+      `"sale":{"cashierUserId":"${id}","items":[{"productId":"${id}","productName":"Food","quantity":1,"unitPriceCents":60000}],` +
+      '"expectedTotalCents":61000,"shipping":{"quoteId":"quote-1"}}}';
+
+    it('a checkout without petId is byte-identical to before (body and key)', async () => {
+      request.mockReturnValue(of(response(receipt)));
+      await client.createCheckout(input, key);
+      expect(JSON.stringify(request.mock.calls[0][0].data)).toBe(legacyWire);
+      expect(request.mock.calls[0][0].headers).toMatchObject({
+        'X-Idempotency-Key': key,
+      });
+    });
+
+    it.each([
+      ['null', null],
+      ['undefined', undefined],
+    ])('a %s petId is omitted (no member, same bytes)', async (_l, value) => {
+      request.mockReturnValue(of(response(receipt)));
+      const sale = {
+        ...input.sale,
+        items: [{ ...input.sale.items[0], petId: value }],
+      };
+      await client.createCheckout({ ...input, sale }, key);
+      const sent = request.mock.calls[0][0].data as typeof input;
+      expect(Object.keys(sent.sale.items[0])).not.toContain('petId');
+      expect(JSON.stringify(sent)).toBe(legacyWire);
+    });
+
+    it('sends petId on the line that has it and keeps the other lines byte-identical', async () => {
+      request.mockReturnValue(of(response(receipt)));
+      const petLine = { ...input.sale.items[0], quantity: 2, petId };
+      const sale = { ...input.sale, items: [petLine, input.sale.items[0]] };
+      await client.createCheckout({ ...input, sale }, key);
+      const sent = request.mock.calls[0][0].data as typeof input;
+      expect(sent.sale.items).toEqual([petLine, input.sale.items[0]]);
+      expect(JSON.stringify(sent.sale.items[1])).toBe(
+        JSON.stringify(input.sale.items[0]),
+      );
+    });
+
+    it('a null petId and a null backorderId on the same line are both omitted', async () => {
+      request.mockReturnValue(of(response(receipt)));
+      const sale = {
+        ...input.sale,
+        items: [{ ...input.sale.items[0], petId: null, backorderId: null }],
+      };
+      await client.createCheckout({ ...input, sale }, key);
+      expect(JSON.stringify(request.mock.calls[0][0].data)).toBe(legacyWire);
+    });
+
+    it('a non-uuid petId is rejected before HTTP', async () => {
+      const sale = {
+        ...input.sale,
+        items: [{ ...input.sale.items[0], petId: 'bruno' }],
+      };
+      await expect(
+        client.createCheckout({ ...input, sale }, key),
+      ).rejects.toMatchObject({ errorCode: 'INVALID_CHECKOUT_REQUEST' });
+      expect(request).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [404, 'PET_NOT_FOUND'],
+      [422, 'PET_CUSTOMER_MISMATCH'],
+      [422, 'PET_ARCHIVED'],
+    ])(
+      '%s %s passes through with its code, single attempt',
+      async (statusCode, code) => {
+        request.mockReturnValue(
+          throwError(() => ({
+            response: {
+              status: statusCode,
+              data: { statusCode, error: code, message: code },
+            },
+          })),
+        );
+        await expect(client.createCheckout(input, key)).rejects.toMatchObject({
+          statusCode,
+          errorCode: code,
+        });
+        expect(request).toHaveBeenCalledTimes(1);
+      },
+    );
+  });
   it.each([
     [404, 'BACKORDER_NOT_FOUND', {}],
     [409, 'BACKORDER_NOT_RESERVED', { status: 'EXPIRED' }],

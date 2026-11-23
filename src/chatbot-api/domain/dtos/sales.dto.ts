@@ -136,6 +136,11 @@ export interface UpdateDeliveryInput {
   estimatedDeliveryAt?: string | null;
 }
 
+export interface OrderHistoryQuery {
+  /** Customer-pets contract §6 `?petId=`; omitted when unset. */
+  petId?: string;
+}
+
 export interface OrderHistoryResponse {
   saleId: string;
   folio: string | null;
@@ -153,6 +158,11 @@ export interface OrderHistoryResponse {
     variantName: string | null;
     quantity: number;
     unitPriceCents: number;
+    /** Customer-pets contract §6: the line's pet snapshot. Absent before the
+     *  backend's pets deploy; `null` for no pet, old lines and really deleted
+     *  pets; `id`/`status` `null` when only the snapshot remains (its
+     *  customer was deleted). */
+    pet?: OrderHistoryLinePet | null;
   }>;
   payments: Array<{
     method: string;
@@ -165,9 +175,41 @@ export interface OrderHistoryResponse {
   } | null;
 }
 
+/** `status` is the pet's CURRENT status; the rest is the frozen snapshot. */
+export type OrderHistoryLinePet =
+  | {
+      id: string;
+      name: string;
+      species: 'DOG' | 'CAT' | 'OTHER';
+      status: 'ACTIVE' | 'ARCHIVED';
+    }
+  | {
+      id: null;
+      name: string;
+      species: 'DOG' | 'CAT' | 'OTHER';
+      status: null;
+    };
+
 /* ---- Runtime parser (tolerant read: unknown keys stripped, see tolerant-read.ts) ---- */
 
 const historyCents = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+
+const historyPetSpecies = z.enum(['DOG', 'CAT', 'OTHER']);
+/** Never an object of nulls: a pet-less line is `null`. */
+const historyLinePet = z.union([
+  z.object({
+    id: z.string().min(1),
+    name: z.string(),
+    species: historyPetSpecies,
+    status: z.enum(['ACTIVE', 'ARCHIVED']),
+  }),
+  z.object({
+    id: z.null(),
+    name: z.string(),
+    species: historyPetSpecies,
+    status: z.null(),
+  }),
+]);
 
 const orderHistorySchema = z.array(
   z.object({
@@ -188,6 +230,7 @@ const orderHistorySchema = z.array(
         variantName: z.string().nullable(),
         quantity: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
         unitPriceCents: historyCents,
+        pet: historyLinePet.nullable().optional(),
       }),
     ),
     payments: z.array(

@@ -98,4 +98,29 @@ describe('makeGetCustomerByPhoneTool', () => {
       error: { kind: 'upstream', retryable: true },
     });
   });
+
+  it('T4a: keeps the tool output unchanged when the backend adds customer.pets (pets reach the model only with T4b)', async () => {
+    const customer = {
+      customerId: 'c1',
+      firstName: 'Ana',
+      lastName: null,
+      phoneCountryCode: '52',
+      phone: '5550001111',
+      preferredPaymentMethod: null,
+      address: null,
+    };
+    const getCustomerByPhone = jest.fn().mockResolvedValue({
+      found: true,
+      customer: { ...customer, pets: [{ id: 'p1', name: 'Bruno' }] },
+    });
+    const tool = makeGetCustomerByPhoneTool({
+      ...baseDeps,
+      chatbotApi: { getCustomerByPhone } as unknown as ChatbotApiClient,
+    });
+    const result = await tool.execute(
+      { phoneCountryCode: '+52', phone: '5550001111' },
+      { toolCallId: 't', messages: [], context: {} },
+    );
+    expect(result).toEqual({ ok: true, found: true, customer });
+  });
 });
