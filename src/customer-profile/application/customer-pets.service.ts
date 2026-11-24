@@ -25,13 +25,14 @@ import {
   localPetView,
   matchPetForFacts,
   mergeFactsIntoLocal,
+  uploadBackoffMs,
   type LocalPet,
   type LocalPetStore,
   type LocalSpecies,
   type PetCandidate,
 } from '../domain/customer-pets';
 import type { CustomerPet } from '../domain/customer-profile';
-import type { PetPromptView } from '../domain/pet-facts';
+import { petFactsConflict, type PetPromptView } from '../domain/pet-facts';
 import { CustomerProfileService } from './customer-profile.service';
 
 export const CUSTOMER_PETS_CLOCK = Symbol('CUSTOMER_PETS_CLOCK');
@@ -72,6 +73,12 @@ interface SenderPets {
   loadedAt: number;
 }
 
+interface PendingLoad {
+  force: boolean;
+  started: boolean;
+  promise: Promise<void>;
+}
+
 type Ref =
   | { kind: 'backend'; id: string }
   | { kind: 'local'; id: string }
@@ -96,6 +103,11 @@ type PatchOutcome = 'ok' | 'noop' | 'failed';
 export class CustomerPetsService {
   private readonly logger = new Logger(CustomerPetsService.name);
   private readonly cache = new Map<string, SenderPets>();
+  /** B5: per-sender tail of the serialized pet work (loads, captures and
+   *  their local writes); removed when the sender goes idle. */
+  private readonly queues = new Map<string, Promise<void>>();
+  /** B5: the sender's queued or running prepare (single flight). */
+  private readonly loads = new Map<string, PendingLoad>();
   private readonly now: () => Date;
   private readonly newId: () => string;
 
@@ -116,13 +128,80 @@ export class CustomerPetsService {
    *  local pets of a Customer. */
   async prepare(senderId: string, force = false): Promise<void> {
     if (this.profiles.isForgotten(senderId)) return;
+    // Fresh: nothing to do, no need to wait behind a running capture.
+    if (!force && this.isFresh(senderId)) return;
+    // Single flight: join the sender's pending prepare. A forced one (after
+    // an order) joins only a prepare that has not started its lookup yet
+    // (and makes it forced); a running one may predate the new Customer.
+    const pending = this.loads.get(senderId);
+    if (pending !== undefined && (!force || !pending.started)) {
+      if (force) pending.force = true;
+      return pending.promise;
+    }
+    const entry: PendingLoad = {
+      force,
+      started: false,
+      promise: Promise.resolve(),
+    };
+    entry.promise = this.serialized(senderId, async () => {
+      entry.started = true;
+      try {
+        await this.load(senderId, entry.force);
+      } finally {
+        if (this.loads.get(senderId) === entry) this.loads.delete(senderId);
+      }
+    });
+    this.loads.set(senderId, entry);
+    await entry.promise;
+  }
+
+  /** After an order: the checkout may have created the Customer (S8). */
+  async afterCheckout(senderId: string): Promise<void> {
+    await this.prepare(senderId, true);
+  }
+
+  /**
+   * Applies one statement's facts (`extractPetFacts` or rememberPetDetails)
+   * to the matched pet. `legacy` is the single stored pet of the profile
+   * (until T6 moves it): facts about it keep updating it like before.
+   * Serialized per sender (B5): overlapping captures never lose an entry.
+   */
+  async capture(
+    senderId: string,
+    facts: CustomerPet,
+    legacy?: CustomerPet,
+  ): Promise<void> {
+    if (!hasPetFacts(facts) || this.profiles.isForgotten(senderId)) return;
+    await this.serialized(senderId, () =>
+      this.captureNow(senderId, facts, legacy),
+    );
+  }
+
+  private isFresh(senderId: string): boolean {
     const state = this.cache.get(senderId);
-    if (
-      !force &&
+    return (
       state !== undefined &&
       this.now().getTime() - state.loadedAt < CUSTOMER_PETS_REFRESH_MS
-    )
-      return;
+    );
+  }
+
+  /** Runs `task` after every earlier task of the sender (never rejects the
+   *  queue: a failed task does not block the next one). */
+  private serialized(senderId: string, task: () => Promise<void>) {
+    const previous = this.queues.get(senderId) ?? Promise.resolve();
+    const run = previous.then(task);
+    const tail = run.catch(() => undefined);
+    this.queues.set(senderId, tail);
+    void tail.then(() => {
+      if (this.queues.get(senderId) === tail) this.queues.delete(senderId);
+    });
+    return run;
+  }
+
+  private async load(senderId: string, force: boolean): Promise<void> {
+    if (this.profiles.isForgotten(senderId)) return;
+    if (!force && this.isFresh(senderId)) return;
+    const state = this.cache.get(senderId);
     try {
       let local: LocalPet[];
       let localKnown = true;
@@ -148,24 +227,14 @@ export class CustomerPetsService {
     }
   }
 
-  /** After an order: the checkout may have created the Customer (S8). */
-  async afterCheckout(senderId: string): Promise<void> {
-    await this.prepare(senderId, true);
-  }
-
-  /**
-   * Applies one statement's facts (`extractPetFacts` or rememberPetDetails)
-   * to the matched pet. `legacy` is the single stored pet of the profile
-   * (until T6 moves it): facts about it keep updating it like before.
-   */
-  async capture(
+  private async captureNow(
     senderId: string,
     facts: CustomerPet,
-    legacy?: CustomerPet,
+    legacy: CustomerPet | undefined,
   ): Promise<void> {
-    if (!hasPetFacts(facts) || this.profiles.isForgotten(senderId)) return;
+    if (this.profiles.isForgotten(senderId)) return;
     try {
-      if (!this.cache.has(senderId)) await this.prepare(senderId);
+      if (!this.cache.has(senderId)) await this.load(senderId, false);
       const state = this.cache.get(senderId);
       if (state === undefined) return;
       const { scope } = state;
@@ -173,7 +242,13 @@ export class CustomerPetsService {
         scope.kind === 'unavailable' ||
         scope.kind === 'customer_pets_unknown'
       ) {
-        this.logger.log(`pet facts not stored: pets ${scope.kind}`);
+        // B4: no pet store this turn, but the legacy single pet keeps the
+        // baseline merge-only profile write (another pet is never mixed in).
+        if (petFactsConflict(legacy, facts)) {
+          this.logger.log(`pet facts not stored: pets ${scope.kind}`);
+          return;
+        }
+        await this.profiles.record(senderId, { pet: facts });
         return;
       }
       if (!state.localKnown) {
@@ -210,7 +285,11 @@ export class CustomerPetsService {
     if (state?.scope.kind === 'customer')
       views.push(...state.scope.pets.map(backendPetView));
     const now = this.now();
-    views.push(...(state?.local ?? []).map((pet) => localPetView(pet, now)));
+    views.push(
+      ...(state === undefined ? [] : this.visibleLocal(state)).map((pet) =>
+        localPetView(pet, now),
+      ),
+    );
     if (legacy !== undefined && Object.keys(legacy).length > 0) {
       const name = legacy.name;
       const shadowed =
@@ -265,21 +344,57 @@ export class CustomerPetsService {
           name: pet.name,
           species: backendSpecies(pet),
         });
-    for (const pet of state.local)
+    for (const pet of this.visibleLocal(state))
       out.push({
         ref: { kind: 'local', id: pet.id },
         ...(pet.name === undefined ? {} : { name: pet.name }),
         ...speciesOf(factsSpecies(localPetFacts(pet, this.now()))),
         nameable: true,
       });
-    if (legacy !== undefined && Object.keys(legacy).length > 0)
-      out.push({
-        ref: { kind: 'legacy' },
-        ...(legacy.name === undefined ? {} : { name: legacy.name }),
-        ...speciesOf(factsSpecies(legacy)),
-        nameable: true,
-      });
+    if (legacy !== undefined && Object.keys(legacy).length > 0) {
+      // B3: a legacy pet shadowed by a store pet with the same name and
+      // species is that pet: the facts go to the store pet.
+      const name = legacy.name;
+      const species = factsSpecies(legacy);
+      const shadowed =
+        name !== undefined &&
+        out.some(
+          (candidate) =>
+            candidate.name !== undefined &&
+            foldPetName(candidate.name) === foldPetName(name) &&
+            (species === undefined ||
+              candidate.species === undefined ||
+              candidate.species === species),
+        );
+      if (!shadowed)
+        out.push({
+          ref: { kind: 'legacy' },
+          ...(name === undefined ? {} : { name }),
+          ...speciesOf(species),
+          nameable: true,
+        });
+    }
     return out;
+  }
+
+  /**
+   * B6: local entries that are not a backend pet already. For a Customer, a
+   * local entry (pending or blocked) with the name and species of an ACTIVE
+   * backend pet is that pet: no second prompt line, never a match candidate.
+   */
+  private visibleLocal(state: SenderPets): LocalPet[] {
+    if (state.scope.kind !== 'customer') return state.local;
+    const backendKeys = new Set(
+      state.scope.pets.map(
+        (pet) => `${foldPetName(pet.name)}|${backendSpecies(pet)}`,
+      ),
+    );
+    return state.local.filter((pet) => {
+      const body = localCreateBody(pet);
+      if (body === null) return true;
+      const species = body.species === 'DOG' ? 'perro' : 'gato';
+      return !backendKeys.has(`${foldPetName(body.name)}|${species}`);
+    });
   }
 
   /* ------------------------------------------------------------- writes */
@@ -363,6 +478,15 @@ export class CustomerPetsService {
         foldPetName(candidate.name) === foldPetName(current.name) &&
         candidate.species === current.species,
     );
+    if (pet.upload === undefined && same.length > 1) {
+      // B6 (conservative): several ACTIVE backend pets already have this
+      // name and species: no new pet, no guess which one to patch.
+      this.logger.log(
+        'pet not uploaded: several backend pets have its name and species (local entry dropped)',
+      );
+      await this.removeLocal(senderId, localId);
+      return;
+    }
     if (pet.upload === undefined && same.length === 1) {
       const outcome = await this.patchBackend(
         senderId,
@@ -375,8 +499,14 @@ export class CustomerPetsService {
     }
     // A retry under the same key must send the first attempt's bytes.
     let body = current;
-    if (pet.upload?.customerId === scope.customerId) body = pet.upload.body;
-    else {
+    let attempts = 0;
+    if (pet.upload?.customerId === scope.customerId) {
+      // B1: no retry before the persisted next attempt time.
+      const next = pet.upload.nextAttemptAt;
+      if (next !== undefined && Date.parse(next) > this.now().getTime()) return;
+      body = pet.upload.body;
+      attempts = pet.upload.attempts ?? 0;
+    } else {
       const frozen: LocalPet = {
         ...pet,
         upload: { customerId: scope.customerId, body },
@@ -391,7 +521,7 @@ export class CustomerPetsService {
     try {
       result = await this.client.createPet(scope.customerId, body, key);
     } catch (error) {
-      this.warn('pet create', error);
+      await this.createFailed(senderId, localId, errorStatus(error), attempts);
       return;
     }
     switch (result.kind) {
@@ -430,8 +560,34 @@ export class CustomerPetsService {
         return;
       }
       default:
-        this.logger.warn(`pet create not done: ${result.kind} (kept local)`);
+        await this.createFailed(senderId, localId, result.kind, attempts);
     }
+  }
+
+  /** B1: one more failed attempt, persisted with its backoff. */
+  private async createFailed(
+    senderId: string,
+    localId: string,
+    status: string,
+    previous: number,
+  ): Promise<void> {
+    const attempts = previous + 1;
+    const wait = uploadBackoffMs(attempts);
+    this.logger.warn(
+      `pet create not done: ${status} (attempt ${attempts}, next in ${Math.round(wait / 60_000)} min, kept local)`,
+    );
+    const latest = this.cache.get(senderId);
+    if (latest === undefined) return;
+    const nextAttemptAt = new Date(this.now().getTime() + wait).toISOString();
+    await this.writeLocal(
+      senderId,
+      latest,
+      latest.local.map((entry) =>
+        entry.id === localId && entry.upload !== undefined
+          ? { ...entry, upload: { ...entry.upload, attempts, nextAttemptAt } }
+          : entry,
+      ),
+    );
   }
 
   /**
@@ -568,6 +724,13 @@ export class CustomerPetsService {
       `customer pets ${operation} failed: ${error instanceof Error ? error.name : 'unknown'}`,
     );
   }
+}
+
+/** The HTTP status of a failed call when known, else the error name. */
+function errorStatus(error: unknown): string {
+  const status = (error as { statusCode?: unknown } | null)?.statusCode;
+  if (typeof status === 'number') return String(status);
+  return error instanceof Error ? error.name : 'unknown';
 }
 
 function backendSpecies(pet: BackendPet): LocalSpecies | 'otro' {

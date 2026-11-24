@@ -57,8 +57,17 @@ export interface LocalPet {
    * The create body of the first upload attempt: a retry under the same key
    * must send the same bytes (a changed body would be a key conflict).
    * `blocked` stops retries after an `IDEMPOTENCY_KEY_CONFLICT`.
+   * `attempts` / `nextAttemptAt` (T4b-fix-B B1): failed creates so far and
+   * the earliest next try (exponential backoff, capped). Absent (entries
+   * written before them) = attempt 0, due now.
    */
-  upload?: { customerId: string; body: CreatePetInput; blocked?: true };
+  upload?: {
+    customerId: string;
+    body: CreatePetInput;
+    blocked?: true;
+    attempts?: number;
+    nextAttemptAt?: string;
+  };
 }
 
 /** Local pets of a sender (`customer_profiles.pets`, migration 5700). */
@@ -71,6 +80,19 @@ export interface LocalPetStore {
 
 /** Bounds of the local list (the column CHECK bounds its bytes too). */
 export const LOCAL_PETS_MAX = 20;
+
+/** B1: wait before the next create after `attempts` failures: 1 min,
+ *  doubling, capped at 1 h. */
+export const UPLOAD_BACKOFF_BASE_MS = 60_000;
+export const UPLOAD_BACKOFF_MAX_MS = 60 * 60_000;
+
+export function uploadBackoffMs(attempts: number): number {
+  const exponent = Math.max(0, attempts - 1);
+  return Math.min(
+    UPLOAD_BACKOFF_MAX_MS,
+    UPLOAD_BACKOFF_BASE_MS * 2 ** Math.min(exponent, 30),
+  );
+}
 
 export const BUSINESS_TIME_ZONE = 'America/Mexico_City';
 
@@ -490,6 +512,15 @@ function normalizeLocalPet(raw: unknown): LocalPet | null {
       customerId: upload.customerId,
       body: upload.body as CreatePetInput,
       ...(upload.blocked === true ? { blocked: true as const } : {}),
+      // B1: invalid or missing backoff fields read as attempt 0, due now.
+      ...(Number.isSafeInteger(upload.attempts) &&
+      (upload.attempts as number) >= 1
+        ? { attempts: upload.attempts as number }
+        : {}),
+      ...(typeof upload.nextAttemptAt === 'string' &&
+      !Number.isNaN(Date.parse(upload.nextAttemptAt))
+        ? { nextAttemptAt: upload.nextAttemptAt }
+        : {}),
     };
   return out;
 }
@@ -523,7 +554,8 @@ export function backendPetView(pet: BackendPet): PetPromptView {
       ? {}
       : { stage: stageFromMonths(pet.ageMonths, species) }),
     ...(pet.allergies === null ? {} : { allergies: pet.allergies }),
-    ...(pet.notes === null ? {} : { notes: pet.notes }),
+    // B2: backend notes may be staff-entered (POS): internal, never quoted.
+    ...(pet.notes === null ? {} : { internalNotes: pet.notes }),
   };
 }
 
@@ -569,21 +601,30 @@ const ALLERGY_INSTRUCTION =
   'Alergias registradas: si recomienda algo para una mascota con alergias, menciónelas y sugiera revisar los ingredientes en la etiqueta; ' +
   'nunca afirme que un producto es seguro o libre de ese ingrediente (el catálogo no tiene ingredientes).';
 
+const INTERNAL_NOTES_INSTRUCTION =
+  'Notas internas de la tienda: úselas solo para aconsejar mejor; nunca las cite, repita ni revele al cliente.';
+
 /**
  * The pet part of the system prompt: one «Mascota conocida» line per known
  * ACTIVE pet. One pet keeps today's single line (search directly); 2+ pets
  * add the instruction not to assume which pet; any allergy adds the S5
- * warning. `null` with no pet (or a single name-only pet).
+ * warning; any internal (staff) note adds the B2 instruction. `null` with
+ * no pet (or a single name-only pet).
  */
 export function knownPetsPrompt(
   views: ReadonlyArray<PetPromptView>,
 ): string | null {
   if (views.length === 0) return null;
   const allergies = views.some((view) => view.allergies !== undefined);
+  const internal = views.some((view) => view.internalNotes !== undefined);
+  const extra = [
+    ...(allergies ? [ALLERGY_INSTRUCTION] : []),
+    ...(internal ? [INTERNAL_NOTES_INSTRUCTION] : []),
+  ];
   if (views.length === 1) {
     const line = knownPetPromptLineOf(views[0]);
     if (line === null) return null;
-    return allergies ? `${line}\n${ALLERGY_INSTRUCTION}` : line;
+    return [line, ...extra].join('\n');
   }
   const lines = views.map((view) => {
     const { facts, query, searchable } = petPromptFacts(view);
@@ -592,9 +633,5 @@ export function knownPetsPrompt(
       (searchable ? ` Búsqueda para esta mascota: «${query}».` : '')
     );
   });
-  return [
-    ...lines,
-    MULTI_PET_INSTRUCTION,
-    ...(allergies ? [ALLERGY_INSTRUCTION] : []),
-  ].join('\n');
+  return [...lines, MULTI_PET_INSTRUCTION, ...extra].join('\n');
 }

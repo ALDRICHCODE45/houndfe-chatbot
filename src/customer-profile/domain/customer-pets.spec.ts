@@ -298,3 +298,84 @@ describe('matchPetForFacts', () => {
     });
   });
 });
+
+describe('local upload backoff fields (T4b-fix-B B1)', () => {
+  const body = { name: 'Max', species: 'DOG' as const };
+  const base = {
+    id: ID,
+    name: 'Max',
+    species: 'perro',
+    createdAt: NOW.toISOString(),
+  };
+
+  it('keeps a valid attempt counter and next attempt time', () => {
+    const upload = {
+      customerId: 'c',
+      body,
+      attempts: 3,
+      nextAttemptAt: '2026-11-23T18:04:00.000Z',
+    };
+    expect(normalizeLocalPets([{ ...base, upload }])).toEqual([
+      { ...base, upload },
+    ]);
+  });
+
+  it('an entry without them (or with invalid ones) is attempt 0, due now', () => {
+    expect(
+      normalizeLocalPets([
+        { ...base, upload: { customerId: 'c', body } },
+        {
+          ...base,
+          id: 'x',
+          upload: {
+            customerId: 'c',
+            body,
+            attempts: -1,
+            nextAttemptAt: 'soon',
+          },
+        },
+        {
+          ...base,
+          id: 'y',
+          upload: { customerId: 'c', body, attempts: 1.5 },
+        },
+      ]),
+    ).toEqual([
+      { ...base, upload: { customerId: 'c', body } },
+      { ...base, id: 'x', upload: { customerId: 'c', body } },
+      { ...base, id: 'y', upload: { customerId: 'c', body } },
+    ]);
+  });
+
+  it('20 maximal ASCII entries with the backoff fields stay within the 32768-byte column cap', () => {
+    const long = (n: number) => 'x'.repeat(n);
+    const pet: LocalPet = {
+      id: ID,
+      name: long(40),
+      species: 'perro',
+      breed: long(60),
+      size: 'gigante',
+      birthDate: '2020-01-01',
+      birthDatePrecision: 'MONTH',
+      stage: 'cachorro',
+      notes: long(200),
+      createdAt: NOW.toISOString(),
+    };
+    const created = localCreateBody(pet);
+    if (created === null) throw new Error('no body');
+    const full: LocalPet = {
+      ...pet,
+      upload: {
+        customerId: '5c1e9a02-77d4-4b8a-a1f3-0e2d4c6b8a90',
+        body: created,
+        blocked: true,
+        attempts: 999_999,
+        nextAttemptAt: NOW.toISOString(),
+      },
+    };
+    const bytes = Buffer.byteLength(
+      JSON.stringify(Array.from({ length: 20 }, () => full)),
+    );
+    expect(bytes).toBeLessThanOrEqual(32768);
+  });
+});

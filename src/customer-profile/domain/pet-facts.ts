@@ -380,6 +380,8 @@ export interface PetPromptView {
   stage?: 'cachorro' | 'adulto' | 'senior';
   allergies?: string;
   notes?: string;
+  /** B2: staff-entered notes (backend pet): shown marked internal. */
+  internalNotes?: string;
 }
 
 /**
@@ -392,7 +394,7 @@ export function petPromptFacts(pet: PetPromptView): {
   query: string;
   searchable: boolean;
 } {
-  const { name, breed, ageText: age, notes, allergies } = pet;
+  const { name, breed, ageText: age, notes, allergies, internalNotes } = pet;
   const searchable = !(
     pet.species === undefined &&
     breed === undefined &&
@@ -427,6 +429,8 @@ export function petPromptFacts(pet: PetPromptView): {
   if (allergies !== undefined)
     parts.push(`alergias ${JSON.stringify(allergies)}`);
   if (notes !== undefined) parts.push(`notas ${JSON.stringify(notes)}`);
+  if (internalNotes !== undefined)
+    parts.push(`notas internas de la tienda ${JSON.stringify(internalNotes)}`);
   const query = [
     'croquetas',
     species,

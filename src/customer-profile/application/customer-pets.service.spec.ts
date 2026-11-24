@@ -339,7 +339,9 @@ describe('CustomerPetsService (T4b)', () => {
           ...input,
         }),
       );
-      // Same pet by name: updates the local entry (still pending upload).
+      // Same pet by name: updates the local entry (still pending upload),
+      // retried once the backoff (B1: 1 min after attempt 1) has passed.
+      h.advance(MINUTE);
       await h.service.capture(
         SENDER,
         extractPetFacts('mi perro Max tiene 2 años'),
@@ -699,5 +701,479 @@ describe('CustomerPetsService (T4b)', () => {
     await h.say('mi perro Max es un husky');
     expect(h.client.createPet).not.toHaveBeenCalled();
     expect(h.service.promptLines(SENDER)).toBeNull();
+  });
+});
+
+describe('CustomerPetsService (T4b-fix-B)', () => {
+  let warn: jest.SpiedFunction<Logger['warn']>;
+  beforeEach(() => {
+    warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const upstream = (statusCode: number) =>
+    Object.assign(new Error('upstream'), { name: 'UpstreamError', statusCode });
+
+  describe('B1: failed creates back off (review R4)', () => {
+    it('a failed create persists attempt 1 and the next attempt time; no retry before it', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockRejectedValue(upstream(500));
+      await h.say('mi perro Max es un husky');
+      const [entry] = await h.local();
+      expect(entry.upload).toMatchObject({
+        attempts: 1,
+        nextAttemptAt: new Date(NOW.getTime() + MINUTE).toISOString(),
+      });
+      expect(JSON.stringify(warn.mock.calls)).toMatch(/500.*attempt 1/);
+      // Due after one minute: the second attempt fails → 2 minutes.
+      h.advance(MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.createPet).toHaveBeenCalledTimes(2);
+      expect((await h.local())[0].upload).toMatchObject({
+        attempts: 2,
+        nextAttemptAt: new Date(NOW.getTime() + 3 * MINUTE).toISOString(),
+      });
+      // A refresh before the next attempt time does not retry.
+      h.advance(MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.getCustomerByPhone).toHaveBeenCalledTimes(3);
+      expect(h.client.createPet).toHaveBeenCalledTimes(2);
+      // Nor does a capture about the same pet.
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi perro Max tiene 2 años'),
+      );
+      expect(h.client.createPet).toHaveBeenCalledTimes(2);
+      h.advance(MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.createPet).toHaveBeenCalledTimes(3);
+      // Same key and bytes on every attempt.
+      const calls = h.client.createPet.mock.calls;
+      expect(calls[2]).toEqual(calls[0]);
+    });
+
+    it('the backoff is capped at one hour', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockRejectedValue(upstream(500));
+      await h.say('mi perro Max es un husky');
+      for (let i = 0; i < 12; i += 1) {
+        h.advance(61 * MINUTE);
+        await h.service.prepare(SENDER);
+      }
+      const [entry] = await h.local();
+      expect(entry.upload?.attempts).toBe(13);
+      const wait =
+        Date.parse(entry.upload?.nextAttemptAt ?? '') -
+        (NOW.getTime() + 12 * 61 * MINUTE);
+      expect(wait).toBe(60 * MINUTE);
+      expect(JSON.stringify(warn.mock.calls)).toContain('attempt 13');
+    });
+
+    it('a non-ok create answer (IDEMPOTENCY_KEY_IN_FLIGHT) backs off too and is logged with its status', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockResolvedValue({
+        kind: 'IDEMPOTENCY_KEY_IN_FLIGHT',
+      });
+      await h.say('mi perro Max es un husky');
+      expect((await h.local())[0].upload).toMatchObject({ attempts: 1 });
+      expect(JSON.stringify(warn.mock.calls)).toMatch(
+        /IDEMPOTENCY_KEY_IN_FLIGHT.*attempt 1/,
+      );
+    });
+
+    it('an existing entry without the new fields is attempt 0, due now (no migration)', async () => {
+      const h = harness(found([]));
+      const body = { name: 'Max', species: 'DOG' as const, breed: 'husky' };
+      await h.localStore.write(
+        SENDER,
+        [
+          {
+            id: uuid(7),
+            name: 'Max',
+            species: 'perro',
+            breed: 'husky',
+            createdAt: NOW.toISOString(),
+            upload: { customerId: CUSTOMER_ID, body },
+          },
+        ],
+        NOW,
+      );
+      await h.service.prepare(SENDER);
+      expect(h.client.createPet.mock.calls).toEqual([
+        [CUSTOMER_ID, body, `pet-local:${CUSTOMER_ID}:${uuid(7)}`],
+      ]);
+      await expect(h.local()).resolves.toEqual([]);
+    });
+
+    it('a success after failures removes the entry', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockRejectedValueOnce(upstream(503));
+      await h.say('mi perro Max es un husky');
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      await expect(h.local()).resolves.toEqual([]);
+    });
+  });
+
+  describe('B2: staff notes are internal (review R1-001)', () => {
+    it('backend notes stay in the prompt marked internal, with the instruction never to quote them', async () => {
+      const h = harness(found([backend({ notes: 'Cliente moroso' })]));
+      await h.service.prepare(SENDER);
+      const text = h.service.promptLines(SENDER) ?? '';
+      expect(text).toContain('notas internas de la tienda "Cliente moroso"');
+      expect(text).not.toContain('notas "Cliente moroso"');
+      expect(text).toMatch(/nunca las cite, repita ni revele/i);
+    });
+
+    it('with several pets the instruction appears once', async () => {
+      const h = harness(
+        found([
+          backend({ notes: 'Muerde' }),
+          backend({ id: uuid(50), name: 'Max', notes: 'Nervioso' }),
+        ]),
+      );
+      await h.service.prepare(SENDER);
+      const text = h.service.promptLines(SENDER) ?? '';
+      expect(text.match(/nunca las cite/g)).toHaveLength(1);
+      expect(text).toContain('notas internas de la tienda "Muerde"');
+      expect(text).toContain('notas internas de la tienda "Nervioso"');
+    });
+
+    it('notes the customer gave (local pet) are not marked internal and add no instruction', async () => {
+      const h = harness(notFound);
+      await h.service.prepare(SENDER);
+      await h.service.capture(SENDER, {
+        name: 'Luna',
+        species: 'perro',
+        notes: 'come poco',
+      });
+      const text = h.service.promptLines(SENDER) ?? '';
+      expect(text).toContain('notas "come poco"');
+      expect(text).not.toMatch(/internas|nunca las cite/);
+    });
+  });
+
+  describe('B3: a shadowed legacy pet is not a match candidate (review R3)', () => {
+    it('legacy and backend pet with the same name and species → the facts PATCH the backend pet, the legacy pet is untouched', async () => {
+      const h = harness(found([backend()]));
+      await h.profiles.record(SENDER, {
+        pet: { name: 'Bruno', species: 'perro' },
+      });
+      h.client.patchPet.mockResolvedValue({
+        kind: 'ok',
+        pet: backend({ version: 4 }),
+        warnings: [],
+      });
+      await h.service.prepare(SENDER);
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi perrito Bruno ya tiene 2 años'),
+        h.profiles.cached(SENDER)?.pet,
+      );
+      expect(h.client.patchPet.mock.calls).toEqual([
+        [CUSTOMER_ID, backend().id, { version: 3, approxAge: { years: 2 } }],
+      ]);
+      expect(h.profiles.cached(SENDER)?.pet).toEqual({
+        name: 'Bruno',
+        species: 'perro',
+      });
+    });
+
+    it('legacy and local pet with the same name → the local pet gets the facts', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es una labrador');
+      await h.profiles.record(SENDER, {
+        pet: { name: 'Luna', species: 'perro' },
+      });
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi perrita Luna tiene 3 años'),
+        h.profiles.cached(SENDER)?.pet,
+      );
+      expect((await h.local())[0]).toMatchObject({
+        name: 'Luna',
+        birthDate: '2023-01-01',
+      });
+      expect(h.profiles.cached(SENDER)?.pet).toEqual({
+        name: 'Luna',
+        species: 'perro',
+      });
+    });
+
+    it('a legacy pet of another species with the same name is still a candidate', async () => {
+      const h = harness(found([backend()]));
+      await h.profiles.record(SENDER, {
+        pet: { name: 'Bruno', species: 'gato' },
+      });
+      await h.service.prepare(SENDER);
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Bruno es siamés'),
+        h.profiles.cached(SENDER)?.pet,
+      );
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      expect(h.profiles.cached(SENDER)?.pet).toMatchObject({
+        name: 'Bruno',
+        breed: 'siamés',
+      });
+    });
+  });
+
+  describe('B4: read-only scopes still record legacy pet facts (review R3)', () => {
+    const legacyCase = async (lookup: CustomerLookupResponse | Error) => {
+      const h = harness(lookup);
+      await h.profiles.record(SENDER, {
+        pet: { name: 'Luna', species: 'perro' },
+      });
+      await h.service.prepare(SENDER);
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi perrita Luna es labrador'),
+        h.profiles.cached(SENDER)?.pet,
+      );
+      return h;
+    };
+
+    it('lookup unavailable → the legacy pet is updated through the profile, no pet route or local write', async () => {
+      const h = await legacyCase(new Error('down'));
+      expect(h.profiles.cached(SENDER)?.pet).toMatchObject({
+        name: 'Luna',
+        breed: 'labrador',
+      });
+      expect(h.client.createPet).not.toHaveBeenCalled();
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      await expect(h.local()).resolves.toEqual([]);
+    });
+
+    it('`pets` absent → the legacy pet is updated through the profile', async () => {
+      const h = await legacyCase(found(undefined));
+      expect(h.profiles.cached(SENDER)?.pet).toMatchObject({
+        name: 'Luna',
+        breed: 'labrador',
+      });
+      await expect(h.local()).resolves.toEqual([]);
+    });
+
+    it('facts about another pet are not mixed into the legacy pet (baseline conflict rule)', async () => {
+      const h = await legacyCase(new Error('down'));
+      const before = h.profiles.cached(SENDER)?.pet;
+      expect(before).toMatchObject({ name: 'Luna', breed: 'labrador' });
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi perro Max es un husky'),
+        before,
+      );
+      expect(h.profiles.cached(SENDER)?.pet).toEqual(before);
+    });
+  });
+
+  describe('B5: captures and local writes are serialized per sender (review R3)', () => {
+    it('two overlapping captures both keep their entry', async () => {
+      const h = harness(notFound);
+      await h.service.prepare(SENDER);
+      const original = h.localStore.write.bind(h.localStore);
+      jest.spyOn(h.localStore, 'write').mockImplementation(async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return original(...args);
+      });
+      await Promise.all([
+        h.service.capture(
+          SENDER,
+          extractPetFacts('mi perrita Luna es labrador'),
+        ),
+        h.service.capture(SENDER, extractPetFacts('mi gato Michi es persa')),
+      ]);
+      expect((await h.local()).map((pet) => pet.name).sort()).toEqual([
+        'Luna',
+        'Michi',
+      ]);
+      expect(
+        h.service.promptLines(SENDER)?.match(/Mascota conocida:/g),
+      ).toHaveLength(2);
+    });
+
+    it('a capture overlapping a refresh never loses its entry', async () => {
+      const h = harness(notFound);
+      await h.service.prepare(SENDER);
+      h.advance(2 * MINUTE);
+      const original = h.localStore.write.bind(h.localStore);
+      jest.spyOn(h.localStore, 'write').mockImplementation(async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return original(...args);
+      });
+      await Promise.all([
+        h.service.capture(
+          SENDER,
+          extractPetFacts('mi perrita Luna es labrador'),
+        ),
+        h.service.prepare(SENDER),
+      ]);
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Michi es persa'),
+      );
+      expect((await h.local()).map((pet) => pet.name).sort()).toEqual([
+        'Luna',
+        'Michi',
+      ]);
+    });
+
+    const prospectThenCustomer = async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es una labrador');
+      h.setLookup(found([]));
+      // A fresh process (cold cache), like a background prepare after restart.
+      const service = new CustomerPetsService(
+        h.localStore,
+        { getCustomerByPhone: h.getCustomerByPhone },
+        h.client as unknown as CustomerPetsClient,
+        h.profiles,
+        () => NOW,
+        () => uuid(80),
+      );
+      h.getCustomerByPhone.mockClear();
+      return { h, service };
+    };
+
+    it('two overlapping prepares → one by-phone lookup and one create (single flight)', async () => {
+      const { h, service } = await prospectThenCustomer();
+      await Promise.all([service.prepare(SENDER), service.prepare(SENDER)]);
+      expect(h.getCustomerByPhone).toHaveBeenCalledTimes(1);
+      expect(h.client.createPet).toHaveBeenCalledTimes(1);
+      await expect(h.local()).resolves.toEqual([]);
+    });
+
+    it('two overlapping afterCheckout prepares (forced) → one lookup and one create', async () => {
+      const { h, service } = await prospectThenCustomer();
+      await Promise.all([
+        service.afterCheckout(SENDER),
+        service.afterCheckout(SENDER),
+        service.prepare(SENDER),
+      ]);
+      expect(h.getCustomerByPhone).toHaveBeenCalledTimes(1);
+      expect(h.client.createPet).toHaveBeenCalledTimes(1);
+    });
+
+    it('afterCheckout during a running prepare still reads again afterwards (the checkout may have created the Customer)', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es una labrador');
+      h.advance(2 * MINUTE);
+      let release: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      h.getCustomerByPhone.mockImplementationOnce(async () => {
+        await gate;
+        return structuredClone(notFound);
+      });
+      const running = h.service.prepare(SENDER);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(h.getCustomerByPhone).toHaveBeenCalledTimes(2);
+      h.setLookup(found([]));
+      const checkout = h.service.afterCheckout(SENDER);
+      const capture = h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Michi es persa'),
+      );
+      release();
+      await Promise.all([running, checkout, capture]);
+      expect(h.getCustomerByPhone).toHaveBeenCalledTimes(3);
+      // Luna uploaded by the forced prepare, Michi by the capture after it.
+      expect(h.client.createPet.mock.calls.map((c) => c[1].name)).toEqual([
+        'Luna',
+        'Michi',
+      ]);
+      await expect(h.local()).resolves.toEqual([]);
+    });
+
+    it('a failing capture does not block the next one', async () => {
+      const h = harness(notFound);
+      await h.service.prepare(SENDER);
+      jest
+        .spyOn(h.localStore, 'write')
+        .mockRejectedValueOnce(new Error('db down'));
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi perrita Luna es labrador'),
+      );
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Michi es persa'),
+      );
+      expect((await h.local()).map((pet) => pet.name)).toEqual(['Michi']);
+    });
+  });
+
+  describe('B6: no local duplicate of a backend pet (verify N4)', () => {
+    const twoBrunos = () => [
+      backend(),
+      backend({
+        id: uuid(60),
+        breed: null,
+        ageMonths: 30,
+        ageLabel: '~2 años',
+      }),
+    ];
+
+    it('two ACTIVE backend pets with the local pet’s name and species → no create, no patch, the local entry is dropped, no extra prompt line', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno es un pug');
+      h.setLookup(found(twoBrunos()));
+      await h.service.afterCheckout(SENDER);
+      expect(h.client.createPet).not.toHaveBeenCalled();
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      await expect(h.local()).resolves.toEqual([]);
+      expect(
+        h.service.promptLines(SENDER)?.match(/Mascota conocida: "Bruno"/g),
+      ).toHaveLength(2);
+    });
+
+    it('a blocked entry never adds a second prompt line for the backend pet with its name and species', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockResolvedValue({
+        kind: 'IDEMPOTENCY_KEY_CONFLICT',
+      });
+      await h.say('mi perro Max es un husky');
+      expect((await h.local())[0].upload?.blocked).toBe(true);
+      h.setLookup(
+        found([backend({ id: uuid(70), name: 'Max', breed: 'husky' })]),
+      );
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.createPet).toHaveBeenCalledTimes(1);
+      expect(
+        h.service.promptLines(SENDER)?.match(/Mascota conocida: "Max"/g),
+      ).toHaveLength(1);
+    });
+
+    it('facts about a pet held by the backend and by a pending local entry go to the backend pet', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockRejectedValue(upstream(500));
+      await h.say('mi perro Max es un husky');
+      h.setLookup(
+        found([backend({ id: uuid(70), name: 'Max', breed: 'husky' })]),
+      );
+      h.advance(30 * MINUTE);
+      h.client.patchPet.mockResolvedValue({
+        kind: 'ok',
+        pet: backend({ id: uuid(70), name: 'Max', breed: 'husky', version: 4 }),
+        warnings: [],
+      });
+      await h.service.prepare(SENDER);
+      h.client.patchPet.mockClear();
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi perro Max tiene 5 años'),
+      );
+      expect(h.client.patchPet.mock.calls.map((call) => call[1])).toEqual([
+        uuid(70),
+      ]);
+      expect(
+        h.service.promptLines(SENDER)?.match(/Mascota conocida: "Max"/g),
+      ).toHaveLength(1);
+    });
   });
 });
