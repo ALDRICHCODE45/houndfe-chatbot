@@ -86,13 +86,27 @@ interface PendingLoad {
   promise: Promise<void>;
 }
 
+/** E1: one queue task's fence. Set when the task outlives its bound: from
+ *  then on its cache update (`remember`, backend pet cache) and every local
+ *  write it would start are refused. */
+interface Fence {
+  expired: boolean;
+}
+
 type Ref =
   | { kind: 'backend'; id: string }
   | { kind: 'local'; id: string }
   | { kind: 'legacy' };
 
-/** `failed` carries the HTTP status or answer kind (for the backoff log). */
-type PatchOutcome = 'ok' | 'noop' | { failed: string };
+/** `failed` carries the HTTP status or answer kind (for the backoff log).
+ *  E2 `forgotten`: stopped by «olvida mis datos» (not a failed attempt).
+ *  E3 `not_twin`: the reread pet no longer has the twin's name and species. */
+type PatchOutcome =
+  | 'ok'
+  | 'noop'
+  | 'forgotten'
+  | 'not_twin'
+  | { failed: string };
 
 /**
  * Multi-pet memory (T4b; S1, S2, S5, S6, S8). Every method is best effort and
@@ -116,6 +130,11 @@ export class CustomerPetsService {
   private readonly queues = new Map<string, Promise<void>>();
   /** B5: the sender's queued or running prepare (single flight). */
   private readonly loads = new Map<string, PendingLoad>();
+  /** E1: per-sender chain of local list I/O (each write, and each load's
+   *  read + cache update): a write never overlaps another write of the
+   *  sender (even one left in flight by a timed-out task) and is computed
+   *  from the list the previous write left. */
+  private readonly localIo = new Map<string, Promise<void>>();
   private readonly now: () => Date;
   private readonly newId: () => string;
 
@@ -159,10 +178,10 @@ export class CustomerPetsService {
     };
     entry.promise = this.serialized(
       senderId,
-      async () => {
+      async (fence) => {
         entry.started = true;
         try {
-          await this.load(senderId, entry.force);
+          await this.load(senderId, entry.force, fence);
         } finally {
           if (this.loads.get(senderId) === entry) this.loads.delete(senderId);
         }
@@ -193,8 +212,8 @@ export class CustomerPetsService {
     legacy?: CustomerPet,
   ): Promise<void> {
     if (!hasPetFacts(facts) || this.profiles.isForgotten(senderId)) return;
-    await this.serialized(senderId, () =>
-      this.captureNow(senderId, facts, legacy),
+    await this.serialized(senderId, (fence) =>
+      this.captureNow(senderId, facts, legacy, fence),
     );
   }
 
@@ -209,10 +228,10 @@ export class CustomerPetsService {
   /** Runs `task` after every earlier task of the sender (never rejects the
    *  queue: a failed task does not block the next one). C3: a task that
    *  outlives CUSTOMER_PETS_TASK_TIMEOUT_MS releases the queue (and its
-   *  caller); it may still finish in the background. */
+   *  caller); it may still finish in the background, fenced (E1). */
   private serialized(
     senderId: string,
-    task: () => Promise<void>,
+    task: (fence: Fence) => Promise<void>,
     onTimeout?: () => void,
   ) {
     const previous = this.queues.get(senderId) ?? Promise.resolve();
@@ -226,12 +245,14 @@ export class CustomerPetsService {
   }
 
   private bounded(
-    task: () => Promise<void>,
+    task: (fence: Fence) => Promise<void>,
     onTimeout: (() => void) | undefined,
   ): Promise<void> {
+    const fence: Fence = { expired: false };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<void>((resolve) => {
       timer = setTimeout(() => {
+        fence.expired = true;
         this.logger.warn(
           `customer pets task exceeded ${CUSTOMER_PETS_TASK_TIMEOUT_MS} ms: queue released`,
         );
@@ -240,33 +261,62 @@ export class CustomerPetsService {
       }, CUSTOMER_PETS_TASK_TIMEOUT_MS);
       timer.unref?.();
     });
-    return Promise.race([task(), expired]).finally(() => clearTimeout(timer));
+    return Promise.race([task(fence), expired]).finally(() =>
+      clearTimeout(timer),
+    );
   }
 
-  private async load(senderId: string, force: boolean): Promise<void> {
+  /** E1: runs `step` after every earlier local I/O step of the sender
+   *  (never rejects the chain). Steps never wait on another step. */
+  private localStep<T>(senderId: string, step: () => Promise<T>): Promise<T> {
+    const previous = this.localIo.get(senderId) ?? Promise.resolve();
+    const run = previous.then(step);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.localIo.set(senderId, tail);
+    void tail.then(() => {
+      if (this.localIo.get(senderId) === tail) this.localIo.delete(senderId);
+    });
+    return run;
+  }
+
+  private async load(
+    senderId: string,
+    force: boolean,
+    fence: Fence,
+  ): Promise<void> {
     if (this.profiles.isForgotten(senderId)) return;
     if (!force && this.isFresh(senderId)) return;
-    const state = this.cache.get(senderId);
     try {
-      let local: LocalPet[];
-      let localKnown = true;
-      try {
-        local = await this.localStore.read(senderId);
-      } catch (error) {
-        this.warn('local read', error);
-        localKnown = state?.localKnown === true;
-        local = localKnown && state !== undefined ? state.local : [];
-      }
       const scope = await this.resolveScope(senderId);
-      this.remember(senderId, {
-        scope,
-        local,
-        localKnown,
-        // An unknown local list is never cached as fresh: the next turn reads.
-        loadedAt: localKnown ? this.now().getTime() : 0,
+      // E1: the local read and the cache update are one local I/O step (no
+      // write lands in between), refused once the task is past its bound.
+      const remembered = await this.localStep(senderId, async () => {
+        if (fence.expired) return false;
+        const state = this.cache.get(senderId);
+        let local: LocalPet[];
+        let localKnown = true;
+        try {
+          local = await this.localStore.read(senderId);
+        } catch (error) {
+          this.warn('local read', error);
+          localKnown = state?.localKnown === true;
+          local = localKnown && state !== undefined ? state.local : [];
+        }
+        return this.remember(senderId, fence, {
+          scope,
+          local,
+          localKnown,
+          // An unknown local list is never cached as fresh: the next turn reads.
+          loadedAt: localKnown ? this.now().getTime() : 0,
+        })
+          ? localKnown
+          : false;
       });
-      if (scope.kind === 'customer' && localKnown)
-        await this.uploadPending(senderId);
+      if (scope.kind === 'customer' && remembered)
+        await this.uploadPending(senderId, fence);
     } catch (error) {
       this.warn('prepare', error);
     }
@@ -276,10 +326,11 @@ export class CustomerPetsService {
     senderId: string,
     facts: CustomerPet,
     legacy: CustomerPet | undefined,
+    fence: Fence,
   ): Promise<void> {
     if (this.profiles.isForgotten(senderId)) return;
     try {
-      if (!this.cache.has(senderId)) await this.load(senderId, false);
+      if (!this.cache.has(senderId)) await this.load(senderId, false, fence);
       const state = this.cache.get(senderId);
       if (state === undefined) return;
       const { scope } = state;
@@ -309,9 +360,9 @@ export class CustomerPetsService {
           this.logger.log('pet facts not stored: no single matching pet');
           return;
         case 'new':
-          return await this.addLocal(senderId, state, facts);
+          return await this.addLocal(senderId, state, facts, fence);
         case 'match':
-          return await this.applyTo(senderId, state, match.ref, facts);
+          return await this.applyTo(senderId, state, match.ref, facts, fence);
       }
     } catch (error) {
       this.warn('capture', error);
@@ -450,6 +501,7 @@ export class CustomerPetsService {
     state: SenderPets,
     ref: Ref,
     facts: CustomerPet,
+    fence: Fence,
   ): Promise<void> {
     if (ref.kind === 'legacy') {
       // Until T6 the legacy single pet keeps its merge-only profile write.
@@ -460,29 +512,42 @@ export class CustomerPetsService {
       if (state.scope.kind !== 'customer') return;
       const pet = state.scope.pets.find((candidate) => candidate.id === ref.id);
       if (pet !== undefined)
-        await this.patchBackend(senderId, state.scope.customerId, pet, facts);
+        await this.patchBackend(
+          senderId,
+          state.scope.customerId,
+          pet,
+          facts,
+          fence,
+        );
       return;
     }
-    const pet = state.local.find((candidate) => candidate.id === ref.id);
-    if (pet === undefined) return;
-    const merged = mergeFactsIntoLocal(pet, facts, this.now());
-    if (merged === 'conflict') {
+    // E1: merged into the entry as the list stands when the write runs.
+    let outcome = 'gone' as 'gone' | 'conflict' | 'unchanged' | 'changed';
+    const wrote = await this.writeLocal(senderId, fence, (current) => {
+      const pet = current.find((candidate) => candidate.id === ref.id);
+      if (pet === undefined) return null;
+      const merged = mergeFactsIntoLocal(pet, facts, this.now());
+      if (merged === 'conflict' || merged === 'unchanged') {
+        outcome = merged;
+        return null;
+      }
+      outcome = 'changed';
+      return current.map((entry) => (entry.id === pet.id ? merged : entry));
+    });
+    if (outcome === 'conflict') {
       this.logger.log('pet facts not stored: another species');
       return;
     }
-    if (merged !== 'unchanged') {
-      const next = state.local.map((entry) =>
-        entry.id === pet.id ? merged : entry,
-      );
-      if (!(await this.writeLocal(senderId, state, next))) return;
-    }
-    if (state.scope.kind === 'customer') await this.uploadPending(senderId);
+    if (outcome === 'gone' || (outcome === 'changed' && !wrote)) return;
+    if (state.scope.kind === 'customer')
+      await this.uploadPending(senderId, fence);
   }
 
   private async addLocal(
     senderId: string,
     state: SenderPets,
     facts: CustomerPet,
+    fence: Fence,
   ): Promise<void> {
     if (state.local.length >= LOCAL_PETS_MAX) {
       this.logger.warn('pet facts not stored: local pet list is full');
@@ -491,13 +556,20 @@ export class CustomerPetsService {
     const pet = localPetFromFacts(this.newId(), facts, this.now());
     // Write-ahead: the entry (and its id, part of the upload key) is durable
     // before any backend create, so a retry can never duplicate the pet.
-    if (!(await this.writeLocal(senderId, state, [...state.local, pet])))
-      return;
-    if (state.scope.kind === 'customer') await this.uploadPending(senderId);
+    let full = false;
+    const wrote = await this.writeLocal(senderId, fence, (current) => {
+      if (current.length < LOCAL_PETS_MAX) return [...current, pet];
+      full = true;
+      return null;
+    });
+    if (full) this.logger.warn('pet facts not stored: local pet list is full');
+    if (!wrote) return;
+    if (state.scope.kind === 'customer')
+      await this.uploadPending(senderId, fence);
   }
 
   /** Uploads every uploadable local pet of a Customer (S8). */
-  private async uploadPending(senderId: string): Promise<void> {
+  private async uploadPending(senderId: string, fence: Fence): Promise<void> {
     const state = this.cache.get(senderId);
     if (
       state === undefined ||
@@ -505,10 +577,15 @@ export class CustomerPetsService {
       !state.localKnown
     )
       return;
-    for (const pet of [...state.local]) await this.upload(senderId, pet.id);
+    for (const pet of [...state.local])
+      await this.upload(senderId, pet.id, fence);
   }
 
-  private async upload(senderId: string, localId: string): Promise<void> {
+  private async upload(
+    senderId: string,
+    localId: string,
+    fence: Fence,
+  ): Promise<void> {
     const state = this.cache.get(senderId);
     if (state === undefined || state.scope.kind !== 'customer') return;
     const scope = state.scope;
@@ -534,7 +611,7 @@ export class CustomerPetsService {
       this.logger.log(
         'pet not uploaded: several backend pets have its name and species (kept local, blocked as ambiguous)',
       );
-      await this.updateLocal(senderId, localId, (entry) => ({
+      await this.updateLocal(senderId, fence, localId, (entry) => ({
         ...entry,
         blocked: 'ambiguous',
       }));
@@ -550,16 +627,28 @@ export class CustomerPetsService {
         scope.customerId,
         same[0],
         localPetFacts(pet, this.now()),
+        fence,
+        key,
       );
+      // E2: stopped by «olvida mis datos»: no retry log, no attempt.
+      if (outcome === 'forgotten') return;
+      // E3: the twin was renamed (or changed species): stays pending.
+      if (outcome === 'not_twin') {
+        this.logger.log(
+          'pet merge stopped: the backend pet no longer has its name and species (kept local)',
+        );
+        return;
+      }
       if (typeof outcome === 'object')
         await this.attemptFailed(
           senderId,
+          fence,
           localId,
           'merge',
           outcome.failed,
           backoff?.attempts ?? 0,
         );
-      else await this.removeLocal(senderId, localId);
+      else await this.removeLocal(senderId, fence, localId);
       return;
     }
     // A retry under the same key must send the first attempt's bytes.
@@ -571,14 +660,15 @@ export class CustomerPetsService {
       body = pet.upload.body;
       attempts = pet.upload.attempts ?? 0;
     } else {
-      const frozen: LocalPet = {
-        ...pet,
-        upload: { customerId: scope.customerId, body },
-      };
-      const next = state.local.map((entry) =>
-        entry.id === localId ? frozen : entry,
+      const upload = { customerId: scope.customerId, body };
+      const frozen = await this.writeLocal(senderId, fence, (current) =>
+        current.some((entry) => entry.id === localId)
+          ? current.map((entry) =>
+              entry.id === localId ? { ...entry, upload } : entry,
+            )
+          : null,
       );
-      if (!(await this.writeLocal(senderId, state, next))) return;
+      if (!frozen) return;
     }
     // C4: re-checked right before the create.
     if (this.profiles.isForgotten(senderId)) return;
@@ -592,6 +682,7 @@ export class CustomerPetsService {
     } catch (error) {
       await this.attemptFailed(
         senderId,
+        fence,
         localId,
         'create',
         errorStatus(error),
@@ -601,8 +692,8 @@ export class CustomerPetsService {
     }
     switch (result.kind) {
       case 'ok': {
-        this.upsertBackend(senderId, result.pet);
-        await this.removeLocal(senderId, localId);
+        this.upsertBackend(senderId, fence, result.pet);
+        await this.removeLocal(senderId, fence, localId);
         // Facts learned after the first (uncertain) attempt: patch them.
         if (JSON.stringify(current) !== JSON.stringify(body))
           await this.patchBackend(
@@ -610,33 +701,28 @@ export class CustomerPetsService {
             scope.customerId,
             result.pet,
             localPetFacts(pet, this.now()),
+            fence,
           );
         return;
       }
       case 'PET_LIMIT_REACHED':
         this.logger.warn('pet create refused: PET_LIMIT_REACHED (not stored)');
-        await this.removeLocal(senderId, localId);
+        await this.removeLocal(senderId, fence, localId);
         return;
-      case 'IDEMPOTENCY_KEY_CONFLICT': {
+      case 'IDEMPOTENCY_KEY_CONFLICT':
         this.logger.warn(
           'pet create refused: IDEMPOTENCY_KEY_CONFLICT (kept local)',
         );
-        const latest = this.cache.get(senderId);
-        if (latest === undefined) return;
-        await this.writeLocal(
-          senderId,
-          latest,
-          latest.local.map((entry) =>
-            entry.id === localId && entry.upload !== undefined
-              ? { ...entry, upload: { ...entry.upload, blocked: true } }
-              : entry,
-          ),
+        await this.updateLocal(senderId, fence, localId, (entry) =>
+          entry.upload !== undefined
+            ? { ...entry, upload: { ...entry.upload, blocked: true } }
+            : entry,
         );
         return;
-      }
       default:
         await this.attemptFailed(
           senderId,
+          fence,
           localId,
           'create',
           result.kind,
@@ -660,6 +746,7 @@ export class CustomerPetsService {
    */
   private async attemptFailed(
     senderId: string,
+    fence: Fence,
     localId: string,
     operation: 'create' | 'merge',
     status: string,
@@ -671,7 +758,7 @@ export class CustomerPetsService {
       `pet ${operation} not done: ${status} (attempt ${attempts}, next in ${Math.round(wait / 60_000)} min, kept local)`,
     );
     const nextAttemptAt = new Date(this.now().getTime() + wait).toISOString();
-    await this.updateLocal(senderId, localId, (entry) =>
+    await this.updateLocal(senderId, fence, localId, (entry) =>
       entry.upload !== undefined
         ? { ...entry, upload: { ...entry.upload, attempts, nextAttemptAt } }
         : { ...entry, merge: { attempts, nextAttemptAt } },
@@ -681,13 +768,16 @@ export class CustomerPetsService {
   /**
    * C1: PATCH only the changed fields. On `PET_VERSION_CONFLICT` reread
    * (`?status=ALL`), accept when the values already match, else retry once
-   * with the current version.
+   * with the current version. E3: a twin merge passes the twin's `twin`
+   * key; a reread pet without it (renamed, other species) is not patched.
    */
   private async patchBackend(
     senderId: string,
     customerId: string,
     pet: BackendPet,
     facts: CustomerPet,
+    fence: Fence,
+    twin?: string,
   ): Promise<PatchOutcome> {
     let target = pet;
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -698,7 +788,7 @@ export class CustomerPetsService {
       }
       if (diff === null) return attempt === 0 ? 'noop' : 'ok';
       // C4: re-checked right before each PATCH.
-      if (this.profiles.isForgotten(senderId)) return { failed: 'forgotten' };
+      if (this.profiles.isForgotten(senderId)) return 'forgotten';
       let result: Awaited<ReturnType<CustomerPetsClient['patchPet']>>;
       try {
         result = await this.client.patchPet(customerId, target.id, {
@@ -710,21 +800,23 @@ export class CustomerPetsService {
         return { failed: errorStatus(error) };
       }
       if (result.kind === 'ok') {
-        this.upsertBackend(senderId, result.pet);
+        this.upsertBackend(senderId, fence, result.pet);
         return 'ok';
       }
       if (result.kind !== 'PET_VERSION_CONFLICT' || attempt > 0) {
         this.logger.warn(`pet patch not done: ${result.kind}`);
         if (result.kind === 'PET_ARCHIVED' || result.kind === 'PET_NOT_FOUND')
-          this.dropBackend(senderId, target.id);
+          this.dropBackend(senderId, fence, target.id);
         return { failed: result.kind };
       }
       const fresh = await this.reread(customerId, target.id);
       if (fresh === null || fresh.status !== 'ACTIVE') {
-        this.dropBackend(senderId, target.id);
+        this.dropBackend(senderId, fence, target.id);
         return { failed: 'PET_VERSION_CONFLICT (reread)' };
       }
-      this.upsertBackend(senderId, fresh);
+      this.upsertBackend(senderId, fence, fresh);
+      if (twin !== undefined && twinKey(fresh.name, fresh.species) !== twin)
+        return 'not_twin';
       target = fresh;
     }
     return { failed: 'PET_VERSION_CONFLICT' };
@@ -747,56 +839,70 @@ export class CustomerPetsService {
 
   /* -------------------------------------------------------------- cache */
 
-  private async writeLocal(
+  /**
+   * Replaces the sender's local list with `change(current)` (`null` = no
+   * write). E1: runs on the sender's local I/O chain, so `current` is the
+   * list the previous write left (never an older snapshot), and is refused
+   * once the task is past its bound. A write that lands updates the cached
+   * list (it is what the store now holds).
+   */
+  private writeLocal(
     senderId: string,
-    state: SenderPets,
-    next: LocalPet[],
+    fence: Fence,
+    change: (current: LocalPet[]) => LocalPet[] | null,
   ): Promise<boolean> {
-    // C4: re-checked right before each write (a write would recreate the
-    // profile row deleted by «olvida mis datos»).
-    if (!state.localKnown || this.profiles.isForgotten(senderId)) return false;
-    try {
-      await this.localStore.write(senderId, next, this.now());
-      state.local = next;
-      return true;
-    } catch (error) {
-      this.warn('local write', error);
-      return false;
-    }
+    return this.localStep(senderId, async () => {
+      // C4: re-checked right before each write (a write would recreate the
+      // profile row deleted by «olvida mis datos»).
+      if (fence.expired || this.profiles.isForgotten(senderId)) return false;
+      const state = this.cache.get(senderId);
+      if (state === undefined || !state.localKnown) return false;
+      const next = change(state.local);
+      if (next === null) return false;
+      try {
+        await this.localStore.write(senderId, next, this.now());
+        state.local = next;
+        return true;
+      } catch (error) {
+        this.warn('local write', error);
+        return false;
+      }
+    });
   }
 
-  /** Replaces one entry of the current list (no-op when it is gone). */
+  /** Replaces one entry of the current list (no write when it is gone). */
   private async updateLocal(
     senderId: string,
+    fence: Fence,
     localId: string,
     change: (entry: LocalPet) => LocalPet,
   ): Promise<void> {
-    const state = this.cache.get(senderId);
-    if (state === undefined) return;
-    await this.writeLocal(
-      senderId,
-      state,
-      state.local.map((entry) =>
-        entry.id === localId ? change(entry) : entry,
-      ),
+    await this.writeLocal(senderId, fence, (current) =>
+      current.some((entry) => entry.id === localId)
+        ? current.map((entry) => (entry.id === localId ? change(entry) : entry))
+        : null,
     );
   }
 
   /** Removed only after a backend success; a failed write keeps the entry
    *  for a retry (same key, same body → replay). */
-  private async removeLocal(senderId: string, localId: string): Promise<void> {
-    const state = this.cache.get(senderId);
-    if (state === undefined) return;
-    await this.writeLocal(
-      senderId,
-      state,
-      state.local.filter((entry) => entry.id !== localId),
+  private async removeLocal(
+    senderId: string,
+    fence: Fence,
+    localId: string,
+  ): Promise<void> {
+    await this.writeLocal(senderId, fence, (current) =>
+      current.some((entry) => entry.id === localId)
+        ? current.filter((entry) => entry.id !== localId)
+        : null,
     );
   }
 
   /** Our write's answer replaces the cached pet (same position); a new pet
-   *  goes last; a non-ACTIVE one leaves the list. */
-  private upsertBackend(senderId: string, pet: BackendPet): void {
+   *  goes last; a non-ACTIVE one leaves the list. E1: not from a fenced
+   *  task (the next refresh reads the backend). */
+  private upsertBackend(senderId: string, fence: Fence, pet: BackendPet): void {
+    if (fence.expired) return;
     const state = this.cache.get(senderId);
     if (state === undefined || state.scope.kind !== 'customer') return;
     const pets = state.scope.pets;
@@ -811,13 +917,17 @@ export class CustomerPetsService {
         : pets.map((entry, i) => (i === index ? pet : entry));
   }
 
-  private dropBackend(senderId: string, petId: string): void {
+  private dropBackend(senderId: string, fence: Fence, petId: string): void {
+    if (fence.expired) return;
     const state = this.cache.get(senderId);
     if (state === undefined || state.scope.kind !== 'customer') return;
     state.scope.pets = state.scope.pets.filter((entry) => entry.id !== petId);
   }
 
-  private remember(senderId: string, state: SenderPets): void {
+  /** E1: refused (false) once the task is past its bound: a late load never
+   *  replaces the cache with an older local list. */
+  private remember(senderId: string, fence: Fence, state: SenderPets): boolean {
+    if (fence.expired) return false;
     this.cache.delete(senderId);
     this.cache.set(senderId, state);
     if (this.cache.size > CACHE_MAX) {
@@ -826,6 +936,7 @@ export class CustomerPetsService {
         break;
       }
     }
+    return true;
   }
 
   private warn(operation: string, error: unknown): void {

@@ -1516,3 +1516,247 @@ describe('CustomerPetsService (T4b-fix-2-C)', () => {
     );
   });
 });
+
+describe('CustomerPetsService (T4b-fix-3)', () => {
+  const BOUND_MS = 25_000;
+  let warn: jest.SpiedFunction<Logger['warn']>;
+  beforeEach(() => {
+    warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const names = async (h: ReturnType<typeof harness>) =>
+    (await h.local()).map((pet) => pet.name);
+  /** The next by-phone lookup waits for `release()`. */
+  const gateLookup = (
+    h: ReturnType<typeof harness>,
+    response: CustomerLookupResponse,
+  ) => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.getCustomerByPhone.mockImplementationOnce(async () => {
+      await gate;
+      return structuredClone(response);
+    });
+    return () => release();
+  };
+  /** The next local write waits for `release()` (then lands). */
+  const gateWrite = (h: ReturnType<typeof harness>) => {
+    const original = h.localStore.write.bind(h.localStore);
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const write = jest
+      .spyOn(h.localStore, 'write')
+      .mockImplementationOnce(async (...args) => {
+        await gate;
+        return original(...args);
+      });
+    return { release: () => release(), write };
+  };
+
+  describe('E1: a timed-out queue task is fenced (verify C3/S8)', () => {
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it('verify reproduction: stalled lookup, capture saves Luna, stalled lookup resolves, next capture saves Michi → both kept', async () => {
+      const h = harness(notFound);
+      const release = gateLookup(h, notFound);
+      void h.service.prepare(SENDER);
+      const luna = h.service.capture(
+        SENDER,
+        extractPetFacts('mi perrita Luna es labrador'),
+      );
+      await jest.advanceTimersByTimeAsync(BOUND_MS);
+      await luna;
+      expect(await names(h)).toEqual(['Luna']);
+      release();
+      await jest.advanceTimersByTimeAsync(0);
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Michi es persa'),
+      );
+      expect(await names(h)).toEqual(['Luna', 'Michi']);
+      const prompt = h.service.promptLines(SENDER) ?? '';
+      expect(prompt).toContain('"Luna"');
+      expect(prompt).toContain('"Michi"');
+    });
+
+    it('two tasks concurrent after a timeout cannot each write a list from the same old snapshot', async () => {
+      const h = harness(notFound);
+      await h.service.prepare(SENDER);
+      const { release, write } = gateWrite(h);
+      void h.service.capture(
+        SENDER,
+        extractPetFacts('mi perrita Luna es labrador'),
+      );
+      await jest.advanceTimersByTimeAsync(0);
+      expect(write).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(BOUND_MS);
+      const michi = h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Michi es persa'),
+      );
+      await jest.advanceTimersByTimeAsync(0);
+      // Michi's write waits for Luna's in-flight write…
+      expect(write).toHaveBeenCalledTimes(1);
+      release();
+      await jest.advanceTimersByTimeAsync(0);
+      await michi;
+      // …and is computed from the list that write left.
+      expect(
+        write.mock.calls.map((call) => call[1].map((p) => p.name)),
+      ).toEqual([['Luna'], ['Luna', 'Michi']]);
+      expect(await names(h)).toEqual(['Luna', 'Michi']);
+    });
+
+    it('a capture that resumes after its bound writes nothing (no older or overwriting list)', async () => {
+      const h = harness(notFound);
+      const release = gateLookup(h, notFound);
+      const write = jest.spyOn(h.localStore, 'write');
+      void h.service.capture(
+        SENDER,
+        extractPetFacts('mi perrita Luna es labrador'),
+      );
+      await jest.advanceTimersByTimeAsync(BOUND_MS);
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Michi es persa'),
+      );
+      release();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(write).toHaveBeenCalledTimes(1);
+      expect(await names(h)).toEqual(['Michi']);
+    });
+
+    it('a fenced upload removes nothing; the next prepare replays the create and removes the entry', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es labrador');
+      h.setLookup(found([]));
+      let releaseCreate: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        releaseCreate = resolve;
+      });
+      h.client.createPet.mockImplementationOnce(async (_c, body) => {
+        await gate;
+        return {
+          kind: 'ok',
+          created: true,
+          pet: createdFrom(body, uuid(950)),
+          warnings: [],
+        };
+      });
+      void h.service.afterCheckout(SENDER);
+      await jest.advanceTimersByTimeAsync(BOUND_MS);
+      releaseCreate();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(await names(h)).toEqual(['Luna']);
+      await h.service.afterCheckout(SENDER);
+      expect(h.client.createPet).toHaveBeenCalledTimes(2);
+      expect(h.client.createPet.mock.calls[1][2]).toBe(
+        h.client.createPet.mock.calls[0][2],
+      );
+      await expect(h.local()).resolves.toEqual([]);
+    });
+  });
+
+  describe('E2: a forgotten PATCH merge is not a failed attempt', () => {
+    it('forget during the version-conflict reread → no second PATCH, no retry log, no backoff write', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno tiene 2 años');
+      h.setLookup(found([backend()]));
+      h.client.patchPet.mockResolvedValueOnce({
+        kind: 'PET_VERSION_CONFLICT',
+        currentVersion: 4,
+      });
+      h.client.listPets.mockImplementationOnce(async () => {
+        await h.profiles.forget(SENDER);
+        return { kind: 'ok', pets: [backend({ version: 4 })] };
+      });
+      const write = jest.spyOn(h.localStore, 'write');
+      await h.service.afterCheckout(SENDER);
+      expect(h.client.patchPet).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+        /not done: forgotten/,
+      );
+      expect(write).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('E3: a twin renamed before the conflict reread is not patched', () => {
+    it('reread twin no longer matches (name) → no PATCH to it, the entry stays pending without an attempt', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno tiene 2 años');
+      h.setLookup(found([backend()]));
+      h.client.patchPet
+        .mockResolvedValueOnce({
+          kind: 'PET_VERSION_CONFLICT',
+          currentVersion: 4,
+        })
+        .mockResolvedValueOnce({
+          kind: 'ok',
+          pet: backend({ name: 'Rocky', version: 5 }),
+          warnings: [],
+        });
+      h.client.listPets.mockResolvedValue({
+        kind: 'ok',
+        pets: [backend({ name: 'Rocky', version: 4 })],
+      });
+      await h.service.afterCheckout(SENDER);
+      expect(h.client.patchPet).toHaveBeenCalledTimes(1);
+      const [entry] = await h.local();
+      expect(entry).toMatchObject({ name: 'Bruno' });
+      expect(entry.merge).toBeUndefined();
+      expect(entry.upload).toBeUndefined();
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/merge not done/);
+    });
+
+    it('reread twin of another species → no PATCH to it either', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno tiene 2 años');
+      h.setLookup(found([backend()]));
+      h.client.patchPet.mockResolvedValueOnce({
+        kind: 'PET_VERSION_CONFLICT',
+        currentVersion: 4,
+      });
+      h.client.listPets.mockResolvedValue({
+        kind: 'ok',
+        pets: [backend({ species: 'CAT', version: 4 })],
+      });
+      await h.service.afterCheckout(SENDER);
+      expect(h.client.patchPet).toHaveBeenCalledTimes(1);
+      expect(await names(h)).toEqual(['Bruno']);
+    });
+
+    it('reread twin still matching → the retry PATCH still happens (baseline)', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno tiene 2 años');
+      h.setLookup(found([backend()]));
+      h.client.patchPet
+        .mockResolvedValueOnce({
+          kind: 'PET_VERSION_CONFLICT',
+          currentVersion: 4,
+        })
+        .mockResolvedValueOnce({
+          kind: 'ok',
+          pet: backend({ version: 5, ageMonths: 24 }),
+          warnings: [],
+        });
+      h.client.listPets.mockResolvedValue({
+        kind: 'ok',
+        pets: [backend({ name: 'BRUNO ', version: 4 })],
+      });
+      await h.service.afterCheckout(SENDER);
+      expect(h.client.patchPet.mock.calls.map((c) => c[2].version)).toEqual([
+        3, 4,
+      ]);
+      await expect(h.local()).resolves.toEqual([]);
+    });
+  });
+});
