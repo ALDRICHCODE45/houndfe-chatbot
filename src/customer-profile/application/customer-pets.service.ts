@@ -47,6 +47,14 @@ export const CUSTOMER_PETS_REFRESH_MS = 60_000;
  *  queue moves on and the stalled load is never joined again. */
 export const CUSTOMER_PETS_TASK_TIMEOUT_MS = 25_000;
 
+/** F1: time bound of one local pet store call (read or write, connection
+ *  acquire included). Past it the local I/O chain moves on and the local
+ *  list is unknown until the next successful read. The store itself must
+ *  never let a timed-out write land later: the Postgres store cancels it
+ *  server-side within LOCAL_PET_STORE_TIMEOUT_MS (shorter than this bound,
+ *  so the write is committed or aborted before the chain moves on). */
+export const CUSTOMER_PETS_LOCAL_IO_TIMEOUT_MS = 10_000;
+
 /** Bounded process cache, like the profile cache. */
 const CACHE_MAX = 2000;
 
@@ -97,6 +105,9 @@ type Ref =
   | { kind: 'backend'; id: string }
   | { kind: 'local'; id: string }
   | { kind: 'legacy' };
+
+/** F1: a local store call's outcome (`timedOut`: past its bound). */
+type StoreAnswer<T> = { ok: true; value: T } | { ok: false; timedOut: boolean };
 
 /** `failed` carries the HTTP status or answer kind (for the backoff log).
  *  E2 `forgotten`: stopped by «olvida mis datos» (not a failed attempt).
@@ -298,11 +309,14 @@ export class CustomerPetsService {
         const state = this.cache.get(senderId);
         let local: LocalPet[];
         let localKnown = true;
-        try {
-          local = await this.localStore.read(senderId);
-        } catch (error) {
-          this.warn('local read', error);
-          localKnown = state?.localKnown === true;
+        const read = await this.storeCall('local read', () =>
+          this.localStore.read(senderId),
+        );
+        if (read.ok) local = read.value;
+        else {
+          // A failed read keeps a known cached list; F1: a timed-out read
+          // makes it unknown (its late answer is ignored).
+          localKnown = !read.timedOut && state?.localKnown === true;
           local = localKnown && state !== undefined ? state.local : [];
         }
         return this.remember(senderId, fence, {
@@ -752,17 +766,42 @@ export class CustomerPetsService {
     status: string,
     previous: number,
   ): Promise<void> {
-    const attempts = previous + 1;
-    const wait = uploadBackoffMs(attempts);
-    this.logger.warn(
-      `pet ${operation} not done: ${status} (attempt ${attempts}, next in ${Math.round(wait / 60_000)} min, kept local)`,
+    let attempts = previous + 1;
+    let wait = uploadBackoffMs(attempts);
+    // F2: persisted even after the task's bound (a create/merge answer can
+    // arrive late): applied on the chain to the entry as it stands now, so
+    // it never restores an older list; a newer attempt is counted.
+    const saved = await this.writeLocal(
+      senderId,
+      fence,
+      (current) => {
+        const entry = current.find((candidate) => candidate.id === localId);
+        if (entry === undefined) return null;
+        attempts =
+          Math.max(previous, (entry.upload ?? entry.merge)?.attempts ?? 0) + 1;
+        wait = uploadBackoffMs(attempts);
+        const nextAttemptAt = new Date(
+          this.now().getTime() + wait,
+        ).toISOString();
+        return current.map((pet) =>
+          pet.id !== localId
+            ? pet
+            : pet.upload !== undefined
+              ? { ...pet, upload: { ...pet.upload, attempts, nextAttemptAt } }
+              : { ...pet, merge: { attempts, nextAttemptAt } },
+        );
+      },
+      { backoff: true },
     );
-    const nextAttemptAt = new Date(this.now().getTime() + wait).toISOString();
-    await this.updateLocal(senderId, fence, localId, (entry) =>
-      entry.upload !== undefined
-        ? { ...entry, upload: { ...entry.upload, attempts, nextAttemptAt } }
-        : { ...entry, merge: { attempts, nextAttemptAt } },
-    );
+    // F2: the retry log only when its backoff is what the store holds.
+    if (saved)
+      this.logger.warn(
+        `pet ${operation} not done: ${status} (attempt ${attempts}, next in ${Math.round(wait / 60_000)} min, kept local)`,
+      );
+    else
+      this.logger.warn(
+        `pet ${operation} not done: ${status} (backoff not saved)`,
+      );
   }
 
   /**
@@ -843,31 +882,72 @@ export class CustomerPetsService {
    * Replaces the sender's local list with `change(current)` (`null` = no
    * write). E1: runs on the sender's local I/O chain, so `current` is the
    * list the previous write left (never an older snapshot), and is refused
-   * once the task is past its bound. A write that lands updates the cached
-   * list (it is what the store now holds).
+   * once the task is past its bound (F2: except a backoff update, which
+   * only touches one entry of the current list). A write that lands updates
+   * the cached list (it is what the store now holds). F1: a write past its
+   * bound makes the list unknown (no write until the next successful read;
+   * the store never lets the timed-out write land later).
    */
   private writeLocal(
     senderId: string,
     fence: Fence,
     change: (current: LocalPet[]) => LocalPet[] | null,
+    options: { backoff?: boolean } = {},
   ): Promise<boolean> {
     return this.localStep(senderId, async () => {
       // C4: re-checked right before each write (a write would recreate the
       // profile row deleted by «olvida mis datos»).
-      if (fence.expired || this.profiles.isForgotten(senderId)) return false;
+      if (
+        (fence.expired && options.backoff !== true) ||
+        this.profiles.isForgotten(senderId)
+      )
+        return false;
       const state = this.cache.get(senderId);
       if (state === undefined || !state.localKnown) return false;
       const next = change(state.local);
       if (next === null) return false;
-      try {
-        await this.localStore.write(senderId, next, this.now());
+      const wrote = await this.storeCall('local write', () =>
+        this.localStore.write(senderId, next, this.now()),
+      );
+      if (wrote.ok) {
         state.local = next;
         return true;
-      } catch (error) {
-        this.warn('local write', error);
-        return false;
       }
+      if (wrote.timedOut) {
+        state.localKnown = false;
+        state.loadedAt = 0;
+      }
+      return false;
     });
+  }
+
+  /** F1: one local store call bounded by CUSTOMER_PETS_LOCAL_IO_TIMEOUT_MS
+   *  (never rejects). A call past its bound is abandoned: its late answer
+   *  (or failure) is ignored. */
+  private storeCall<T>(
+    operation: string,
+    call: () => Promise<T>,
+  ): Promise<StoreAnswer<T>> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const answer = Promise.resolve()
+      .then(call)
+      .then(
+        (value): StoreAnswer<T> => ({ ok: true, value }),
+        (error: unknown): StoreAnswer<T> => {
+          this.warn(operation, error);
+          return { ok: false, timedOut: false };
+        },
+      );
+    const expired = new Promise<StoreAnswer<T>>((resolve) => {
+      timer = setTimeout(() => {
+        this.logger.warn(
+          `customer pets ${operation} exceeded ${CUSTOMER_PETS_LOCAL_IO_TIMEOUT_MS} ms: local pets unknown until the next read`,
+        );
+        resolve({ ok: false, timedOut: true });
+      }, CUSTOMER_PETS_LOCAL_IO_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    return Promise.race([answer, expired]).finally(() => clearTimeout(timer));
   }
 
   /** Replaces one entry of the current list (no write when it is gone). */

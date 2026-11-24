@@ -9,6 +9,7 @@ import type {
 import type { CustomerPetsClient } from '../../chatbot-api/domain/customer-pets.port';
 import { InMemoryCustomerProfileStore } from '../infrastructure/in-memory-customer-profile.store';
 import { InMemoryLocalPetStore } from '../infrastructure/in-memory-local-pet.store';
+import type { LocalPet } from '../domain/customer-pets';
 import { extractPetFacts } from '../domain/pet-facts';
 import { CustomerPetsService } from './customer-pets.service';
 import { CustomerProfileService } from './customer-profile.service';
@@ -147,6 +148,17 @@ function harness(initialLookup: CustomerLookupResponse | Error = notFound) {
 }
 
 const MINUTE = 60_000;
+
+/** A deferred the test settles by hand (or never). */
+const deferred = <T>() => {
+  let resolve: (value: T) => void = () => undefined;
+  let reject: (error: unknown) => void = () => undefined;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
 
 describe('CustomerPetsService (T4b)', () => {
   let warn: jest.SpiedFunction<Logger['warn']>;
@@ -1545,21 +1557,6 @@ describe('CustomerPetsService (T4b-fix-3)', () => {
     });
     return () => release();
   };
-  /** The next local write waits for `release()` (then lands). */
-  const gateWrite = (h: ReturnType<typeof harness>) => {
-    const original = h.localStore.write.bind(h.localStore);
-    let release: () => void = () => undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const write = jest
-      .spyOn(h.localStore, 'write')
-      .mockImplementationOnce(async (...args) => {
-        await gate;
-        return original(...args);
-      });
-    return { release: () => release(), write };
-  };
 
   describe('E1: a timed-out queue task is fenced (verify C3/S8)', () => {
     beforeEach(() => jest.useFakeTimers());
@@ -1589,27 +1586,38 @@ describe('CustomerPetsService (T4b-fix-3)', () => {
     });
 
     it('two tasks concurrent after a timeout cannot each write a list from the same old snapshot', async () => {
+      // F1 bounds each write at 10 s: the write starts at 20 s so it is
+      // still in flight when its task passes the 25 s bound.
       const h = harness(notFound);
-      await h.service.prepare(SENDER);
-      const { release, write } = gateWrite(h);
+      // Lookup answers at 20 s, then Luna's write hangs past the task bound.
+      const lookup = deferred<CustomerLookupResponse>();
+      h.getCustomerByPhone.mockImplementationOnce(() => lookup.promise);
+      const original = h.localStore.write.bind(h.localStore);
+      const gate = deferred<void>();
+      const write = jest
+        .spyOn(h.localStore, 'write')
+        .mockImplementationOnce(async (...args) => {
+          await gate.promise;
+          return original(...args);
+        });
       void h.service.capture(
         SENDER,
         extractPetFacts('mi perrita Luna es labrador'),
       );
+      await jest.advanceTimersByTimeAsync(20_000);
+      lookup.resolve(structuredClone(notFound));
       await jest.advanceTimersByTimeAsync(0);
       expect(write).toHaveBeenCalledTimes(1);
-      await jest.advanceTimersByTimeAsync(BOUND_MS);
+      await jest.advanceTimersByTimeAsync(BOUND_MS - 20_000);
       const michi = h.service.capture(
         SENDER,
         extractPetFacts('mi gato Michi es persa'),
       );
       await jest.advanceTimersByTimeAsync(0);
-      // Michi's write waits for Luna's in-flight write…
       expect(write).toHaveBeenCalledTimes(1);
-      release();
+      gate.resolve();
       await jest.advanceTimersByTimeAsync(0);
       await michi;
-      // …and is computed from the list that write left.
       expect(
         write.mock.calls.map((call) => call[1].map((p) => p.name)),
       ).toEqual([['Luna'], ['Luna', 'Michi']]);
@@ -1757,6 +1765,200 @@ describe('CustomerPetsService (T4b-fix-3)', () => {
         3, 4,
       ]);
       await expect(h.local()).resolves.toEqual([]);
+    });
+  });
+});
+
+describe('CustomerPetsService (T4b-fix-4)', () => {
+  const IO_MS = 10_000;
+  const BOUND_MS = 25_000;
+  let warn: jest.SpiedFunction<Logger['warn']>;
+  beforeEach(() => {
+    jest.useFakeTimers();
+    warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  const names = async (h: ReturnType<typeof harness>) =>
+    (await h.local()).map((pet) => pet.name);
+  const upstream = (statusCode: number) =>
+    Object.assign(new Error('upstream'), { name: 'UpstreamError', statusCode });
+
+  describe('F1: every local store call is time-bounded (review: chain stall)', () => {
+    it('a local read that never settles: the chain moves on, later turns store once the store recovers, the late (stale) answer restores nothing', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es labrador');
+      expect(await names(h)).toEqual(['Luna']);
+      h.advance(MINUTE);
+      const stalled = deferred<LocalPet[]>();
+      const read = jest
+        .spyOn(h.localStore, 'read')
+        .mockImplementationOnce(() => stalled.promise);
+      const write = jest.spyOn(h.localStore, 'write');
+      const turn = h.say('mi gato Michi es persa');
+      await jest.advanceTimersByTimeAsync(IO_MS);
+      await turn;
+      // Unknown list: nothing written from the old cached list.
+      expect(write).not.toHaveBeenCalled();
+      expect(JSON.stringify(warn.mock.calls)).toContain('local read');
+      // The store recovers: the next turn reads again and stores Michi.
+      await h.say('mi gato Michi es persa');
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(await names(h)).toEqual(['Luna', 'Michi']);
+      // The stalled read answers late with an older list: ignored.
+      stalled.resolve([]);
+      await jest.advanceTimersByTimeAsync(0);
+      await h.say('mi perro Toby es un husky');
+      expect(await names(h)).toEqual(['Luna', 'Michi', 'Toby']);
+      const prompt = h.service.promptLines(SENDER) ?? '';
+      expect(prompt).toContain('"Luna"');
+      expect(prompt).toContain('"Michi"');
+      expect(prompt).toContain('"Toby"');
+    });
+
+    it('a local write that never settles: the chain moves on, the list is unknown until reread, the next turn writes from the stored list', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es labrador');
+      const stalled = deferred<void>();
+      const original = h.localStore.write.bind(h.localStore);
+      const write = jest
+        .spyOn(h.localStore, 'write')
+        .mockImplementationOnce(() => stalled.promise);
+      const read = jest.spyOn(h.localStore, 'read');
+      const turn = h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Michi es persa'),
+      );
+      await jest.advanceTimersByTimeAsync(IO_MS);
+      await turn;
+      expect(JSON.stringify(warn.mock.calls)).toContain('local write');
+      // No write from the unknown list in the meantime.
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi perro Toby es un husky'),
+      );
+      expect(write).toHaveBeenCalledTimes(1);
+      // The next turn rereads (not fresh any more) and writes from it.
+      write.mockImplementation(original);
+      await h.say('mi perro Toby es un husky');
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(await names(h)).toEqual(['Luna', 'Toby']);
+      // The timed-out write is cancelled by the store (never lands); its
+      // late failure changes nothing.
+      stalled.reject(new Error('canceling statement due to statement timeout'));
+      await jest.advanceTimersByTimeAsync(0);
+      await h.say('mi gato Michi es persa');
+      expect(await names(h)).toEqual(['Luna', 'Toby', 'Michi']);
+    });
+  });
+
+  describe('F2: a create/merge failure after the 25 s bound still backs off', () => {
+    const stalledCreate = (h: ReturnType<typeof harness>) => {
+      const create = deferred<CreatePetResult>();
+      h.client.createPet.mockImplementationOnce(() => create.promise);
+      return create;
+    };
+    const retryLogged = (attempt: number) =>
+      new RegExp(
+        `pet create not done: 500 \\(attempt ${attempt}, next in`,
+      ).test(JSON.stringify(warn.mock.calls));
+
+    it('persists attempts/nextAttemptAt on the current list (newer changes kept) and logs the retry', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es labrador');
+      h.setLookup(found([]));
+      const create = stalledCreate(h);
+      void h.service.afterCheckout(SENDER);
+      await jest.advanceTimersByTimeAsync(BOUND_MS);
+      // A newer task while the first create is still out: Luna's retry is
+      // IN_FLIGHT (attempt 1 persisted) and Michi is created and removed.
+      h.client.createPet.mockResolvedValueOnce({
+        kind: 'IDEMPOTENCY_KEY_IN_FLIGHT',
+      });
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Michi es persa'),
+      );
+      expect(await names(h)).toEqual(['Luna']);
+      expect((await h.local())[0].upload?.attempts).toBe(1);
+      create.reject(upstream(500));
+      await jest.advanceTimersByTimeAsync(0);
+      // Applied to the current list: Michi stays uploaded, attempt 1 counted.
+      const [luna, ...rest] = await h.local();
+      expect(rest).toEqual([]);
+      expect(luna.upload).toMatchObject({
+        attempts: 2,
+        nextAttemptAt: new Date(NOW.getTime() + 2 * MINUTE).toISOString(),
+      });
+      expect(retryLogged(2)).toBe(true);
+      // No retry before the persisted time.
+      h.advance(2 * MINUTE - 1);
+      await h.service.prepare(SENDER, true);
+      expect(
+        h.client.createPet.mock.calls.filter((c) => c[1].name === 'Luna'),
+      ).toHaveLength(2);
+    });
+
+    it('a late failure with nothing newer persists attempt 1', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es labrador');
+      h.setLookup(found([]));
+      const create = stalledCreate(h);
+      void h.service.afterCheckout(SENDER);
+      await jest.advanceTimersByTimeAsync(BOUND_MS);
+      expect(retryLogged(1)).toBe(false);
+      create.reject(upstream(500));
+      await jest.advanceTimersByTimeAsync(0);
+      expect((await h.local())[0].upload).toMatchObject({
+        attempts: 1,
+        nextAttemptAt: new Date(NOW.getTime() + MINUTE).toISOString(),
+      });
+      expect(retryLogged(1)).toBe(true);
+    });
+
+    it('a merge (twin PATCH) failing after the bound persists its backoff too', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno tiene 2 años');
+      h.setLookup(found([backend()]));
+      const patch = deferred<PatchPetResult>();
+      h.client.patchPet.mockImplementationOnce(() => patch.promise);
+      void h.service.afterCheckout(SENDER);
+      await jest.advanceTimersByTimeAsync(BOUND_MS);
+      patch.reject(upstream(500));
+      await jest.advanceTimersByTimeAsync(0);
+      const [bruno] = await h.local();
+      expect(bruno.merge).toMatchObject({
+        attempts: 1,
+        nextAttemptAt: new Date(NOW.getTime() + MINUTE).toISOString(),
+      });
+      expect(JSON.stringify(warn.mock.calls)).toMatch(
+        /pet merge not done: 500 \(attempt 1, next in/,
+      );
+    });
+
+    it('no retry log when the backoff could not be persisted (local write failed)', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es labrador');
+      h.setLookup(found([]));
+      h.client.createPet.mockRejectedValueOnce(upstream(500));
+      const original = h.localStore.write.bind(h.localStore);
+      // The frozen-body write lands; the backoff write fails.
+      jest
+        .spyOn(h.localStore, 'write')
+        .mockImplementationOnce(original)
+        .mockRejectedValueOnce(new Error('pool exhausted'));
+      await h.service.afterCheckout(SENDER);
+      expect((await h.local())[0].upload?.attempts).toBeUndefined();
+      expect(retryLogged(1)).toBe(false);
+      expect(JSON.stringify(warn.mock.calls)).toContain(
+        'pet create not done: 500 (backoff not saved',
+      );
     });
   });
 });

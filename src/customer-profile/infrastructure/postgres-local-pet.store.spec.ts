@@ -7,7 +7,10 @@ import {
 } from '@testcontainers/postgresql';
 import { runLocalPetStoreContract } from './local-pet-store.contract';
 import { PostgresCustomerProfileStore } from './postgres-customer-profile.store';
-import { PostgresLocalPetStore } from './postgres-local-pet.store';
+import {
+  LOCAL_PET_STORE_TIMEOUT_MS,
+  PostgresLocalPetStore,
+} from './postgres-local-pet.store';
 
 const DOCKER = process.env.RUN_DOCKER_TESTS === '1';
 const ddescribe = DOCKER ? describe : describe.skip;
@@ -22,28 +25,78 @@ const pet = {
   createdAt: '2026-11-23T12:00:00.000Z',
 };
 
-class FakePool {
-  readonly calls: Array<{ sql: string; params: unknown[] }> = [];
-  constructor(private readonly rows: unknown[][] = []) {}
+type Call = { sql: string; params: unknown[] };
+
+class FakeClient {
+  readonly calls: Call[] = [];
+  readonly released: Array<Error | undefined> = [];
+  /** Answers per statement (shifted for every query, BEGIN included). */
+  constructor(private readonly answers: Array<() => Promise<unknown[]>>) {}
   query(sql: string, params: unknown[] = []) {
     this.calls.push({ sql, params });
-    const rows = this.rows.shift() ?? [];
-    return Promise.resolve({ rows, rowCount: rows.length });
+    const answer = this.answers.shift();
+    return (answer?.() ?? Promise.resolve([])).then((rows) => ({
+      rows,
+      rowCount: rows.length,
+    }));
+  }
+  release(error?: Error) {
+    this.released.push(error);
   }
 }
 
-const fake = (rows: unknown[][] = []) => {
-  const pool = new FakePool(rows);
-  // SAFETY: FakePool implements the only `query` surface the store calls.
-  return { pool, store: new PostgresLocalPetStore(pool as unknown as Pool) };
+class FakePool {
+  connects = 0;
+  constructor(
+    readonly client: FakeClient,
+    private readonly acquire: () => Promise<FakeClient> = () =>
+      Promise.resolve(client),
+  ) {}
+  connect() {
+    this.connects += 1;
+    return this.acquire();
+  }
+}
+
+const rows =
+  (value: unknown[] = []) =>
+  () =>
+    Promise.resolve(value);
+const never = () => new Promise<unknown[]>(() => undefined);
+
+const fake = (
+  answers: Array<() => Promise<unknown[]>> = [],
+  acquire?: (client: FakeClient) => Promise<FakeClient>,
+) => {
+  const client = new FakeClient(answers);
+  const pool = new FakePool(
+    client,
+    acquire === undefined ? undefined : () => acquire(client),
+  );
+  // SAFETY: FakePool implements the only `connect` surface the store calls.
+  return {
+    pool,
+    client,
+    store: new PostgresLocalPetStore(pool as unknown as Pool),
+  };
 };
 
+const sqls = (client: FakeClient) => client.calls.map((call) => call.sql);
+const GUARD =
+  /^SELECT set_config\('statement_timeout', \$1, true\), set_config\('idle_in_transaction_session_timeout', \$1, true\)$/;
+
 describe('PostgresLocalPetStore SQL (no database)', () => {
-  it('replaces the pets column in one upsert, leaving the other columns alone', async () => {
-    const { pool, store } = fake();
+  it('replaces the pets column in one upsert inside a time-bounded transaction, leaving the other columns alone', async () => {
+    const { client, store } = fake();
     await store.write(SENDER, [pet] as never, new Date('2026-11-23T12:00:00Z'));
-    expect(pool.calls).toHaveLength(1);
-    const { sql, params } = pool.calls[0];
+    expect(sqls(client)).toHaveLength(4);
+    expect(client.calls[0].sql).toBe('BEGIN');
+    expect(client.calls[1].sql).toMatch(GUARD);
+    expect(Number(client.calls[1].params[0])).toBeGreaterThan(0);
+    expect(Number(client.calls[1].params[0])).toBeLessThanOrEqual(
+      LOCAL_PET_STORE_TIMEOUT_MS,
+    );
+    const { sql, params } = client.calls[2];
     expect(sql).toMatch(/INSERT INTO customer_profiles \(sender_id, pets,/);
     expect(sql).toMatch(/ON CONFLICT \(sender_id\) DO UPDATE SET pets = /);
     expect(sql).not.toMatch(/\bpet =/);
@@ -52,26 +105,97 @@ describe('PostgresLocalPetStore SQL (no database)', () => {
       JSON.stringify([pet]),
       '2026-11-23T12:00:00.000Z',
     ]);
+    expect(client.calls[3].sql).toBe('COMMIT');
+    expect(client.released).toEqual([undefined]);
   });
 
   it('an empty list only clears an existing row (never inserts)', async () => {
-    const { pool, store } = fake();
+    const { client, store } = fake();
     await store.write(SENDER, [], new Date('2026-11-23T12:00:00Z'));
-    expect(pool.calls[0].sql).toMatch(
+    expect(client.calls[2].sql).toMatch(
       /^UPDATE customer_profiles SET pets = NULL/,
     );
+    expect(client.calls[3].sql).toBe('COMMIT');
   });
 
-  it('reads and normalizes the list; invalid entries are dropped', async () => {
-    const { store } = fake([[{ pets: [pet, { id: '' }] }]]);
+  it('reads and normalizes the list under the same bound; invalid entries are dropped', async () => {
+    const { client, store } = fake([
+      rows(),
+      rows(),
+      rows([{ pets: [pet, { id: '' }] }]),
+    ]);
     await expect(store.read(SENDER)).resolves.toEqual([pet]);
+    expect(sqls(client)[0]).toBe('BEGIN');
+    expect(sqls(client)[1]).toMatch(GUARD);
+    expect(sqls(client)[2]).toMatch(/^SELECT pets FROM customer_profiles/);
+    expect(client.released).toEqual([undefined]);
   });
 
-  it('never queries for an invalid sender', async () => {
+  it('never connects for an invalid sender', async () => {
     const { pool, store } = fake();
     await expect(store.read('sender-1')).resolves.toEqual([]);
     await store.write('sender-1', [pet] as never, new Date());
-    expect(pool.calls).toHaveLength(0);
+    expect(pool.connects).toBe(0);
+  });
+
+  it('a failed statement destroys the connection (the open transaction is aborted) and never commits', async () => {
+    const failure = new Error('boom');
+    const { client, store } = fake([
+      rows(),
+      rows(),
+      () => Promise.reject(failure),
+    ]);
+    await expect(store.write(SENDER, [pet] as never, new Date())).rejects.toBe(
+      failure,
+    );
+    expect(sqls(client)).not.toContain('COMMIT');
+    expect(client.released).toEqual([failure]);
+  });
+
+  describe('F1: bounded by LOCAL_PET_STORE_TIMEOUT_MS, connection acquire included', () => {
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it('the store bound leaves the service bound a margin (≤ 10 s overall)', () => {
+      expect(LOCAL_PET_STORE_TIMEOUT_MS).toBeLessThan(10_000);
+    });
+
+    it('a connection acquire that does not finish in time rejects; a late client is released untouched', async () => {
+      let hand: (client: FakeClient) => void = () => undefined;
+      const { client, store } = fake([], () => new Promise((r) => (hand = r)));
+      const write = store.write(SENDER, [pet] as never, new Date());
+      const settled = expect(write).rejects.toThrow(/timed out/);
+      await jest.advanceTimersByTimeAsync(LOCAL_PET_STORE_TIMEOUT_MS);
+      await settled;
+      hand(client);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(client.calls).toEqual([]);
+      expect(client.released).toEqual([undefined]);
+    });
+
+    it('a statement still running at the deadline: connection destroyed, COMMIT never sent, rejects', async () => {
+      const { client, store } = fake([rows(), rows(), never]);
+      const write = store.write(SENDER, [pet] as never, new Date());
+      const settled = expect(write).rejects.toThrow(/timed out/);
+      await jest.advanceTimersByTimeAsync(LOCAL_PET_STORE_TIMEOUT_MS);
+      await settled;
+      expect(sqls(client)).not.toContain('COMMIT');
+      expect(client.released).toHaveLength(1);
+      expect(client.released[0]).toBeInstanceOf(Error);
+    });
+
+    it('the server-side statement_timeout is the time left after the acquire', async () => {
+      const { client, store } = fake(
+        [],
+        (c) => new Promise((resolve) => setTimeout(() => resolve(c), 3_000)),
+      );
+      const write = store.write(SENDER, [pet] as never, new Date());
+      await jest.advanceTimersByTimeAsync(3_000);
+      await write;
+      expect(client.calls[1].params[0]).toBe(
+        String(LOCAL_PET_STORE_TIMEOUT_MS - 3_000),
+      );
+    });
   });
 });
 
@@ -178,6 +302,38 @@ ddescribe(
         new PostgresCustomerProfileStore(pool).read(SENDER),
       ).resolves.toMatchObject({ senderId: SENDER });
       migrate('up');
+      await pool.query('TRUNCATE TABLE customer_profiles');
+    });
+
+    it('F1: a write blocked past the deadline is cancelled server-side and never lands later', async () => {
+      const store = new PostgresLocalPetStore(pool);
+      await store.write(SENDER, [pet] as never, new Date());
+      const locker = await pool.connect();
+      try {
+        await locker.query('BEGIN');
+        await locker.query(
+          'SELECT 1 FROM customer_profiles WHERE sender_id = $1 FOR UPDATE',
+          [SENDER],
+        );
+        const started = Date.now();
+        await expect(
+          store.write(SENDER, [], new Date()),
+        ).rejects.toBeInstanceOf(Error);
+        expect(Date.now() - started).toBeLessThan(
+          LOCAL_PET_STORE_TIMEOUT_MS + 1_000,
+        );
+        await locker.query('COMMIT');
+      } finally {
+        locker.release();
+      }
+      // The lock is gone: a write still pending would land now.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await expect(store.read(SENDER)).resolves.toEqual([pet]);
+      const idle = await pool.query<{ n: string }>(
+        `SELECT count(*) AS n FROM pg_stat_activity
+        WHERE state LIKE 'idle in transaction%' AND datname = current_database()`,
+      );
+      expect(idle.rows[0].n).toBe('0');
       await pool.query('TRUNCATE TABLE customer_profiles');
     });
 

@@ -85,7 +85,10 @@ export interface LocalPet {
 export interface LocalPetStore {
   /** `[]` when unknown, empty or the sender id is not wa_id digits. */
   read(senderId: string): Promise<LocalPet[]>;
-  /** Replaces the list (creating the profile row if needed). */
+  /** Replaces the list (creating the profile row if needed). F1: the
+   *  service abandons a call after CUSTOMER_PETS_LOCAL_IO_TIMEOUT_MS, so a
+   *  durable adapter must make sure an abandoned write never lands later
+   *  (bound and cancel it itself, as PostgresLocalPetStore does). */
   write(senderId: string, pets: LocalPet[], now: Date): Promise<void>;
 }
 
