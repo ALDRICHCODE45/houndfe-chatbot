@@ -11,6 +11,7 @@ import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
 import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
+import type { CustomerPetsService } from '../../customer-profile/application/customer-pets.service';
 import { InMemoryCustomerProfileStore } from '../../customer-profile/infrastructure/in-memory-customer-profile.store';
 import { MinimalCartService } from './minimal-cart.service';
 import { MinimalCheckoutService } from './minimal-checkout.service';
@@ -64,6 +65,8 @@ function setup(
   options: {
     order?: 'on' | 'absent';
     shipping?: boolean;
+    /** T4b (S8): the pet store's post-checkout upload hook. */
+    pets?: Pick<CustomerPetsService, 'afterCheckout'>;
   } = {},
 ) {
   const mode = options.order ?? 'on';
@@ -195,6 +198,9 @@ function setup(
     shipping,
     undefined,
     profiles,
+    undefined,
+    undefined,
+    options.pets as CustomerPetsService | undefined,
   );
   const agent = new MinimalCatalogAgentService(
     client,
@@ -720,6 +726,36 @@ describe('minimal order placement through the SDK route', () => {
         totalCents: 3000,
       },
     });
+  });
+
+  it('T4b (S8): a placed order runs the pet upload once (the checkout may have created the Customer); a summary alone does not', async () => {
+    const afterCheckout = jest.fn(() => Promise.resolve());
+    const h = setup({ pets: { afterCheckout } });
+    await h.ready();
+    const offer = await h.turn(
+      'Quiero hacer mi pedido',
+      [call('prepareOrder'), say('x')],
+      EVENT('wamid.pets1'),
+    );
+    (offer as { onSent: () => void }).onSent();
+    expect(afterCheckout).not.toHaveBeenCalled();
+    await h.turn('SÍ', [say('x')], EVENT('wamid.pets2'));
+    expect(afterCheckout.mock.calls).toEqual([[SENDER]]);
+  });
+
+  it('T4b: a failing pet upload never blocks the order-created reply', async () => {
+    const afterCheckout = jest.fn(() => Promise.reject(new Error('down')));
+    const h = setup({ pets: { afterCheckout } });
+    await h.ready();
+    const offer = await h.turn(
+      'Quiero hacer mi pedido',
+      [call('prepareOrder'), say('x')],
+      EVENT('wamid.pets3'),
+    );
+    (offer as { onSent: () => void }).onSent();
+    const placed = await h.turn('SÍ', [say('x')], EVENT('wamid.pets4'));
+    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect(afterCheckout).toHaveBeenCalledTimes(1);
   });
 
   it('lets a mixed answer reach the model without creating a sale', async () => {

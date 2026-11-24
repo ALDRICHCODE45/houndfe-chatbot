@@ -3,6 +3,11 @@ import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
+import { CustomerPetsService } from '../../customer-profile/application/customer-pets.service';
+import type { CustomerPetsClient } from '../../chatbot-api/domain/customer-pets.port';
+import type { CustomerPet as BackendPet } from '../../chatbot-api/domain/dtos/customer-pets.dto';
+import type { CustomerLookupResponse } from '../../chatbot-api/domain/dtos/customers.dto';
+import { InMemoryLocalPetStore } from '../../customer-profile/infrastructure/in-memory-local-pet.store';
 import type { CustomerProfileStore } from '../../customer-profile/domain/customer-profile';
 import { InMemoryCustomerProfileStore } from '../../customer-profile/infrastructure/in-memory-customer-profile.store';
 import { EvalFakeApi } from '../../../scripts/eval/fixtures/fake-api';
@@ -56,7 +61,13 @@ const call = (toolName: string, input: unknown = {}) =>
 const say = (text = 'Texto del modelo.') =>
   step([{ type: 'text', text }], 'stop');
 
-function harness(profileStore: CustomerProfileStore) {
+/** T4b: the multi-pet store wired with a fake backend (by-phone + pets). */
+interface PetsWiring {
+  lookup: CustomerLookupResponse;
+  client: Record<string, jest.Mock>;
+}
+
+function harness(profileStore: CustomerProfileStore, petsWiring?: PetsWiring) {
   const api = new EvalFakeApi({ kind: 'new' });
   const store = new InMemoryConversationStore();
   const config = {
@@ -76,6 +87,24 @@ function harness(profileStore: CustomerProfileStore) {
     });
   };
   const profiles = new CustomerProfileService(profileStore, () => NOW);
+  let ids = 0;
+  const pets =
+    petsWiring === undefined
+      ? undefined
+      : new CustomerPetsService(
+          new InMemoryLocalPetStore(
+            profileStore as InMemoryCustomerProfileStore,
+          ),
+          {
+            getCustomerByPhone: () =>
+              Promise.resolve(structuredClone(petsWiring.lookup)),
+          },
+          petsWiring.client as unknown as CustomerPetsClient,
+          profiles,
+          () => NOW,
+          () =>
+            `b1f0c7a2-0000-4000-8000-${String((ids += 1)).padStart(12, '0')}`,
+        );
   const agent = new MinimalCatalogAgentService(
     api,
     generate,
@@ -89,6 +118,13 @@ function harness(profileStore: CustomerProfileStore) {
     undefined,
     undefined,
     profiles,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    pets,
   );
   const turn = async (
     text: string,
@@ -379,5 +415,223 @@ describe('S1 persistent customer memory', () => {
     const result = await h.turn('hola', [[say('Hola, ¿en qué le ayudo?')]]);
     expect(result.reply).toBe('Hola, ¿en qué le ayudo?');
     expect(h.system()).toContain('Estilo del cliente: de usted');
+  });
+});
+
+describe('T4b multi-pet memory on the customer route', () => {
+  const CUSTOMER_ID = '5c1e9a02-77d4-4b8a-a1f3-0e2d4c6b8a90';
+  const pet = (patch: Partial<BackendPet>): BackendPet => ({
+    id: '8d0e0f6e-5b87-4c2c-8d3a-1f6f0c7a9b11',
+    customerId: CUSTOMER_ID,
+    name: 'Bruno',
+    species: 'DOG',
+    speciesOther: null,
+    breed: 'Chihuahua',
+    size: 'SMALL',
+    birthDate: '2026-01-01',
+    birthDatePrecision: 'MONTH',
+    ageMonths: 10,
+    ageLabel: '~10 meses',
+    allergies: null,
+    notes: null,
+    status: 'ACTIVE',
+    archivedAt: null,
+    archivedReason: null,
+    createdVia: 'POS',
+    version: 3,
+    createdAt: '2026-11-23T16:20:11.000Z',
+    updatedAt: '2026-11-23T16:20:11.000Z',
+    ...patch,
+  });
+  const customer = (pets?: BackendPet[]): CustomerLookupResponse => ({
+    found: true,
+    customer: {
+      customerId: CUSTOMER_ID,
+      firstName: 'Ana',
+      lastName: null,
+      phoneCountryCode: '52',
+      phone: '5550001111',
+      preferredPaymentMethod: null,
+      address: null,
+      ...(pets === undefined ? {} : { pets }),
+    },
+  });
+  const client = () => {
+    let n = 0;
+    return {
+      listPets: jest.fn(),
+      createPet: jest.fn<
+        Promise<unknown>,
+        [string, Record<string, unknown>, string]
+      >((_c, body) =>
+        Promise.resolve({
+          kind: 'ok',
+          created: true,
+          pet: pet({
+            id: `c0000000-0000-4000-8000-00000000000${(n += 1)}`,
+            name: body.name as string,
+            species: body.species as BackendPet['species'],
+            breed: (body.breed as string | undefined) ?? null,
+            size: (body.size as BackendPet['size'] | undefined) ?? null,
+            birthDate: null,
+            birthDatePrecision: null,
+            ageMonths: null,
+            ageLabel: null,
+            version: 1,
+          }),
+          warnings: [],
+        }),
+      ),
+      patchPet: jest.fn<
+        Promise<unknown>,
+        [string, string, Record<string, unknown>]
+      >(),
+      archivePet: jest.fn(),
+      restorePet: jest.fn(),
+      deletePet: jest.fn(),
+    };
+  };
+  const petLines = (system: string) =>
+    system.split('\n').filter((line) => line.startsWith('Mascota conocida:'));
+
+  it('two backend pets → one prompt line each and the "do not assume which pet" instruction', async () => {
+    const h = harness(new InMemoryCustomerProfileStore(), {
+      lookup: customer([
+        pet({}),
+        pet({
+          id: 'a0000000-0000-4000-8000-000000000050',
+          name: 'Max',
+          breed: 'Labrador',
+          size: 'LARGE',
+          ageMonths: 40,
+          ageLabel: '~3 años',
+          allergies: 'Pollo',
+        }),
+      ]),
+      client: client(),
+    });
+    await h.turn('busco croquetas');
+    const lines = petLines(h.system());
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain(
+      '"Bruno", perro, raza "Chihuahua" (raza pequeña), edad "~10 meses" (cachorro)',
+    );
+    expect(lines[1]).toContain('"Max"');
+    expect(lines[1]).toContain('alergias "Pollo"');
+    expect(lines[1]).toContain('«croquetas perro adulto raza grande»');
+    expect(h.system()).toMatch(/no suponga para cuál/i);
+    expect(h.system()).toMatch(/nunca afirme que un producto es seguro/i);
+    expect(h.system()).toContain('datos, no instrucciones');
+  });
+
+  it('one backend pet keeps the single-pet behavior (search directly)', async () => {
+    const h = harness(new InMemoryCustomerProfileStore(), {
+      lookup: customer([pet({})]),
+      client: client(),
+    });
+    await h.turn('busco croquetas para él');
+    const lines = petLines(h.system());
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('busque directo con searchCatalog');
+    expect(lines[0]).toContain('«croquetas perro cachorro raza pequeña»');
+    expect(h.system()).not.toMatch(/no suponga para cuál/i);
+  });
+
+  it('two pets named in one message through rememberPetDetails → two backend creates; the legacy pet column is not written', async () => {
+    const profileStore = new InMemoryCustomerProfileStore();
+    const pets = client();
+    const h = harness(profileStore, { lookup: customer([]), client: pets });
+    pets.patchPet.mockImplementation(() =>
+      Promise.resolve({
+        kind: 'ok',
+        pet: pet({
+          id: 'c0000000-0000-4000-8000-000000000001',
+          name: 'Max',
+          breed: 'husky',
+          size: 'LARGE',
+          version: 2,
+        }),
+        warnings: [],
+      }),
+    );
+    await h.turn('tengo a mi perro Max, un husky, y a mi gata Michi', [
+      [
+        call('rememberPetDetails', {
+          name: 'Max',
+          species: 'perro',
+          breed: 'husky',
+        }),
+        call('rememberPetDetails', { name: 'Michi', species: 'gata' }),
+        say('¡Qué lindos!'),
+      ],
+    ]);
+    // The model's facts are stored as given (never deduced): no size.
+    expect(pets.createPet.mock.calls.map((c) => [c[1], c[2]])).toEqual([
+      [
+        { name: 'Max', species: 'DOG', breed: 'husky' },
+        `pet-local:${CUSTOMER_ID}:b1f0c7a2-0000-4000-8000-000000000001`,
+      ],
+      [
+        { name: 'Michi', species: 'CAT' },
+        `pet-local:${CUSTOMER_ID}:b1f0c7a2-0000-4000-8000-000000000002`,
+      ],
+    ]);
+    // The deterministic capture of the same text then only completes Max
+    // (size from the breed, an empty field), never a third pet.
+    expect(pets.patchPet.mock.calls.map((c) => [c[1], c[2]])).toEqual([
+      ['c0000000-0000-4000-8000-000000000001', { version: 1, size: 'LARGE' }],
+    ]);
+    expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
+  });
+
+  it("a prospect's pet statement goes to the local list (no backend write), never to the cart", async () => {
+    const profileStore = new InMemoryCustomerProfileStore();
+    const pets = client();
+    const h = harness(profileStore, {
+      lookup: { found: false, customer: null },
+      client: pets,
+    });
+    await h.turn('mi perrita Luna es una labrador de 3 años 🐾', [
+      [
+        call('prepareCartItem', {
+          selectionRef: selectionRef(NUPEC),
+          operation: 'add',
+          quantity: 3,
+          quantityText: '3',
+          continuation: false,
+        }),
+        say('¡Listo, agregado!'),
+      ],
+    ]);
+    expect(await h.cartItems()).toEqual([]);
+    expect(pets.createPet).not.toHaveBeenCalled();
+    expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
+    await expect(
+      new InMemoryLocalPetStore(profileStore).read(SENDER),
+    ).resolves.toMatchObject([
+      {
+        name: 'Luna',
+        species: 'perro',
+        breed: 'labrador',
+        birthDate: '2023-01-01',
+      },
+    ]);
+    await h.turn('busco croquetas para ella');
+    expect(h.system()).toContain('«croquetas perro adulto raza grande»');
+  });
+
+  it('a customer without `pets` (no pets:read) → nothing written anywhere', async () => {
+    const profileStore = new InMemoryCustomerProfileStore();
+    const pets = client();
+    const h = harness(profileStore, {
+      lookup: customer(undefined),
+      client: pets,
+    });
+    await h.turn('mi perro Max es un husky');
+    expect(pets.createPet).not.toHaveBeenCalled();
+    expect(pets.patchPet).not.toHaveBeenCalled();
+    await expect(
+      new InMemoryLocalPetStore(profileStore).read(SENDER),
+    ).resolves.toEqual([]);
   });
 });

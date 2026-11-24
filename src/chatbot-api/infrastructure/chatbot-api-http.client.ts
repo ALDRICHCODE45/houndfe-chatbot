@@ -172,6 +172,7 @@ import type {
 import {
   CancelSaleInputSchema,
   CreateSaleInputSchema,
+  dropInvalidHistoryLinePets,
   parseOrderHistoryResponse,
 } from '../domain/dtos/sales.dto';
 import {
@@ -837,16 +838,25 @@ export class ChatbotApiHttpClient
         url: `/chatbot-api/customers/by-phone/${encodeURIComponent(phone)}/orders`,
         params: {
           phoneCountryCode: cc,
-          ...(options.petId === undefined ? {} : { petId: options.petId }),
+          // T4b (L13 b): a blank petId is never sent as `?petId=`.
+          ...(typeof options.petId === 'string' && options.petId.trim() !== ''
+            ? { petId: options.petId }
+            : {}),
         },
       },
       { retryable: true },
     );
+    // T4b (L13 c): a drifted per-line pet degrades to absent (by-phone policy).
+    const { body, dropped } = dropInvalidHistoryLinePets(response.data);
+    if (dropped > 0)
+      new Logger(ChatbotApiHttpClient.name).warn(
+        `Chatbot API order history line pet was invalid; treating it as absent (lines=${dropped})`,
+      );
     return this.acceptTolerantRead(
       'order history',
       response,
       [200],
-      parseOrderHistoryResponse(response.data),
+      parseOrderHistoryResponse(body),
     );
   }
 
@@ -2284,7 +2294,7 @@ export class ChatbotApiHttpClient
       response = await this.requestWithResponse<unknown>({
         method: 'POST',
         url: petsUrl(customerId),
-        data: toPetBody(input),
+        data: toPetBody(input, {}, 'create'),
         headers: { 'X-Idempotency-Key': key },
       });
     } catch (error) {

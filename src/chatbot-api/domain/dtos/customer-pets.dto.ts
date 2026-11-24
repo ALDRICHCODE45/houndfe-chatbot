@@ -141,25 +141,33 @@ const PET_BODY_KEYS = [
 
 /**
  * The wire body: only the documented members, in a fixed order, without
- * `undefined` ones (`null` kept: it clears on PATCH). The backend rejects
- * unknown members, and a fixed shape keeps a create retry byte-identical
- * under the same idempotency key.
+ * `undefined` ones. The backend rejects unknown members, and a fixed shape
+ * keeps a create retry byte-identical under the same idempotency key.
+ *
+ * T4b (L13 a): `null` means absent on create, so a create drops it like
+ * `undefined` (a null/undefined flip never changes the bytes under the same
+ * key); a PATCH keeps `null` because it clears. An `approxAge` without whole
+ * `years`/`months` is never sent (the backend needs at least one).
  */
 export function toPetBody(
   input: CreatePetInput | PatchPetInput,
   leading: Record<string, unknown> = {},
+  mode: 'create' | 'patch' = 'patch',
 ): Record<string, unknown> {
   const source = input as unknown as Record<string, unknown>;
   const body: Record<string, unknown> = { ...leading };
   for (const key of PET_BODY_KEYS) {
     const value = source[key];
     if (value === undefined) continue;
+    if (value === null && mode === 'create') continue;
     if (key === 'approxAge' && value !== null && typeof value === 'object') {
       const age = value as PetApproxAge;
-      body[key] = {
-        ...(age.years === undefined ? {} : { years: age.years }),
-        ...(age.months === undefined ? {} : { months: age.months }),
+      const approxAge = {
+        ...(typeof age.years === 'number' ? { years: age.years } : {}),
+        ...(typeof age.months === 'number' ? { months: age.months } : {}),
       };
+      if (Object.keys(approxAge).length === 0) continue;
+      body[key] = approxAge;
       continue;
     }
     body[key] = value;

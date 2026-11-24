@@ -212,14 +212,69 @@ describe('getOrderHistory response parsing', () => {
         'a bad status',
         { id: petId, name: 'Bruno', species: 'DOG', status: 'GONE' },
       ],
-    ])('maps a pet with %s to UpstreamError', async (_label, pet) => {
+      ['a string', 'Bruno'],
+    ])(
+      'T4b (L13 c): a pet with %s degrades to absent with a warning; the history still parses',
+      async (_label, pet) => {
+        request.mockReturnValue(
+          of(
+            response([
+              {
+                ...order,
+                items: [
+                  { ...line, pet },
+                  {
+                    ...line,
+                    productName: 'Shampoo',
+                    pet: {
+                      id: petId,
+                      name: 'Bruno',
+                      species: 'DOG',
+                      status: 'ACTIVE',
+                    },
+                  },
+                ],
+              },
+            ]),
+          ),
+        );
+        const [parsed] = await client.getOrderHistory('5512345678', '52');
+        expect(parsed.items).toHaveLength(2);
+        expect('pet' in parsed.items[0]).toBe(false);
+        expect(parsed.items[0]).toEqual(line);
+        expect(parsed.items[1].pet).toEqual({
+          id: petId,
+          name: 'Bruno',
+          species: 'DOG',
+          status: 'ACTIVE',
+        });
+        const logged = JSON.stringify(warn.mock.calls);
+        expect(logged).toContain('pet');
+        expect(logged).toMatch(/absent/);
+        // Never the pet's values.
+        expect(logged).not.toContain('Bruno');
+      },
+    );
+
+    it('T4b (L13 c): other line errors still fail the whole history', async () => {
       request.mockReturnValue(
-        of(response([{ ...order, items: [{ ...line, pet }] }])),
+        of(response([{ ...order, items: [{ ...line, quantity: 0, pet: 1 }] }])),
       );
       await expect(
         client.getOrderHistory('5512345678', '52'),
       ).rejects.toBeInstanceOf(UpstreamError);
     });
+
+    it.each(['', '   '])(
+      'T4b (L13 b): a blank petId %j is not sent as ?petId=',
+      async (blank) => {
+        request.mockReturnValue(of(response([withPets])));
+        await client.getOrderHistory('5512345678', '52', { petId: blank });
+        expect(request.mock.calls[0][0].params).toEqual({
+          phoneCountryCode: '52',
+        });
+      },
+    );
 
     it('sends ?petId= only when asked', async () => {
       request.mockReturnValue(of(response([withPets])));

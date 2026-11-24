@@ -249,6 +249,39 @@ const orderHistorySchema = z.array(
   }),
 );
 
+/**
+ * T4b (L13 c): a per-line `pet` that fails its contract is removed (the line
+ * reads as pet-less) instead of failing the whole history — the same policy
+ * as `customer.pets` on by-phone. Returns a copy and how many were dropped;
+ * anything that is not the documented array shape is returned untouched (the
+ * parser then rejects it as before).
+ */
+export function dropInvalidHistoryLinePets(body: unknown): {
+  body: unknown;
+  dropped: number;
+} {
+  if (!Array.isArray(body)) return { body, dropped: 0 };
+  let dropped = 0;
+  const next = body.map((order: unknown) => {
+    if (typeof order !== 'object' || order === null) return order;
+    const items = (order as { items?: unknown }).items;
+    if (!Array.isArray(items)) return order;
+    return {
+      ...order,
+      items: items.map((item: unknown) => {
+        if (typeof item !== 'object' || item === null || !('pet' in item))
+          return item;
+        const { pet, ...rest } = item;
+        if (historyLinePet.nullable().optional().safeParse(pet).success)
+          return item;
+        dropped += 1;
+        return rest;
+      }),
+    };
+  });
+  return { body: dropped === 0 ? body : next, dropped };
+}
+
 /** `GET /chatbot-api/customers/by-phone/:phone/orders`; null on contract breaks.
  *  Names and unit prices are historical: never a price for a new sale. */
 export function parseOrderHistoryResponse(

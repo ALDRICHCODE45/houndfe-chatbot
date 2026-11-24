@@ -145,6 +145,8 @@ ddescribe('customer_profiles migration 3700 + store (real PostgreSQL)', () => {
       'last_order_folio',
       'last_order_total_cents',
       'pet',
+      // T4b (migration 5700): the prospect's local pet list.
+      'pets',
       'preferred_name',
       'register',
       'sender_id',

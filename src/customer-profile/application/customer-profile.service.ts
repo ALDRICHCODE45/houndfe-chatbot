@@ -41,6 +41,11 @@ export class CustomerProfileService {
     this.now = clock ?? (() => new Date());
   }
 
+  /** True after "olvida mis datos" in this process (no more writes). */
+  isForgotten(senderId: string): boolean {
+    return this.forgotten.has(senderId);
+  }
+
   isLoaded(senderId: string): boolean {
     return this.cache.has(senderId);
   }

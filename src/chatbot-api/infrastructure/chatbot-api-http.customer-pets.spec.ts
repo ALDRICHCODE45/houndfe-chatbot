@@ -250,6 +250,42 @@ describe('customer pets client (T4a)', () => {
       expect(Object.keys(sent().data as object)).toEqual(['name', 'species']);
     });
 
+    it('T4b (L13 a): drops null members like undefined and never sends an empty approxAge', async () => {
+      request.mockReturnValue(of(ok({ ...pet, warnings: [] }, 201)));
+      const withNulls = {
+        name: 'Bruno',
+        species: 'DOG' as const,
+        breed: null,
+        size: null,
+        approxAge: null,
+        allergies: null,
+        notes: null,
+      };
+      await client.createPet(customerId, withNulls, key);
+      await client.createPet(
+        customerId,
+        { name: 'Bruno', species: 'DOG', approxAge: {} },
+        key,
+      );
+      await client.createPet(
+        customerId,
+        {
+          name: 'Bruno',
+          species: 'DOG',
+          approxAge: { years: undefined, months: undefined },
+        },
+        key,
+      );
+      await client.createPet(
+        customerId,
+        { name: 'Bruno', species: 'DOG' },
+        key,
+      );
+      // null, undefined and empty age all produce the same bytes under the key.
+      const bytes = [0, 1, 2, 3].map((i) => JSON.stringify(sent(i).data));
+      expect(bytes).toEqual(Array(4).fill('{"name":"Bruno","species":"DOG"}'));
+    });
+
     it('is single attempt: a 5xx is not retried', async () => {
       request.mockReturnValue(fail(500, 'CUSTOMER_PET_REQUEST_FAILED'));
       await expect(
@@ -350,6 +386,16 @@ describe('customer pets client (T4a)', () => {
       expect(Object.keys(sent().data as object).sort()).toEqual(
         ['allergies', 'size', 'version'].sort(),
       );
+    });
+
+    it('T4b (L13 a): keeps null (it clears) but never sends an empty approxAge', async () => {
+      request.mockReturnValue(of(ok({ ...pet, version: 4, warnings: [] })));
+      await client.patchPet(customerId, petId, {
+        version: 3,
+        approxAge: {},
+        notes: null,
+      });
+      expect(JSON.stringify(sent().data)).toBe('{"version":3,"notes":null}');
     });
 
     it('exposes PET_NAME_DUPLICATE warnings', async () => {

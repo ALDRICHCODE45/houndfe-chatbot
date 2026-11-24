@@ -53,6 +53,7 @@ import {
   type CustomerStyle,
 } from '../domain/customer-style';
 import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
+import { CustomerPetsService } from '../../customer-profile/application/customer-pets.service';
 import {
   extractPetFacts,
   knownPetPromptLine,
@@ -320,7 +321,8 @@ export const FORGET_MY_DATA_REPLY =
 const PET_MEMORY_INSTRUCTIONS =
   'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
   'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación. ' +
-  'Si hay una línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte.';
+  'Si hay una sola línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte. ' +
+  'Si hay varias, siga la indicación que las acompaña.';
 
 /** Generous input cap; the profile store bounds each field again. */
 const PET_FACT = z.string().min(1).max(500).optional();
@@ -1050,6 +1052,11 @@ export class MinimalCatalogAgentService {
     // and schedule an expired one again; optional only as a test seam.
     @Optional()
     private readonly backorderConfirm?: MinimalBackorderConfirmService,
+    // Multi-pet T4b: backend pets for a Customer, a local list for a
+    // prospect; optional only as a test seam (without it the single stored
+    // pet of the profile is used as before).
+    @Optional()
+    private readonly pets?: CustomerPetsService,
   ) {
     const llm = config.get<{
       model: string;
@@ -3597,6 +3604,9 @@ export class MinimalCatalogAgentService {
       !profiles.isLoaded(senderId)
     )
       await profiles.load(senderId);
+    // T4b: the sender's pets (refreshed at most once a minute); uploads a
+    // former prospect's local pets once the sender is a Customer (S8).
+    await this.pets?.prepare(senderId);
   }
 
   /** S1: the stored style that seeds this sender's session, if any. */
@@ -3611,7 +3621,10 @@ export class MinimalCatalogAgentService {
     const profile = this.profiles.cached(senderId);
     const known = [
       knownCustomerPromptLine(profile),
-      knownPetPromptLine(profile?.pet),
+      // T4b: one line per known pet (backend, local and the legacy one).
+      this.pets === undefined
+        ? knownPetPromptLine(profile?.pet)
+        : this.pets.promptLines(senderId, profile?.pet),
     ].filter((line): line is string => line !== null);
     return `\n\n${[PET_MEMORY_INSTRUCTIONS, ...known].join('\n')}`;
   }
@@ -3738,7 +3751,14 @@ export class MinimalCatalogAgentService {
           notes: PET_FACT,
         }),
         execute: async (pet) => {
-          await profiles.record(senderId, { pet });
+          // T4b: the matched pet of the pet store (never mixes two pets).
+          if (this.pets !== undefined)
+            await this.pets.capture(
+              senderId,
+              pet,
+              profiles.cached(senderId)?.pet,
+            );
+          else await profiles.record(senderId, { pet });
           return { ok: true as const, remembered: true as const };
         },
       }),
@@ -3771,15 +3791,23 @@ export class MinimalCatalogAgentService {
       const name = explicitPreferredName(input.text);
       if (name !== null) patch.preferredName = name;
       // Deterministic pet capture, in addition to rememberPetDetails; a
-      // different pet is skipped so two pets are never mixed.
+      // different pet is skipped so two pets are never mixed. With the pet
+      // store (T4b) the facts go to the matched pet instead (below).
       const pet = extractPetFacts(input.text);
       if (
+        this.pets === undefined &&
         Object.keys(pet).length > 0 &&
         !petFactsConflict(profiles.cached(input.senderId)?.pet, pet)
       )
         patch.pet = pet;
     }
     await profiles.record(input.senderId, patch);
+    if (this.pets !== undefined && input.interactiveReplyId === undefined)
+      await this.pets.capture(
+        input.senderId,
+        extractPetFacts(input.text),
+        profiles.cached(input.senderId)?.pet,
+      );
   }
 
   /** S1: "olvida mis datos" — delete the profile and confirm. */

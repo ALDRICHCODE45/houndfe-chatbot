@@ -64,6 +64,7 @@ import { MinimalBackorderConfirmService } from './application/minimal-backorder-
 import { MinimalBackorderManageService } from './application/minimal-backorder-manage.service';
 import { MinimalBackorderOfferService } from './application/minimal-backorder-offer.service';
 import { CustomerProfileService } from '../customer-profile/application/customer-profile.service';
+import { CustomerPetsService } from '../customer-profile/application/customer-pets.service';
 import { MINIMAL_CATALOG_SESSION_STORE } from './domain/minimal-catalog-session.store';
 import { InMemoryMinimalCatalogSessionStore } from './infrastructure/in-memory-minimal-catalog-session.store';
 import { LLM_AGENT } from './domain/llm-agent.port';
@@ -164,6 +165,9 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
       useClass: InMemoryMinimalCatalogSessionStore,
     },
     MinimalCatalogAgentService,
+    // Multi-pet T4b: backend pets / local prospect pets for the agent and
+    // the post-checkout upload (S8).
+    CustomerPetsService,
     MinimalCartService,
     MinimalCheckoutService,
     MinimalOrderService,

@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { toMexicanState } from '../domain/mexican-state';
 import { ConfigService } from '@nestjs/config';
+import { CustomerPetsService } from '../../customer-profile/application/customer-pets.service';
 import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -380,6 +381,9 @@ export class MinimalOrderService {
     @Optional()
     @Inject(BACKORDER_CLIENT)
     private readonly backorders?: BackorderClient,
+    // Multi-pet T4b (S8): after an order the prospect's local pets are
+    // uploaded (the checkout may have created the Customer); optional.
+    @Optional() private readonly pets?: CustomerPetsService,
   ) {
     this.now = now ?? (() => Date.now());
     this.confirmation = new DurableOrderConfirmation(
@@ -1317,6 +1321,8 @@ export class MinimalOrderService {
         },
         firstName,
       );
+    // T4b (S8): best effort; the pet upload never blocks the reply.
+    await this.pets?.afterCheckout(senderId).catch(() => undefined);
     // Bank details are fetched when the customer chooses how to pay.
     return {
       reply: `¡Listo! ${minimalOrderCreatedReply(sale, shipping, pickupLocation)}\n\n${MINIMAL_PAYMENT_QUESTION}`,
