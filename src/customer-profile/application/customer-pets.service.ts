@@ -65,6 +65,10 @@ type PetScope =
 interface SenderPets {
   scope: PetScope;
   local: LocalPet[];
+  /** False while the local list could not be read: every local write and
+   *  upload is refused (a full-replacement write from an unknown base would
+   *  erase stored pets) and the next turn reads again. */
+  localKnown: boolean;
   loadedAt: number;
 }
 
@@ -121,19 +125,24 @@ export class CustomerPetsService {
       return;
     try {
       let local: LocalPet[];
+      let localKnown = true;
       try {
         local = await this.localStore.read(senderId);
       } catch (error) {
         this.warn('local read', error);
-        local = state?.local ?? [];
+        localKnown = state?.localKnown === true;
+        local = localKnown && state !== undefined ? state.local : [];
       }
       const scope = await this.resolveScope(senderId);
       this.remember(senderId, {
         scope,
         local,
-        loadedAt: this.now().getTime(),
+        localKnown,
+        // An unknown local list is never cached as fresh: the next turn reads.
+        loadedAt: localKnown ? this.now().getTime() : 0,
       });
-      if (scope.kind === 'customer') await this.uploadPending(senderId);
+      if (scope.kind === 'customer' && localKnown)
+        await this.uploadPending(senderId);
     } catch (error) {
       this.warn('prepare', error);
     }
@@ -165,6 +174,10 @@ export class CustomerPetsService {
         scope.kind === 'customer_pets_unknown'
       ) {
         this.logger.log(`pet facts not stored: pets ${scope.kind}`);
+        return;
+      }
+      if (!state.localKnown) {
+        this.logger.log('pet facts not stored: local pets unknown');
         return;
       }
       const match = matchPetForFacts<Ref>(
@@ -325,7 +338,12 @@ export class CustomerPetsService {
   /** Uploads every uploadable local pet of a Customer (S8). */
   private async uploadPending(senderId: string): Promise<void> {
     const state = this.cache.get(senderId);
-    if (state === undefined || state.scope.kind !== 'customer') return;
+    if (
+      state === undefined ||
+      state.scope.kind !== 'customer' ||
+      !state.localKnown
+    )
+      return;
     for (const pet of [...state.local]) await this.upload(senderId, pet.id);
   }
 
@@ -488,6 +506,7 @@ export class CustomerPetsService {
     state: SenderPets,
     next: LocalPet[],
   ): Promise<boolean> {
+    if (!state.localKnown) return false;
     try {
       await this.localStore.write(senderId, next, this.now());
       state.local = next;

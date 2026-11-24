@@ -354,6 +354,66 @@ describe('CustomerPetsService (T4b)', () => {
     });
   });
 
+  describe('local list read failure (review R4)', () => {
+    const restarted = (h: ReturnType<typeof harness>) =>
+      new CustomerPetsService(
+        h.localStore,
+        { getCustomerByPhone: h.getCustomerByPhone },
+        h.client as unknown as CustomerPetsClient,
+        h.profiles,
+        () => NOW,
+        () => uuid(50),
+      );
+
+    it('a failed local read on a cold cache never overwrites the stored list, and the next turn reads again', async () => {
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es una labrador');
+      await h.say('mi gato Michi es persa');
+      const service = restarted(h);
+      const write = jest.spyOn(h.localStore, 'write');
+      jest
+        .spyOn(h.localStore, 'read')
+        .mockRejectedValueOnce(new Error('pool exhausted'));
+      await service.prepare(SENDER);
+      await service.capture(
+        SENDER,
+        extractPetFacts('mi perro Max es un husky'),
+      );
+      expect(write).not.toHaveBeenCalled();
+      expect((await h.local()).map((pet) => pet.name)).toEqual([
+        'Luna',
+        'Michi',
+      ]);
+      await service.prepare(SENDER);
+      await service.capture(
+        SENDER,
+        extractPetFacts('mi perro Max es un husky'),
+      );
+      expect((await h.local()).map((pet) => pet.name)).toEqual([
+        'Luna',
+        'Michi',
+        'Max',
+      ]);
+    });
+
+    it('a Customer whose local read failed uploads nothing until a read succeeds', async () => {
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es una labrador');
+      h.setLookup(found([]));
+      const service = restarted(h);
+      jest
+        .spyOn(h.localStore, 'read')
+        .mockRejectedValueOnce(new Error('pool exhausted'));
+      await service.prepare(SENDER);
+      expect(h.client.createPet).not.toHaveBeenCalled();
+      expect((await h.local()).map((pet) => pet.name)).toEqual(['Luna']);
+      await service.prepare(SENDER);
+      expect(h.client.createPet).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('prospect (S8)', () => {
     it('keeps pets in the local list, never calls the backend pets routes', async () => {
       const h = harness(notFound);
