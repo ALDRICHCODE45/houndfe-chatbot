@@ -42,6 +42,11 @@ export const CUSTOMER_PETS_ID = Symbol('CUSTOMER_PETS_ID');
  *  in the POS without a feed event); our own writes update the cache. */
 export const CUSTOMER_PETS_REFRESH_MS = 60_000;
 
+/** C3: time bound of one task in the per-sender queue (a load, a capture
+ *  and their writes; each backend call times out at 10 s). Past it the
+ *  queue moves on and the stalled load is never joined again. */
+export const CUSTOMER_PETS_TASK_TIMEOUT_MS = 25_000;
+
 /** Bounded process cache, like the profile cache. */
 const CACHE_MAX = 2000;
 
@@ -76,6 +81,8 @@ interface SenderPets {
 interface PendingLoad {
   force: boolean;
   started: boolean;
+  /** C3: past the task bound: stale, never joined. */
+  timedOut: boolean;
   promise: Promise<void>;
 }
 
@@ -84,7 +91,8 @@ type Ref =
   | { kind: 'local'; id: string }
   | { kind: 'legacy' };
 
-type PatchOutcome = 'ok' | 'noop' | 'failed';
+/** `failed` carries the HTTP status or answer kind (for the backoff log). */
+type PatchOutcome = 'ok' | 'noop' | { failed: string };
 
 /**
  * Multi-pet memory (T4b; S1, S2, S5, S6, S8). Every method is best effort and
@@ -133,24 +141,37 @@ export class CustomerPetsService {
     // Single flight: join the sender's pending prepare. A forced one (after
     // an order) joins only a prepare that has not started its lookup yet
     // (and makes it forced); a running one may predate the new Customer.
+    // C3: a load that outlived the task bound is stale and never joined.
     const pending = this.loads.get(senderId);
-    if (pending !== undefined && (!force || !pending.started)) {
+    if (
+      pending !== undefined &&
+      !pending.timedOut &&
+      (!force || !pending.started)
+    ) {
       if (force) pending.force = true;
       return pending.promise;
     }
     const entry: PendingLoad = {
       force,
       started: false,
+      timedOut: false,
       promise: Promise.resolve(),
     };
-    entry.promise = this.serialized(senderId, async () => {
-      entry.started = true;
-      try {
-        await this.load(senderId, entry.force);
-      } finally {
+    entry.promise = this.serialized(
+      senderId,
+      async () => {
+        entry.started = true;
+        try {
+          await this.load(senderId, entry.force);
+        } finally {
+          if (this.loads.get(senderId) === entry) this.loads.delete(senderId);
+        }
+      },
+      () => {
+        entry.timedOut = true;
         if (this.loads.get(senderId) === entry) this.loads.delete(senderId);
-      }
-    });
+      },
+    );
     this.loads.set(senderId, entry);
     await entry.promise;
   }
@@ -186,16 +207,40 @@ export class CustomerPetsService {
   }
 
   /** Runs `task` after every earlier task of the sender (never rejects the
-   *  queue: a failed task does not block the next one). */
-  private serialized(senderId: string, task: () => Promise<void>) {
+   *  queue: a failed task does not block the next one). C3: a task that
+   *  outlives CUSTOMER_PETS_TASK_TIMEOUT_MS releases the queue (and its
+   *  caller); it may still finish in the background. */
+  private serialized(
+    senderId: string,
+    task: () => Promise<void>,
+    onTimeout?: () => void,
+  ) {
     const previous = this.queues.get(senderId) ?? Promise.resolve();
-    const run = previous.then(task);
+    const run = previous.then(() => this.bounded(task, onTimeout));
     const tail = run.catch(() => undefined);
     this.queues.set(senderId, tail);
     void tail.then(() => {
       if (this.queues.get(senderId) === tail) this.queues.delete(senderId);
     });
     return run;
+  }
+
+  private bounded(
+    task: () => Promise<void>,
+    onTimeout: (() => void) | undefined,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        this.logger.warn(
+          `customer pets task exceeded ${CUSTOMER_PETS_TASK_TIMEOUT_MS} ms: queue released`,
+        );
+        onTimeout?.();
+        resolve();
+      }, CUSTOMER_PETS_TASK_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    return Promise.race([task(), expired]).finally(() => clearTimeout(timer));
   }
 
   private async load(senderId: string, force: boolean): Promise<void> {
@@ -381,19 +426,20 @@ export class CustomerPetsService {
    * B6: local entries that are not a backend pet already. For a Customer, a
    * local entry (pending or blocked) with the name and species of an ACTIVE
    * backend pet is that pet: no second prompt line, never a match candidate.
+   * C2: an entry blocked as ambiguous is never shown nor matched. C5: both
+   * sides compare through `twinKey` (OTHER is not a cat).
    */
   private visibleLocal(state: SenderPets): LocalPet[] {
-    if (state.scope.kind !== 'customer') return state.local;
+    const local = state.local.filter((pet) => pet.blocked !== 'ambiguous');
+    if (state.scope.kind !== 'customer') return local;
     const backendKeys = new Set(
-      state.scope.pets.map(
-        (pet) => `${foldPetName(pet.name)}|${backendSpecies(pet)}`,
-      ),
+      state.scope.pets.map((pet) => twinKey(pet.name, pet.species)),
     );
-    return state.local.filter((pet) => {
+    return local.filter((pet) => {
       const body = localCreateBody(pet);
-      if (body === null) return true;
-      const species = body.species === 'DOG' ? 'perro' : 'gato';
-      return !backendKeys.has(`${foldPetName(body.name)}|${species}`);
+      return (
+        body === null || !backendKeys.has(twinKey(body.name, body.species))
+      );
     });
   }
 
@@ -467,34 +513,53 @@ export class CustomerPetsService {
     if (state === undefined || state.scope.kind !== 'customer') return;
     const scope = state.scope;
     const pet = state.local.find((entry) => entry.id === localId);
-    if (pet === undefined || pet.upload?.blocked === true) return;
+    if (
+      pet === undefined ||
+      pet.upload?.blocked === true ||
+      pet.blocked === 'ambiguous'
+    )
+      return;
     const current = localCreateBody(pet);
     // Name and species are required by the backend: stays local until known.
     if (current === null) return;
-    // The Customer already has a pet with this name (staff created it):
-    // merge by PATCH instead of creating a duplicate.
+    // The Customer already has a pet with this name (staff created it, or an
+    // earlier uncertain create did): merge by PATCH, never a duplicate.
+    const key = twinKey(current.name, current.species);
     const same = scope.pets.filter(
-      (candidate) =>
-        foldPetName(candidate.name) === foldPetName(current.name) &&
-        candidate.species === current.species,
+      (candidate) => twinKey(candidate.name, candidate.species) === key,
     );
-    if (pet.upload === undefined && same.length > 1) {
-      // B6 (conservative): several ACTIVE backend pets already have this
-      // name and species: no new pet, no guess which one to patch.
+    if (same.length > 1) {
+      // C2: several ACTIVE backend pets have this name and species: no new
+      // pet, no guess which one to patch; kept blocked for T4c's buttons.
       this.logger.log(
-        'pet not uploaded: several backend pets have its name and species (local entry dropped)',
+        'pet not uploaded: several backend pets have its name and species (kept local, blocked as ambiguous)',
       );
-      await this.removeLocal(senderId, localId);
+      await this.updateLocal(senderId, localId, (entry) => ({
+        ...entry,
+        blocked: 'ambiguous',
+      }));
       return;
     }
-    if (pet.upload === undefined && same.length === 1) {
+    if (same.length === 1) {
+      // B6/C1: pending or not, the twin gets the facts (staff values kept)
+      // and the entry goes; a failed PATCH backs off like a create (C6).
+      const backoff = pet.upload ?? pet.merge;
+      if (!this.due(backoff?.nextAttemptAt)) return;
       const outcome = await this.patchBackend(
         senderId,
         scope.customerId,
         same[0],
         localPetFacts(pet, this.now()),
       );
-      if (outcome !== 'failed') await this.removeLocal(senderId, localId);
+      if (typeof outcome === 'object')
+        await this.attemptFailed(
+          senderId,
+          localId,
+          'merge',
+          outcome.failed,
+          backoff?.attempts ?? 0,
+        );
+      else await this.removeLocal(senderId, localId);
       return;
     }
     // A retry under the same key must send the first attempt's bytes.
@@ -502,8 +567,7 @@ export class CustomerPetsService {
     let attempts = 0;
     if (pet.upload?.customerId === scope.customerId) {
       // B1: no retry before the persisted next attempt time.
-      const next = pet.upload.nextAttemptAt;
-      if (next !== undefined && Date.parse(next) > this.now().getTime()) return;
+      if (!this.due(pet.upload.nextAttemptAt)) return;
       body = pet.upload.body;
       attempts = pet.upload.attempts ?? 0;
     } else {
@@ -516,12 +580,23 @@ export class CustomerPetsService {
       );
       if (!(await this.writeLocal(senderId, state, next))) return;
     }
-    const key = localPetUploadKey(scope.customerId, localId);
+    // C4: re-checked right before the create.
+    if (this.profiles.isForgotten(senderId)) return;
     let result: Awaited<ReturnType<CustomerPetsClient['createPet']>>;
     try {
-      result = await this.client.createPet(scope.customerId, body, key);
+      result = await this.client.createPet(
+        scope.customerId,
+        body,
+        localPetUploadKey(scope.customerId, localId),
+      );
     } catch (error) {
-      await this.createFailed(senderId, localId, errorStatus(error), attempts);
+      await this.attemptFailed(
+        senderId,
+        localId,
+        'create',
+        errorStatus(error),
+        attempts,
+      );
       return;
     }
     switch (result.kind) {
@@ -560,33 +635,46 @@ export class CustomerPetsService {
         return;
       }
       default:
-        await this.createFailed(senderId, localId, result.kind, attempts);
+        await this.attemptFailed(
+          senderId,
+          localId,
+          'create',
+          result.kind,
+          attempts,
+        );
     }
   }
 
-  /** B1: one more failed attempt, persisted with its backoff. */
-  private async createFailed(
+  /** B1: true when a persisted next attempt time (if any) has passed. */
+  private due(nextAttemptAt: string | undefined): boolean {
+    return (
+      nextAttemptAt === undefined ||
+      Date.parse(nextAttemptAt) <= this.now().getTime()
+    );
+  }
+
+  /**
+   * B1/C6: one more failed create or PATCH merge, persisted with its backoff.
+   * One counter per entry: in `upload` once a create body is frozen, else in
+   * `merge`.
+   */
+  private async attemptFailed(
     senderId: string,
     localId: string,
+    operation: 'create' | 'merge',
     status: string,
     previous: number,
   ): Promise<void> {
     const attempts = previous + 1;
     const wait = uploadBackoffMs(attempts);
     this.logger.warn(
-      `pet create not done: ${status} (attempt ${attempts}, next in ${Math.round(wait / 60_000)} min, kept local)`,
+      `pet ${operation} not done: ${status} (attempt ${attempts}, next in ${Math.round(wait / 60_000)} min, kept local)`,
     );
-    const latest = this.cache.get(senderId);
-    if (latest === undefined) return;
     const nextAttemptAt = new Date(this.now().getTime() + wait).toISOString();
-    await this.writeLocal(
-      senderId,
-      latest,
-      latest.local.map((entry) =>
-        entry.id === localId && entry.upload !== undefined
-          ? { ...entry, upload: { ...entry.upload, attempts, nextAttemptAt } }
-          : entry,
-      ),
+    await this.updateLocal(senderId, localId, (entry) =>
+      entry.upload !== undefined
+        ? { ...entry, upload: { ...entry.upload, attempts, nextAttemptAt } }
+        : { ...entry, merge: { attempts, nextAttemptAt } },
     );
   }
 
@@ -606,9 +694,11 @@ export class CustomerPetsService {
       const diff = backendPetPatch(target, facts);
       if (diff === 'conflict') {
         this.logger.log('pet facts not stored: another species');
-        return 'failed';
+        return { failed: 'species conflict' };
       }
       if (diff === null) return attempt === 0 ? 'noop' : 'ok';
+      // C4: re-checked right before each PATCH.
+      if (this.profiles.isForgotten(senderId)) return { failed: 'forgotten' };
       let result: Awaited<ReturnType<CustomerPetsClient['patchPet']>>;
       try {
         result = await this.client.patchPet(customerId, target.id, {
@@ -617,7 +707,7 @@ export class CustomerPetsService {
         });
       } catch (error) {
         this.warn('pet patch', error);
-        return 'failed';
+        return { failed: errorStatus(error) };
       }
       if (result.kind === 'ok') {
         this.upsertBackend(senderId, result.pet);
@@ -627,17 +717,17 @@ export class CustomerPetsService {
         this.logger.warn(`pet patch not done: ${result.kind}`);
         if (result.kind === 'PET_ARCHIVED' || result.kind === 'PET_NOT_FOUND')
           this.dropBackend(senderId, target.id);
-        return 'failed';
+        return { failed: result.kind };
       }
       const fresh = await this.reread(customerId, target.id);
       if (fresh === null || fresh.status !== 'ACTIVE') {
         this.dropBackend(senderId, target.id);
-        return 'failed';
+        return { failed: 'PET_VERSION_CONFLICT (reread)' };
       }
       this.upsertBackend(senderId, fresh);
       target = fresh;
     }
-    return 'failed';
+    return { failed: 'PET_VERSION_CONFLICT' };
   }
 
   private async reread(
@@ -662,7 +752,9 @@ export class CustomerPetsService {
     state: SenderPets,
     next: LocalPet[],
   ): Promise<boolean> {
-    if (!state.localKnown) return false;
+    // C4: re-checked right before each write (a write would recreate the
+    // profile row deleted by «olvida mis datos»).
+    if (!state.localKnown || this.profiles.isForgotten(senderId)) return false;
     try {
       await this.localStore.write(senderId, next, this.now());
       state.local = next;
@@ -671,6 +763,23 @@ export class CustomerPetsService {
       this.warn('local write', error);
       return false;
     }
+  }
+
+  /** Replaces one entry of the current list (no-op when it is gone). */
+  private async updateLocal(
+    senderId: string,
+    localId: string,
+    change: (entry: LocalPet) => LocalPet,
+  ): Promise<void> {
+    const state = this.cache.get(senderId);
+    if (state === undefined) return;
+    await this.writeLocal(
+      senderId,
+      state,
+      state.local.map((entry) =>
+        entry.id === localId ? change(entry) : entry,
+      ),
+    );
   }
 
   /** Removed only after a backend success; a failed write keeps the entry
@@ -733,12 +842,20 @@ function errorStatus(error: unknown): string {
   return error instanceof Error ? error.name : 'unknown';
 }
 
-function backendSpecies(pet: BackendPet): LocalSpecies | 'otro' {
+function backendSpecies(
+  pet: Pick<BackendPet, 'species'>,
+): LocalSpecies | 'otro' {
   return pet.species === 'DOG'
     ? 'perro'
     : pet.species === 'CAT'
       ? 'gato'
       : 'otro';
+}
+
+/** B6/C5: the twin identity: folded name + species mapped like
+ *  `backendSpecies` on both sides (OTHER is never a cat). */
+function twinKey(name: string, species: BackendPet['species']): string {
+  return `${foldPetName(name)}|${backendSpecies({ species })}`;
 }
 
 function speciesOf(species: LocalSpecies | undefined): {

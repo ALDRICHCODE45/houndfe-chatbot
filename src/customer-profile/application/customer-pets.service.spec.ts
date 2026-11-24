@@ -1118,14 +1118,16 @@ describe('CustomerPetsService (T4b-fix-B)', () => {
       }),
     ];
 
-    it('two ACTIVE backend pets with the local pet’s name and species → no create, no patch, the local entry is dropped, no extra prompt line', async () => {
+    it('two ACTIVE backend pets with the local pet’s name and species → no create, no patch, the local entry is kept blocked as ambiguous (C2), no extra prompt line', async () => {
       const h = harness(notFound);
       await h.say('mi perrito Bruno es un pug');
       h.setLookup(found(twoBrunos()));
       await h.service.afterCheckout(SENDER);
       expect(h.client.createPet).not.toHaveBeenCalled();
       expect(h.client.patchPet).not.toHaveBeenCalled();
-      await expect(h.local()).resolves.toEqual([]);
+      await expect(h.local()).resolves.toMatchObject([
+        { name: 'Bruno', blocked: 'ambiguous' },
+      ]);
       expect(
         h.service.promptLines(SENDER)?.match(/Mascota conocida: "Bruno"/g),
       ).toHaveLength(2);
@@ -1175,5 +1177,342 @@ describe('CustomerPetsService (T4b-fix-B)', () => {
         h.service.promptLines(SENDER)?.match(/Mascota conocida: "Max"/g),
       ).toHaveLength(1);
     });
+  });
+});
+
+describe('CustomerPetsService (T4b-fix-2-C)', () => {
+  let warn: jest.SpiedFunction<Logger['warn']>;
+  beforeEach(() => {
+    warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const upstream = (statusCode: number) =>
+    Object.assign(new Error('upstream'), { name: 'UpstreamError', statusCode });
+  /** Max as staff entered him: staff size and notes, no breed or age. */
+  const twinMax = (patch: Partial<BackendPet> = {}) =>
+    backend({
+      id: uuid(70),
+      name: 'Max',
+      breed: null,
+      size: 'SMALL',
+      notes: 'staff',
+      birthDate: null,
+      birthDatePrecision: null,
+      ageMonths: null,
+      ageLabel: null,
+      ...patch,
+    });
+  const twoBrunos = () => [
+    backend(),
+    backend({ id: uuid(60), breed: null, ageMonths: 30, ageLabel: '~2 años' }),
+  ];
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  /** The next by-phone lookup waits for `release()`. */
+  const gateLookup = (
+    h: ReturnType<typeof harness>,
+    response: CustomerLookupResponse,
+  ) => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.getCustomerByPhone.mockImplementationOnce(async () => {
+      await gate;
+      return structuredClone(response);
+    });
+    return () => release();
+  };
+
+  describe('C1: a pending entry hidden by one ACTIVE backend twin PATCHes it (review R3)', () => {
+    it('no create retry: its facts PATCH the twin (staff size and notes kept) and the entry is removed', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockRejectedValue(upstream(500));
+      await h.say('mi perro Max es un husky de 3 años');
+      expect((await h.local())[0].upload?.attempts).toBe(1);
+      h.setLookup(found([twinMax()]));
+      h.client.patchPet.mockResolvedValue({
+        kind: 'ok',
+        pet: twinMax({ breed: 'husky', version: 4 }),
+        warnings: [],
+      });
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.createPet).toHaveBeenCalledTimes(1);
+      expect(h.client.patchPet.mock.calls).toEqual([
+        [
+          CUSTOMER_ID,
+          uuid(70),
+          { version: 3, breed: 'husky', approxAge: { years: 3 } },
+        ],
+      ]);
+      await expect(h.local()).resolves.toEqual([]);
+      expect(
+        h.service.promptLines(SENDER)?.match(/Mascota conocida: "Max"/g),
+      ).toHaveLength(1);
+    });
+
+    it('nothing to change on the twin → no PATCH, no create, the entry is removed', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockRejectedValue(upstream(500));
+      await h.say('mi perro Max es un husky');
+      h.setLookup(found([twinMax({ breed: 'Husky' })]));
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.createPet).toHaveBeenCalledTimes(1);
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      await expect(h.local()).resolves.toEqual([]);
+    });
+  });
+
+  describe('C2: two or more ACTIVE twins block the entry as ambiguous (verify B6)', () => {
+    it('a pending entry (create already attempted) with two twins is blocked instead of retrying its create', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockRejectedValue(upstream(500));
+      await h.say('mi perrito Bruno es un pug');
+      h.setLookup(found(twoBrunos()));
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.createPet).toHaveBeenCalledTimes(1);
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      await expect(h.local()).resolves.toMatchObject([
+        { name: 'Bruno', blocked: 'ambiguous' },
+      ]);
+    });
+
+    it('the blocked entry stays for T4c: never created, patched or shown, even when one twin remains', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno es un pug');
+      h.setLookup(found(twoBrunos()));
+      await h.service.afterCheckout(SENDER);
+      h.setLookup(found([backend()]));
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      await h.service.afterCheckout(SENDER);
+      expect(h.client.createPet).not.toHaveBeenCalled();
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      await expect(h.local()).resolves.toMatchObject([
+        { name: 'Bruno', breed: 'pug', blocked: 'ambiguous' },
+      ]);
+      expect(
+        h.service.promptLines(SENDER)?.match(/Mascota conocida:/g),
+      ).toHaveLength(1);
+      expect(h.service.promptLines(SENDER)).not.toContain('pug');
+    });
+  });
+
+  describe('C3: each per-sender queue task is time-bounded (review R4)', () => {
+    const BOUND_MS = 25_000;
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it('a stalled prepare releases the queue after the bound: the queued capture then runs', async () => {
+      const h = harness(notFound);
+      h.getCustomerByPhone.mockImplementationOnce(
+        () => new Promise<CustomerLookupResponse>(() => undefined),
+      );
+      let prepared = false;
+      let captured = false;
+      void h.service.prepare(SENDER).then(() => {
+        prepared = true;
+      });
+      void h.service
+        .capture(SENDER, extractPetFacts('mi perrita Luna es labrador'))
+        .then(() => {
+          captured = true;
+        });
+      await jest.advanceTimersByTimeAsync(BOUND_MS - 1);
+      expect(prepared).toBe(false);
+      expect(captured).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(prepared).toBe(true);
+      expect(captured).toBe(true);
+      expect((await h.local()).map((pet) => pet.name)).toEqual(['Luna']);
+      expect(JSON.stringify(warn.mock.calls)).toContain('25000 ms');
+    });
+
+    it('a stale in-flight load is not joined: a later prepare reads again', async () => {
+      const h = harness(notFound);
+      h.getCustomerByPhone.mockImplementationOnce(
+        () => new Promise<CustomerLookupResponse>(() => undefined),
+      );
+      void h.service.prepare(SENDER);
+      await jest.advanceTimersByTimeAsync(BOUND_MS);
+      let done = false;
+      void h.service.prepare(SENDER).then(() => {
+        done = true;
+      });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(done).toBe(true);
+      expect(h.getCustomerByPhone).toHaveBeenCalledTimes(2);
+    });
+
+    it('a task that finishes in time leaves no timer behind', async () => {
+      const h = harness(notFound);
+      await h.service.prepare(SENDER);
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi perrita Luna es labrador'),
+      );
+      expect(jest.getTimerCount()).toBe(0);
+    });
+  });
+
+  describe('C4: no write after «olvida mis datos» (review R1)', () => {
+    it('forget during the lookup of an upload → no create and no local write', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es una labrador');
+      h.advance(2 * MINUTE);
+      const release = gateLookup(h, found([]));
+      const write = jest.spyOn(h.localStore, 'write');
+      const running = h.service.afterCheckout(SENDER);
+      await tick();
+      await h.profiles.forget(SENDER);
+      release();
+      await running;
+      expect(h.client.createPet).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+    });
+
+    it('forget during a capture → the local list is not written (the deleted row is not recreated)', async () => {
+      const h = harness(notFound);
+      const release = gateLookup(h, notFound);
+      const write = jest.spyOn(h.localStore, 'write');
+      const running = h.service.capture(
+        SENDER,
+        extractPetFacts('mi perro Max es un husky'),
+      );
+      await tick();
+      await h.profiles.forget(SENDER);
+      release();
+      await running;
+      expect(write).not.toHaveBeenCalled();
+      await expect(h.local()).resolves.toEqual([]);
+    });
+
+    it('forget during a capture about a backend pet → no PATCH', async () => {
+      const h = harness(found([backend()]));
+      const release = gateLookup(h, found([backend()]));
+      const running = h.service.capture(
+        SENDER,
+        extractPetFacts('mi perrito Bruno ya tiene 2 años'),
+      );
+      await tick();
+      await h.profiles.forget(SENDER);
+      release();
+      await running;
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('C5: local species compare like backend species', () => {
+    it('a local cat is not hidden by an OTHER-species backend pet with its name', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockRejectedValue(upstream(500));
+      await h.say('mi gato Michi es persa');
+      h.setLookup(
+        found([
+          backend({
+            id: uuid(71),
+            name: 'Michi',
+            species: 'OTHER',
+            speciesOther: 'hurón',
+            breed: null,
+          }),
+        ]),
+      );
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      expect(
+        h.service.promptLines(SENDER)?.match(/Mascota conocida: "Michi"/g),
+      ).toHaveLength(2);
+    });
+  });
+
+  describe('C6: failed PATCH merges back off like creates (verify)', () => {
+    it('a failed merge persists attempt 1 and its next time; no retry before it; a due retry that succeeds removes the entry', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno tiene 2 años');
+      h.setLookup(found([backend()]));
+      h.client.patchPet.mockRejectedValueOnce(upstream(500));
+      await h.service.afterCheckout(SENDER);
+      expect((await h.local())[0].merge).toEqual({
+        attempts: 1,
+        nextAttemptAt: new Date(NOW.getTime() + MINUTE).toISOString(),
+      });
+      expect(JSON.stringify(warn.mock.calls)).toMatch(/merge.*500.*attempt 1/);
+      await h.service.afterCheckout(SENDER);
+      expect(h.client.patchPet).toHaveBeenCalledTimes(1);
+      h.advance(MINUTE);
+      h.client.patchPet.mockResolvedValueOnce({
+        kind: 'ok',
+        pet: backend({ version: 4 }),
+        warnings: [],
+      });
+      await h.service.afterCheckout(SENDER);
+      expect(h.client.patchPet).toHaveBeenCalledTimes(2);
+      expect(h.client.createPet).not.toHaveBeenCalled();
+      await expect(h.local()).resolves.toEqual([]);
+    });
+
+    it('a non-ok PATCH answer backs off too, with its status', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno tiene 2 años');
+      h.setLookup(found([backend()]));
+      h.client.patchPet.mockResolvedValue({ kind: 'PET_ARCHIVED' });
+      await h.service.afterCheckout(SENDER);
+      expect((await h.local())[0].merge?.attempts).toBe(1);
+      expect(JSON.stringify(warn.mock.calls)).toMatch(
+        /merge.*PET_ARCHIVED.*attempt 1/,
+      );
+    });
+
+    it('a failed twin PATCH of a pending entry advances the entry’s create counter (one backoff per entry)', async () => {
+      const h = harness(found([]));
+      h.client.createPet.mockRejectedValue(upstream(500));
+      await h.say('mi perro Max es un husky');
+      h.setLookup(found([twinMax()]));
+      h.client.patchPet.mockRejectedValue(upstream(503));
+      h.advance(MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.patchPet).toHaveBeenCalledTimes(1);
+      expect((await h.local())[0].upload).toMatchObject({
+        attempts: 2,
+        nextAttemptAt: new Date(NOW.getTime() + 3 * MINUTE).toISOString(),
+      });
+      h.advance(MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.patchPet).toHaveBeenCalledTimes(1);
+      expect(h.client.createPet).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('C7: read-only scopes record the first pet (baseline)', () => {
+    it.each([
+      ['lookup unavailable', new Error('down')],
+      ['`pets` absent', found(undefined)],
+    ] as const)(
+      '%s, no legacy pet → the facts become the legacy pet through the profile',
+      async (_label, lookup) => {
+        const h = harness(lookup);
+        await h.service.prepare(SENDER);
+        await h.service.capture(
+          SENDER,
+          extractPetFacts('mi perrita Luna es labrador'),
+          undefined,
+        );
+        expect(h.profiles.cached(SENDER)?.pet).toMatchObject({
+          name: 'Luna',
+          breed: 'labrador',
+        });
+        expect(h.client.createPet).not.toHaveBeenCalled();
+        expect(h.client.patchPet).not.toHaveBeenCalled();
+        await expect(h.local()).resolves.toEqual([]);
+      },
+    );
   });
 });

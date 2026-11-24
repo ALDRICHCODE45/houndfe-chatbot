@@ -68,6 +68,17 @@ export interface LocalPet {
     attempts?: number;
     nextAttemptAt?: string;
   };
+  /**
+   * C2 (T4b-fix-2): `ambiguous` = 2+ ACTIVE backend pets have this name and
+   * species: no create, no PATCH, hidden from the prompt, kept for T4c to
+   * resolve with buttons. Absent (every older entry) = not blocked.
+   */
+  blocked?: 'ambiguous';
+  /**
+   * C6 (T4b-fix-2): failed PATCH merges into a backend twin of an entry with
+   * no `upload` (same backoff as creates). Absent = attempt 0, due now.
+   */
+  merge?: { attempts: number; nextAttemptAt: string };
 }
 
 /** Local pets of a sender (`customer_profiles.pets`, migration 5700). */
@@ -521,6 +532,21 @@ function normalizeLocalPet(raw: unknown): LocalPet | null {
       !Number.isNaN(Date.parse(upload.nextAttemptAt))
         ? { nextAttemptAt: upload.nextAttemptAt }
         : {}),
+    };
+  if (pet.blocked === 'ambiguous') out.blocked = 'ambiguous';
+  // C6: an invalid merge backoff reads as attempt 0, due now.
+  const merge = pet.merge as Record<string, unknown> | undefined;
+  if (
+    typeof merge === 'object' &&
+    merge !== null &&
+    Number.isSafeInteger(merge.attempts) &&
+    (merge.attempts as number) >= 1 &&
+    typeof merge.nextAttemptAt === 'string' &&
+    !Number.isNaN(Date.parse(merge.nextAttemptAt))
+  )
+    out.merge = {
+      attempts: merge.attempts as number,
+      nextAttemptAt: merge.nextAttemptAt,
     };
   return out;
 }

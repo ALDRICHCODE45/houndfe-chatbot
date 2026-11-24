@@ -379,3 +379,63 @@ describe('local upload backoff fields (T4b-fix-B B1)', () => {
     expect(bytes).toBeLessThanOrEqual(32768);
   });
 });
+
+describe('local entry states (T4b-fix-2-C C2, C6)', () => {
+  const base = {
+    id: ID,
+    name: 'Max',
+    species: 'perro',
+    createdAt: NOW.toISOString(),
+  };
+
+  it('keeps the ambiguous block and a valid merge backoff', () => {
+    const merge = { attempts: 2, nextAttemptAt: '2026-11-23T18:04:00.000Z' };
+    expect(
+      normalizeLocalPets([{ ...base, blocked: 'ambiguous', merge }]),
+    ).toEqual([{ ...base, blocked: 'ambiguous', merge }]);
+  });
+
+  it('drops unknown block values and invalid merge backoffs (attempt 0, due now); old entries read as before', () => {
+    expect(
+      normalizeLocalPets([
+        { ...base, blocked: true, merge: { attempts: 0, nextAttemptAt: 'x' } },
+        { ...base, id: 'x', merge: { attempts: 2 } },
+        { ...base, id: 'y' },
+      ]),
+    ).toEqual([base, { ...base, id: 'x' }, { ...base, id: 'y' }]);
+  });
+
+  it('20 maximal entries with every state field stay within the 32768-byte column cap', () => {
+    const long = (n: number) => 'x'.repeat(n);
+    const pet: LocalPet = {
+      id: ID,
+      name: long(40),
+      species: 'perro',
+      breed: long(60),
+      size: 'gigante',
+      birthDate: '2020-01-01',
+      birthDatePrecision: 'MONTH',
+      stage: 'cachorro',
+      notes: long(200),
+      createdAt: NOW.toISOString(),
+    };
+    const created = localCreateBody(pet);
+    if (created === null) throw new Error('no body');
+    const full: LocalPet = {
+      ...pet,
+      blocked: 'ambiguous',
+      merge: { attempts: 999_999, nextAttemptAt: NOW.toISOString() },
+      upload: {
+        customerId: '5c1e9a02-77d4-4b8a-a1f3-0e2d4c6b8a90',
+        body: created,
+        blocked: true,
+        attempts: 999_999,
+        nextAttemptAt: NOW.toISOString(),
+      },
+    };
+    const bytes = Buffer.byteLength(
+      JSON.stringify(Array.from({ length: 20 }, () => full)),
+    );
+    expect(bytes).toBeLessThanOrEqual(32768);
+  });
+});
