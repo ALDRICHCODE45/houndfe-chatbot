@@ -1,6 +1,7 @@
 import { FakeShippingQuoteClient } from '../../chatbot-api/infrastructure/fake-shipping-quote.client';
 import { MinimalShippingService } from './minimal-shipping.service';
 import { minimalShippingDestination } from '../domain/minimal-shipping';
+import { Logger } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
@@ -756,6 +757,69 @@ describe('minimal order placement through the SDK route', () => {
     const placed = await h.turn('SÍ', [say('x')], EVENT('wamid.pets4'));
     expect((placed as { reply: string }).reply).toContain('folio B-0042');
     expect(afterCheckout).toHaveBeenCalledTimes(1);
+  });
+
+  describe('T4b-fix A1: the pet upload runs in the background', () => {
+    const NOT_YET = Symbol('not yet');
+    /** Resolves with the turn, or NOT_YET after `ms` of real time. */
+    const within = <T>(promise: Promise<T>, ms = 500) =>
+      Promise.race([
+        promise,
+        new Promise<typeof NOT_YET>((resolve) =>
+          setTimeout(() => resolve(NOT_YET), ms),
+        ),
+      ]);
+    const flush = async () => {
+      for (let i = 0; i < 5; i += 1)
+        await new Promise((resolve) => setImmediate(resolve));
+    };
+    const placeOrder = async (
+      pets?: Pick<CustomerPetsService, 'afterCheckout'>,
+    ) => {
+      const h = setup(pets === undefined ? {} : { pets });
+      await h.ready();
+      const offer = await h.turn(
+        'Quiero hacer mi pedido',
+        [call('prepareOrder'), say('x')],
+        EVENT('wamid.bg1'),
+      );
+      (offer as { onSent: () => void }).onSent();
+      return within(h.turn('SÍ', [say('x')], EVENT('wamid.bg2')));
+    };
+    afterEach(() => jest.restoreAllMocks());
+
+    it('an upload that never settles does not delay the order-created reply, unchanged byte for byte', async () => {
+      const baseline = await placeOrder();
+      expect(baseline).not.toBe(NOT_YET);
+      const afterCheckout = jest.fn(() => new Promise<void>(() => undefined));
+      const placed = await placeOrder({ afterCheckout });
+      expect(placed).not.toBe(NOT_YET);
+      expect(afterCheckout.mock.calls).toEqual([[SENDER]]);
+      expect(placed).toEqual(baseline);
+      expect((placed as { reply: string }).reply).toBe(
+        (baseline as { reply: string }).reply,
+      );
+    });
+
+    it('a rejected upload is logged without throwing and the reply is unchanged', async () => {
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      const baseline = await placeOrder();
+      warn.mockClear();
+      const afterCheckout = jest.fn(() =>
+        Promise.reject(new TypeError('down 5215550001111')),
+      );
+      const placed = await placeOrder({ afterCheckout });
+      await flush();
+      expect(placed).toEqual(baseline);
+      const messages = warn.mock.calls.map((c) => String(c[0]));
+      expect(messages).toContain(
+        'customer pets afterCheckout failed: TypeError',
+      );
+      // Never the error text (it may carry the phone).
+      expect(messages.join('\n')).not.toContain(SENDER);
+    });
   });
 
   it('lets a mixed answer reach the model without creating a sale', async () => {

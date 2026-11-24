@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
@@ -67,7 +68,17 @@ interface PetsWiring {
   client: Record<string, jest.Mock>;
 }
 
-function harness(profileStore: CustomerProfileStore, petsWiring?: PetsWiring) {
+/** T4b-fix: a stand-in pet store to control the timing of each call. */
+type PetsStub = Pick<
+  CustomerPetsService,
+  'prepare' | 'capture' | 'promptLines' | 'afterCheckout'
+>;
+
+function harness(
+  profileStore: CustomerProfileStore,
+  petsWiring?: PetsWiring,
+  petsStub?: PetsStub,
+) {
   const api = new EvalFakeApi({ kind: 'new' });
   const store = new InMemoryConversationStore();
   const config = {
@@ -89,22 +100,24 @@ function harness(profileStore: CustomerProfileStore, petsWiring?: PetsWiring) {
   const profiles = new CustomerProfileService(profileStore, () => NOW);
   let ids = 0;
   const pets =
-    petsWiring === undefined
-      ? undefined
-      : new CustomerPetsService(
-          new InMemoryLocalPetStore(
-            profileStore as InMemoryCustomerProfileStore,
-          ),
-          {
-            getCustomerByPhone: () =>
-              Promise.resolve(structuredClone(petsWiring.lookup)),
-          },
-          petsWiring.client as unknown as CustomerPetsClient,
-          profiles,
-          () => NOW,
-          () =>
-            `b1f0c7a2-0000-4000-8000-${String((ids += 1)).padStart(12, '0')}`,
-        );
+    petsStub !== undefined
+      ? (petsStub as CustomerPetsService)
+      : petsWiring === undefined
+        ? undefined
+        : new CustomerPetsService(
+            new InMemoryLocalPetStore(
+              profileStore as InMemoryCustomerProfileStore,
+            ),
+            {
+              getCustomerByPhone: () =>
+                Promise.resolve(structuredClone(petsWiring.lookup)),
+            },
+            petsWiring.client as unknown as CustomerPetsClient,
+            profiles,
+            () => NOW,
+            () =>
+              `b1f0c7a2-0000-4000-8000-${String((ids += 1)).padStart(12, '0')}`,
+          );
   const agent = new MinimalCatalogAgentService(
     api,
     generate,
@@ -493,6 +506,11 @@ describe('T4b multi-pet memory on the customer route', () => {
   };
   const petLines = (system: string) =>
     system.split('\n').filter((line) => line.startsWith('Mascota conocida:'));
+  // T4b-fix A3: the deterministic capture runs after the reply.
+  const flushCapture = async () => {
+    for (let i = 0; i < 5; i += 1)
+      await new Promise((resolve) => setImmediate(resolve));
+  };
 
   it('two backend pets → one prompt line each and the "do not assume which pet" instruction', async () => {
     const h = harness(new InMemoryCustomerProfileStore(), {
@@ -565,6 +583,7 @@ describe('T4b multi-pet memory on the customer route', () => {
         say('¡Qué lindos!'),
       ],
     ]);
+    await flushCapture();
     // The model's facts are stored as given (never deduced): no size.
     expect(pets.createPet.mock.calls.map((c) => [c[1], c[2]])).toEqual([
       [
@@ -603,6 +622,7 @@ describe('T4b multi-pet memory on the customer route', () => {
         say('¡Listo, agregado!'),
       ],
     ]);
+    await flushCapture();
     expect(await h.cartItems()).toEqual([]);
     expect(pets.createPet).not.toHaveBeenCalled();
     expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
@@ -628,10 +648,229 @@ describe('T4b multi-pet memory on the customer route', () => {
       client: pets,
     });
     await h.turn('mi perro Max es un husky');
+    await flushCapture();
     expect(pets.createPet).not.toHaveBeenCalled();
     expect(pets.patchPet).not.toHaveBeenCalled();
     await expect(
       new InMemoryLocalPetStore(profileStore).read(SENDER),
     ).resolves.toEqual([]);
+  });
+});
+
+describe('T4b-fix A2-A4: the pet store never holds the reply', () => {
+  // A4: the exact guidance every conversation with a profile store gets.
+  const PET_MEMORY_INSTRUCTIONS_TEXT =
+    'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
+    'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación. ' +
+    'Si hay una sola línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte. ' +
+    'Si hay varias, siga la indicación que las acompaña.';
+  const STUB_LINE = 'Mascota conocida: "Bruno" (stub)';
+  const REPLY = 'Hola, ¿en qué le ayudo?';
+  const NOT_YET = Symbol('not yet');
+  const flush = async () => {
+    for (let i = 0; i < 5; i += 1)
+      await new Promise((resolve) => setImmediate(resolve));
+  };
+  /** Resolves with the turn, or NOT_YET after `ms` of real time. */
+  const within = <T>(promise: Promise<T>, ms = 500) =>
+    Promise.race([
+      promise,
+      new Promise<typeof NOT_YET>((resolve) =>
+        setTimeout(() => resolve(NOT_YET), ms),
+      ),
+    ]);
+  /** With fake timers: flushes until the turn settled (or gives up). */
+  const settled = async <T>(promise: Promise<T>) => {
+    let value: T | typeof NOT_YET = NOT_YET;
+    void promise.then((result) => {
+      value = result;
+    });
+    for (let i = 0; i < 40 && value === NOT_YET; i += 1) await flush();
+    return value as T | typeof NOT_YET;
+  };
+  const stub = (patch: Partial<Record<keyof PetsStub, jest.Mock>> = {}) => ({
+    prepare: jest.fn<Promise<void>, [string]>(() => Promise.resolve()),
+    capture: jest.fn(() => Promise.resolve()),
+    promptLines: jest.fn((): string | null => STUB_LINE),
+    afterCheckout: jest.fn(() => Promise.resolve()),
+    ...patch,
+  });
+  let warn: jest.SpyInstance;
+  beforeEach(() => {
+    warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+  const warnings = () =>
+    (warn.mock.calls as unknown[][]).map((c) => String(c[0]));
+
+  it('A4: pins the exact PET_MEMORY_INSTRUCTIONS text, followed by the pet lines of a fast prepare', async () => {
+    const pets = stub();
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    const result = await h.turn('hola', [[say(REPLY)]]);
+    expect(result.reply).toBe(REPLY);
+    expect(h.system()).toContain(
+      `\n\n${PET_MEMORY_INSTRUCTIONS_TEXT}\n${STUB_LINE}`,
+    );
+    // The prompt is built after the prepare settled.
+    expect(pets.prepare.mock.calls).toEqual([[SENDER]]);
+    expect(pets.prepare.mock.invocationCallOrder[0]).toBeLessThan(
+      pets.promptLines.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('A4: without pet lines the block is exactly the instructions', async () => {
+    const pets = stub({ promptLines: jest.fn(() => null) });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    await h.turn('hola', [[say(REPLY)]]);
+    expect(h.system()).toContain(`\n\n${PET_MEMORY_INSTRUCTIONS_TEXT}`);
+    expect(h.system()).not.toContain('Mascota conocida:');
+  });
+
+  it('A2: a prepare inside the 1500 ms budget is awaited and its pets reach the prompt', async () => {
+    jest.useFakeTimers({
+      doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'],
+    });
+    let loaded = false;
+    const pets = stub({
+      prepare: jest.fn(
+        () =>
+          new Promise<void>((resolve) =>
+            setTimeout(() => {
+              loaded = true;
+              resolve();
+            }, 1400),
+          ),
+      ),
+      promptLines: jest.fn(() => (loaded ? STUB_LINE : null)),
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    const turn = h.turn('hola', [[say(REPLY)]]);
+    await jest.advanceTimersByTimeAsync(1400);
+    const result = await settled(turn);
+    expect(result).not.toBe(NOT_YET);
+    expect((result as { reply: string }).reply).toBe(REPLY);
+    expect(h.system()).toContain(
+      `${PET_MEMORY_INSTRUCTIONS_TEXT}\n${STUB_LINE}`,
+    );
+  });
+
+  it('A2: a prepare past the 1500 ms budget does not hold the turn; the prompt uses the state the store already has', async () => {
+    jest.useFakeTimers({
+      doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'],
+    });
+    const pets = stub({
+      prepare: jest.fn(() => new Promise<void>(() => undefined)),
+      promptLines: jest.fn(() => 'Mascota conocida: "Bruno" (stale)'),
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    const turn = h.turn('hola', [[say(REPLY)]]);
+    await jest.advanceTimersByTimeAsync(1499);
+    expect(await settled(turn)).toBe(NOT_YET);
+    await jest.advanceTimersByTimeAsync(1);
+    const result = await settled(turn);
+    expect(result).not.toBe(NOT_YET);
+    expect((result as { reply: string }).reply).toBe(REPLY);
+    expect(h.system()).toContain(
+      `${PET_MEMORY_INSTRUCTIONS_TEXT}\nMascota conocida: "Bruno" (stale)`,
+    );
+  });
+
+  it('A2: past the budget the turn writes no pets (tool or deterministic); the prepare finishes in the background and the next turn writes again', async () => {
+    jest.useFakeTimers({
+      doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'],
+    });
+    let finish: () => void = () => undefined;
+    const pets = stub({
+      prepare: jest.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          }),
+      ),
+    });
+    const profileStore = new InMemoryCustomerProfileStore();
+    const h = harness(profileStore, undefined, pets);
+    const turn = h.turn('mi perro Max es un husky', [
+      [
+        call('rememberPetDetails', {
+          name: 'Max',
+          species: 'perro',
+          breed: 'husky',
+        }),
+        say('¡Qué lindo Max!'),
+      ],
+    ]);
+    await jest.advanceTimersByTimeAsync(1500);
+    const result = await settled(turn);
+    expect((result as { reply: string }).reply).toBe('¡Qué lindo Max!');
+    await flush();
+    expect(pets.capture).not.toHaveBeenCalled();
+    // The legacy pet column is not a fallback either.
+    expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
+    finish();
+    await flush();
+    // Next turn: the prepare is fast again, captures run.
+    pets.prepare.mockImplementation(() => Promise.resolve());
+    await h.turn('mi perro Max es un husky', [[say('¡Qué lindo Max!')]]);
+    await flush();
+    expect(pets.capture.mock.calls).toEqual([
+      [SENDER, expect.objectContaining({ name: 'Max' }), undefined],
+    ]);
+    expect(warnings()).toEqual([
+      'customer pets prepare over budget (1500 ms): continuing without pet writes this turn',
+    ]);
+  });
+
+  it('A2: a rejected prepare is logged without throwing and the turn continues', async () => {
+    const pets = stub({
+      prepare: jest.fn(() => Promise.reject(new TypeError(`down ${SENDER}`))),
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    const result = await h.turn('hola', [[say(REPLY)]]);
+    expect(result.reply).toBe(REPLY);
+    expect(warnings()).toContain('customer pets prepare failed: TypeError');
+    expect(warnings().join('\n')).not.toContain(SENDER);
+  });
+
+  it('A3: a capture that never settles does not delay the reply', async () => {
+    const pets = stub({
+      capture: jest.fn(() => new Promise<void>(() => undefined)),
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    const result = await within(
+      h.turn('mi perro Max es un husky', [[say('¡Qué lindo Max!')]]),
+    );
+    expect(result).not.toBe(NOT_YET);
+    expect((result as { reply: string }).reply).toBe('¡Qué lindo Max!');
+    expect(pets.capture.mock.calls).toEqual([
+      [
+        SENDER,
+        expect.objectContaining({
+          name: 'Max',
+          species: 'perro',
+          breed: 'husky',
+        }),
+        undefined,
+      ],
+    ]);
+  });
+
+  it('A3: a rejected capture is logged without throwing and the reply is unchanged', async () => {
+    const pets = stub({
+      capture: jest.fn(() => Promise.reject(new TypeError(`down ${SENDER}`))),
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    const result = await h.turn('mi perro Max es un husky', [
+      [say('¡Qué lindo Max!')],
+    ]);
+    await flush();
+    expect(result.reply).toBe('¡Qué lindo Max!');
+    expect(warnings()).toContain('customer pets capture failed: TypeError');
+    expect(warnings().join('\n')).not.toContain(SENDER);
   });
 });

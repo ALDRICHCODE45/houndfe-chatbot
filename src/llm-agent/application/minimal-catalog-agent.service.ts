@@ -317,6 +317,9 @@ export const BUSY_REPLY =
 export const FORGET_MY_DATA_REPLY =
   'Listo, borré los datos que tenía guardados de usted (nombre, estilo de trato y mascota). Sus pedidos registrados en la tienda no se borran.';
 
+// T4b-fix A2: the longest a turn waits for the pet store's prepare.
+export const PET_PREPARE_BUDGET_MS = 1500;
+
 // S1: guidance for the customer-memory tool (pet facts).
 const PET_MEMORY_INSTRUCTIONS =
   'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
@@ -1003,6 +1006,9 @@ export class MinimalCatalogAgentService {
   // run's order summary must not outlive the interruption.
   private readonly interrupted = new Set<string>();
   private readonly logger = new Logger(MinimalCatalogAgentService.name);
+  // T4b-fix A2: senders whose pet prepare ran past its budget this turn; the
+  // turn writes no pets (the prepare finishes in the background).
+  private readonly petsOverBudget = new Set<string>();
   /** Durable copy of the payment offer; `undefined` without gates. */
   private readonly paymentOffers?: DurablePaymentOffer;
 
@@ -1131,6 +1137,7 @@ export class MinimalCatalogAgentService {
         this.order?.dismiss(input.senderId);
       }
       this.busy.delete(input.senderId);
+      this.petsOverBudget.delete(input.senderId);
       // The turn's gate changes are durable before its reply is sent.
       await this.gates?.settle(input.senderId);
     }
@@ -3606,7 +3613,50 @@ export class MinimalCatalogAgentService {
       await profiles.load(senderId);
     // T4b: the sender's pets (refreshed at most once a minute); uploads a
     // former prospect's local pets once the sender is a Customer (S8).
-    await this.pets?.prepare(senderId);
+    // T4b-fix A2: bounded by PET_PREPARE_BUDGET_MS; past it the turn goes on
+    // with the state the store already has and the prepare finishes in the
+    // background.
+    await this.preparePetsWithinBudget(senderId);
+  }
+
+  private async preparePetsWithinBudget(senderId: string): Promise<void> {
+    const pets = this.pets;
+    this.petsOverBudget.delete(senderId);
+    if (pets === undefined) return;
+    const work = this.petsInBackground('prepare', () => pets.prepare(senderId));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<'over_budget'>((resolve) => {
+      timer = setTimeout(() => resolve('over_budget'), PET_PREPARE_BUDGET_MS);
+    });
+    const outcome = await Promise.race([work.then(() => 'done'), budget]);
+    clearTimeout(timer);
+    if (outcome === 'over_budget') {
+      this.petsOverBudget.add(senderId);
+      this.logger.warn(
+        `customer pets prepare over budget (${PET_PREPARE_BUDGET_MS} ms): continuing without pet writes this turn`,
+      );
+    }
+  }
+
+  /**
+   * T4b-fix: runs a pet store call without letting it throw; a failure is
+   * logged (error name only: the text may carry the phone). The returned
+   * promise always resolves; callers that must not wait simply drop it.
+   */
+  private petsInBackground(
+    operation: string,
+    start: () => Promise<unknown>,
+  ): Promise<void> {
+    const failed = (error: unknown) =>
+      this.logger.warn(
+        `customer pets ${operation} failed: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+    try {
+      return Promise.resolve(start()).then(() => undefined, failed);
+    } catch (error) {
+      failed(error);
+      return Promise.resolve();
+    }
   }
 
   /** S1: the stored style that seeds this sender's session, if any. */
@@ -3752,13 +3802,16 @@ export class MinimalCatalogAgentService {
         }),
         execute: async (pet) => {
           // T4b: the matched pet of the pet store (never mixes two pets).
-          if (this.pets !== undefined)
+          if (this.pets !== undefined) {
+            // T4b-fix A2: the pets of this turn are not loaded; no writes.
+            if (this.petsOverBudget.has(senderId))
+              return { ok: true as const, remembered: false as const };
             await this.pets.capture(
               senderId,
               pet,
               profiles.cached(senderId)?.pet,
             );
-          else await profiles.record(senderId, { pet });
+          } else await profiles.record(senderId, { pet });
           return { ok: true as const, remembered: true as const };
         },
       }),
@@ -3802,12 +3855,20 @@ export class MinimalCatalogAgentService {
         patch.pet = pet;
     }
     await profiles.record(input.senderId, patch);
-    if (this.pets !== undefined && input.interactiveReplyId === undefined)
-      await this.pets.capture(
-        input.senderId,
-        extractPetFacts(input.text),
-        profiles.cached(input.senderId)?.pet,
+    const pets = this.pets;
+    // T4b-fix A3: the capture runs in the background (never delays the
+    // reply; a failure is logged). A2: none after an over-budget prepare.
+    if (
+      pets !== undefined &&
+      input.interactiveReplyId === undefined &&
+      !this.petsOverBudget.has(input.senderId)
+    ) {
+      const facts = extractPetFacts(input.text);
+      const legacy = profiles.cached(input.senderId)?.pet;
+      void this.petsInBackground('capture', () =>
+        pets.capture(input.senderId, facts, legacy),
       );
+    }
   }
 
   /** S1: "olvida mis datos" — delete the profile and confirm. */

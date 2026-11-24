@@ -1321,14 +1321,30 @@ export class MinimalOrderService {
         },
         firstName,
       );
-    // T4b (S8): best effort; the pet upload never blocks the reply.
-    await this.pets?.afterCheckout(senderId).catch(() => undefined);
+    // T4b (S8) / T4b-fix A1: the pet upload runs in the background; it
+    // never delays the order-created reply and a failure is only logged.
+    this.uploadPetsInBackground(senderId);
     // Bank details are fetched when the customer chooses how to pay.
     return {
       reply: `¡Listo! ${minimalOrderCreatedReply(sale, shipping, pickupLocation)}\n\n${MINIMAL_PAYMENT_QUESTION}`,
       saleId: sale.saleId,
       payInStore,
     };
+  }
+
+  /** Starts the post-checkout pet upload without awaiting it (A1). */
+  private uploadPetsInBackground(senderId: string): void {
+    const pets = this.pets;
+    if (pets === undefined) return;
+    const failed = (error: unknown) =>
+      this.logger.warn(
+        `customer pets afterCheckout failed: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+    try {
+      void Promise.resolve(pets.afterCheckout(senderId)).catch(failed);
+    } catch (error) {
+      failed(error);
+    }
   }
 
   /** One CAS attempt on the owned cart slot; `false` never retries. */
