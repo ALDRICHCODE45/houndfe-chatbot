@@ -2230,6 +2230,40 @@ describe('CustomerPetsService (T4c-1)', () => {
       ]);
     });
 
+    it('a legacy twin of the archived backend pet is cleared too: it never resurfaces in the prompt or knownPets (review R3)', async () => {
+      const h = harness(found([backend(), max()]));
+      await h.profiles.record(SENDER, {
+        pet: { name: 'Bruno', species: 'perro' },
+      });
+      h.client.archivePet.mockResolvedValue(archived(backend(), 'falleció'));
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.forgetPet(SENDER, 'Bruno', 'falleció'),
+      ).resolves.toBe('archived');
+      expect(h.profiles.cached(SENDER)?.pet).toBeUndefined();
+      const legacy = h.profiles.cached(SENDER)?.pet;
+      expect(h.service.promptLines(SENDER, legacy) ?? '').not.toContain(
+        'Bruno',
+      );
+      expect(h.service.knownPets(SENDER).map((pet) => pet.name)).toEqual([
+        'Max',
+      ]);
+    });
+
+    it('a legacy pet of another species with the same name is not cleared when the backend pet is archived', async () => {
+      const h = harness(found([backend(), max()]));
+      await h.profiles.record(SENDER, {
+        pet: { name: 'Bruno', species: 'gato' },
+      });
+      h.client.archivePet.mockResolvedValue(archived(backend()));
+      await h.service.prepare(SENDER);
+      await h.service.forgetPet(SENDER, 'Bruno');
+      expect(h.profiles.cached(SENDER)?.pet).toEqual({
+        name: 'Bruno',
+        species: 'gato',
+      });
+    });
+
     it('PET_VERSION_CONFLICT → rereads (ALL) and archives with the current version', async () => {
       const h = harness(found([backend()]));
       h.client.archivePet

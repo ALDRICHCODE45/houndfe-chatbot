@@ -1258,12 +1258,23 @@ export class CustomerPetsService {
   }
 
   /** G2: a local entry with the archived pet's name and species (pending,
-   *  hidden by B6) is that pet: removed so it is never uploaded later. */
+   *  hidden by B6) is that pet: removed so it is never uploaded later. The
+   *  legacy pet it shadowed (B3 rule) is that pet too: cleared, so it does
+   *  not resurface once the archived pet leaves the list. */
   private async forgetTwinEntries(
     senderId: string,
     fence: Fence,
     pet: BackendPet,
   ): Promise<void> {
+    const legacy = this.profiles.cached(senderId)?.pet;
+    const legacySpecies =
+      legacy === undefined ? undefined : factsSpecies(legacy);
+    if (
+      legacy?.name !== undefined &&
+      foldPetName(legacy.name) === foldPetName(pet.name) &&
+      (legacySpecies === undefined || legacySpecies === backendSpecies(pet))
+    )
+      await this.profiles.clearPet(senderId);
     const key = twinKey(pet.name, pet.species);
     await this.writeLocal(senderId, fence, (current) => {
       const next = current.filter((entry) => {
