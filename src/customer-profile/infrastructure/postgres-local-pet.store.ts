@@ -41,7 +41,10 @@ class LocalPetStoreTimeoutError extends Error {
  *     included) or an abandoned transaction by the deadline;
  *   - at the deadline (or on any error) the connection is destroyed, which
  *     aborts the open transaction; COMMIT is only sent before the deadline.
- * So a write that timed out was never committed and cannot land later.
+ * So a timed-out write cannot land later than the deadline. Its outcome is
+ * still unknown to the caller: a COMMIT sent just before the deadline may
+ * have committed although the call rejects, so callers must treat any
+ * rejected write as possibly landed (the pets service rereads).
  */
 @Injectable()
 export class PostgresLocalPetStore implements LocalPetStore {

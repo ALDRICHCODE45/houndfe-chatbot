@@ -768,6 +768,7 @@ export class CustomerPetsService {
   ): Promise<void> {
     let attempts = previous + 1;
     let wait = uploadBackoffMs(attempts);
+    let gone = false;
     // F2: persisted even after the task's bound (a create/merge answer can
     // arrive late): applied on the chain to the entry as it stands now, so
     // it never restores an older list; a newer attempt is counted.
@@ -776,7 +777,10 @@ export class CustomerPetsService {
       fence,
       (current) => {
         const entry = current.find((candidate) => candidate.id === localId);
-        if (entry === undefined) return null;
+        if (entry === undefined) {
+          gone = true;
+          return null;
+        }
         attempts =
           Math.max(previous, (entry.upload ?? entry.merge)?.attempts ?? 0) + 1;
         wait = uploadBackoffMs(attempts);
@@ -797,6 +801,10 @@ export class CustomerPetsService {
     if (saved)
       this.logger.warn(
         `pet ${operation} not done: ${status} (attempt ${attempts}, next in ${Math.round(wait / 60_000)} min, kept local)`,
+      );
+    else if (gone)
+      this.logger.warn(
+        `pet ${operation} not done: ${status} (entry already resolved, nothing pending)`,
       );
     else
       this.logger.warn(
@@ -884,9 +892,9 @@ export class CustomerPetsService {
    * list the previous write left (never an older snapshot), and is refused
    * once the task is past its bound (F2: except a backoff update, which
    * only touches one entry of the current list). A write that lands updates
-   * the cached list (it is what the store now holds). F1: a write past its
-   * bound makes the list unknown (no write until the next successful read;
-   * the store never lets the timed-out write land later).
+   * the cached list (it is what the store now holds). F1/F1b: a write that
+   * fails or passes its bound makes the list unknown (no write until the
+   * next successful read), because it may have landed.
    */
   private writeLocal(
     senderId: string,
@@ -913,10 +921,11 @@ export class CustomerPetsService {
         state.local = next;
         return true;
       }
-      if (wrote.timedOut) {
-        state.localKnown = false;
-        state.loadedAt = 0;
-      }
+      // F1b: a rejected write has an unknown outcome (e.g. the store's own
+      // deadline fired while COMMIT was in flight): never write from the
+      // pre-write list again; the next successful read decides.
+      state.localKnown = false;
+      state.loadedAt = 0;
       return false;
     });
   }

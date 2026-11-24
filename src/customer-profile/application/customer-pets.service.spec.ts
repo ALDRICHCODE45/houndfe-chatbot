@@ -1101,7 +1101,7 @@ describe('CustomerPetsService (T4b-fix-B)', () => {
       await expect(h.local()).resolves.toEqual([]);
     });
 
-    it('a failing capture does not block the next one', async () => {
+    it('a failing capture does not block the next one (F1b: the next turn rereads the list first)', async () => {
       const h = harness(notFound);
       await h.service.prepare(SENDER);
       jest
@@ -1111,10 +1111,15 @@ describe('CustomerPetsService (T4b-fix-B)', () => {
         SENDER,
         extractPetFacts('mi perrita Luna es labrador'),
       );
+      // F1b: the failed write may have landed, so the list is unknown and
+      // this capture is refused instead of writing from a stale list.
       await h.service.capture(
         SENDER,
         extractPetFacts('mi gato Michi es persa'),
       );
+      await expect(h.local()).resolves.toEqual([]);
+      // The queue is not blocked: the next turn rereads and stores.
+      await h.say('mi gato Michi es persa');
       expect((await h.local()).map((pet) => pet.name)).toEqual(['Michi']);
     });
   });
@@ -1855,6 +1860,35 @@ describe('CustomerPetsService (T4b-fix-4)', () => {
       await jest.advanceTimersByTimeAsync(0);
       await h.say('mi gato Michi es persa');
       expect(await names(h)).toEqual(['Luna', 'Toby', 'Michi']);
+    });
+  });
+
+  describe('F1b: a rejected local write has an unknown outcome (verify: COMMIT racing the store deadline)', () => {
+    it('a write that lands but is reported failed (store timeout at COMMIT): the list is unknown until reread, the next write never erases the landed pet', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrita Luna es labrador');
+      const original = h.localStore.write.bind(h.localStore);
+      const write = jest
+        .spyOn(h.localStore, 'write')
+        .mockImplementationOnce(async (sender, pets, at) => {
+          await original(sender, pets, at);
+          throw Object.assign(new Error('local pet store deadline'), {
+            name: 'LocalPetStoreTimeoutError',
+          });
+        });
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Michi es persa'),
+      );
+      // Unknown outcome: no write from the pre-write cached list.
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi perro Toby es un husky'),
+      );
+      expect(write).toHaveBeenCalledTimes(1);
+      // The next turn rereads what the store holds and writes from it.
+      await h.say('mi perro Toby es un husky');
+      expect(await names(h)).toEqual(['Luna', 'Michi', 'Toby']);
     });
   });
 
