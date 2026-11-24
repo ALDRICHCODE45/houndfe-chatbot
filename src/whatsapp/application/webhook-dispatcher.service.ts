@@ -805,13 +805,17 @@ export class WebhookDispatcherService {
     }
   }
 
-  /** S1: best effort; a profile failure never blocks the message. */
+  /**
+   * S1: best effort; a profile failure never blocks the message.
+   * T4b-fix-2 D2: a warm-up: the pet prepare is not waited for here (the
+   * turn pays the single pet budget) and never changes a running turn.
+   */
   private async prepareCustomer(senderId: string): Promise<void> {
     const agent = this
       .minimalCatalogAgent as Partial<MinimalCatalogAgentService>;
     if (typeof agent.prepareCustomer !== 'function') return;
     try {
-      await agent.prepareCustomer(senderId);
+      await agent.prepareCustomer(senderId, { warmUp: true });
     } catch (error) {
       this.logger.warn(
         `customer profile warm-up failed: ${describeError(error)}`,

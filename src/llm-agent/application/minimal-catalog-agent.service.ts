@@ -1009,6 +1009,10 @@ export class MinimalCatalogAgentService {
   // T4b-fix A2: senders whose pet prepare ran past its budget this turn; the
   // turn writes no pets (the prepare finishes in the background).
   private readonly petsOverBudget = new Set<string>();
+  // T4b-fix-2 D2: the pet prepare started by the dispatcher warm-up, still
+  // in flight; the next turn of the sender joins it instead of paying a
+  // second budget.
+  private readonly petWarmUps = new Map<string, Promise<void>>();
   /** Durable copy of the payment offer; `undefined` without gates. */
   private readonly paymentOffers?: DurablePaymentOffer;
 
@@ -3602,8 +3606,13 @@ export class MinimalCatalogAgentService {
    * S1: loads the stored profile at the start of a session (no in-memory
    * turns) or when it is not cached yet. Never throws. The dispatcher also
    * calls it before media/handoff replies so they use the stored style.
+   * T4b-fix-2 D2: with `warmUp` (the dispatcher) the pet prepare starts in
+   * the background and is never waited for; the turn pays the one budget.
    */
-  async prepareCustomer(senderId: string): Promise<void> {
+  async prepareCustomer(
+    senderId: string,
+    options: { warmUp?: true } = {},
+  ): Promise<void> {
     const profiles = this.profiles;
     if (profiles === undefined) return;
     if (
@@ -3616,25 +3625,57 @@ export class MinimalCatalogAgentService {
     // T4b-fix A2: bounded by PET_PREPARE_BUDGET_MS; past it the turn goes on
     // with the state the store already has and the prepare finishes in the
     // background.
-    await this.preparePetsWithinBudget(senderId);
+    if (options.warmUp === true) this.warmUpPets(senderId);
+    else await this.preparePetsWithinBudget(senderId);
+  }
+
+  /**
+   * T4b-fix-2 D2: starts the pet prepare without waiting and without
+   * touching `petsOverBudget` (a turn of the same sender may be running).
+   */
+  private warmUpPets(senderId: string): void {
+    const pets = this.pets;
+    if (pets === undefined || this.petWarmUps.has(senderId)) return;
+    const work = this.petsInBackground('prepare', () => pets.prepare(senderId));
+    this.petWarmUps.set(senderId, work);
+    void work.then(() => {
+      if (this.petWarmUps.get(senderId) === work)
+        this.petWarmUps.delete(senderId);
+    });
   }
 
   private async preparePetsWithinBudget(senderId: string): Promise<void> {
     const pets = this.pets;
     this.petsOverBudget.delete(senderId);
     if (pets === undefined) return;
-    const work = this.petsInBackground('prepare', () => pets.prepare(senderId));
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const budget = new Promise<'over_budget'>((resolve) => {
-      timer = setTimeout(() => resolve('over_budget'), PET_PREPARE_BUDGET_MS);
-    });
-    const outcome = await Promise.race([work.then(() => 'done'), budget]);
-    clearTimeout(timer);
+    // D2: join the warm-up's prepare (taken once) rather than a second one.
+    const warmUp = this.petWarmUps.get(senderId);
+    this.petWarmUps.delete(senderId);
+    const work =
+      warmUp ?? this.petsInBackground('prepare', () => pets.prepare(senderId));
+    const outcome = await this.withinPetBudget(
+      work.then(() => 'done' as const),
+    );
     if (outcome === 'over_budget') {
       this.petsOverBudget.add(senderId);
       this.logger.warn(
         `customer pets prepare over budget (${PET_PREPARE_BUDGET_MS} ms): continuing without pet writes this turn`,
       );
+    }
+  }
+
+  /** T4b-fix: `work`, or 'over_budget' once PET_PREPARE_BUDGET_MS passed. */
+  private async withinPetBudget<T>(
+    work: Promise<T>,
+  ): Promise<T | 'over_budget'> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<'over_budget'>((resolve) => {
+      timer = setTimeout(() => resolve('over_budget'), PET_PREPARE_BUDGET_MS);
+    });
+    try {
+      return await Promise.race([work, budget]);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -3806,11 +3847,31 @@ export class MinimalCatalogAgentService {
             // T4b-fix A2: the pets of this turn are not loaded; no writes.
             if (this.petsOverBudget.has(senderId))
               return { ok: true as const, remembered: false as const };
-            await this.pets.capture(
-              senderId,
-              pet,
-              profiles.cached(senderId)?.pet,
+            // T4b-fix-2 D1: waits at most PET_PREPARE_BUDGET_MS (the capture
+            // may queue behind other pet work of the sender); past it the
+            // capture goes on in the background. A failure inside the
+            // budget is thrown as before.
+            const pets = this.pets;
+            const capture = (async () =>
+              pets.capture(senderId, pet, profiles.cached(senderId)?.pet))();
+            const outcome = await this.withinPetBudget(
+              capture.then(
+                () => ({ failed: false as const }),
+                (error: unknown) => ({ failed: true as const, error }),
+              ),
             );
+            if (outcome === 'over_budget') {
+              this.logger.warn(
+                `customer pets capture over budget (${PET_PREPARE_BUDGET_MS} ms): continuing in the background`,
+              );
+              void this.petsInBackground('capture', () => capture);
+              return {
+                ok: true as const,
+                remembered: false as const,
+                pending: true as const,
+              };
+            }
+            if (outcome.failed) throw outcome.error;
           } else await profiles.record(senderId, { pet });
           return { ok: true as const, remembered: true as const };
         },

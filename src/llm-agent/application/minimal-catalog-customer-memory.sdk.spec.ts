@@ -88,14 +88,22 @@ function harness(
         : { model: 'm', maxSteps: 6, historyTurns: 12 },
   } as unknown as ConfigService;
   const seen: Array<{ system?: unknown; tools?: Record<string, unknown> }> = [];
+  // T4b-fix-2 D: the tool outputs of each run, and a hook that runs before
+  // the model (to act while a turn is in flight).
+  const toolOutputs: unknown[] = [];
+  const hooks: { beforeModel?: () => Promise<void> } = {};
   let scripts: unknown[][] = [];
   const generate: GenerateTextFn = async (input) => {
     seen.push(input);
+    await hooks.beforeModel?.();
     const script = scripts.shift() ?? [say()];
-    return generateText({
+    const result = await generateText({
       ...input,
       model: new MockLanguageModelV4({ doGenerate: script } as never),
     });
+    for (const s of result.steps)
+      for (const r of s.toolResults) toolOutputs.push(r.output);
+    return result;
   };
   const profiles = new CustomerProfileService(profileStore, () => NOW);
   let ids = 0;
@@ -157,7 +165,7 @@ function harness(
     const value = seen.at(-1)?.system;
     return typeof value === 'string' ? value : '';
   };
-  return { agent, seen, system, turn, cartItems };
+  return { agent, seen, system, turn, cartItems, toolOutputs, hooks };
 }
 
 describe('S1 persistent customer memory', () => {
@@ -872,5 +880,177 @@ describe('T4b-fix A2-A4: the pet store never holds the reply', () => {
     expect(result.reply).toBe('¡Qué lindo Max!');
     expect(warnings()).toContain('customer pets capture failed: TypeError');
     expect(warnings().join('\n')).not.toContain(SENDER);
+  });
+
+  // ─── T4b-fix-2 D1: rememberPetDetails waits at most the budget ────────
+  const MAX_TOOL = {
+    name: 'Max',
+    species: 'perro',
+    breed: 'husky',
+  };
+  const toolTurn = (h: ReturnType<typeof harness>) =>
+    h.turn('hola', [
+      [call('rememberPetDetails', MAX_TOOL), say('¡Qué lindo Max!')],
+    ]);
+
+  it('D1: a fast tool capture keeps today’s result and reply', async () => {
+    const pets = stub();
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    const result = await toolTurn(h);
+    expect(result.reply).toBe('¡Qué lindo Max!');
+    expect(h.toolOutputs).toEqual([{ ok: true, remembered: true }]);
+    // The tool's capture (the deterministic one of rememberTurn follows).
+    expect(pets.capture).toHaveBeenNthCalledWith(
+      1,
+      SENDER,
+      expect.objectContaining(MAX_TOOL),
+      undefined,
+    );
+    expect(warnings()).toEqual([]);
+  });
+
+  it('D1: a tool capture that fails inside the budget is still a tool error, as today (no pending result)', async () => {
+    const pets = stub({
+      capture: jest
+        .fn()
+        .mockImplementationOnce(() => Promise.reject(new TypeError('down')))
+        .mockImplementation(() => Promise.resolve()),
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    const result = await toolTurn(h);
+    expect(result.reply).toBe('¡Qué lindo Max!');
+    expect(h.toolOutputs).toEqual([]);
+    expect(warnings().join('\n')).not.toContain('over budget');
+  });
+
+  it('D1: a tool capture that never settles waits exactly the 1500 ms budget, then the tool returns pending and the reply goes out', async () => {
+    jest.useFakeTimers({
+      doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'],
+    });
+    const pets = stub({
+      capture: jest.fn(() => new Promise<void>(() => undefined)),
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    const turn = toolTurn(h);
+    expect(await settled(turn)).toBe(NOT_YET);
+    await jest.advanceTimersByTimeAsync(1499);
+    expect(await settled(turn)).toBe(NOT_YET);
+    await jest.advanceTimersByTimeAsync(1);
+    const result = await settled(turn);
+    expect(result).not.toBe(NOT_YET);
+    expect((result as { reply: string }).reply).toBe('¡Qué lindo Max!');
+    expect(h.toolOutputs).toEqual([
+      { ok: true, remembered: false, pending: true },
+    ]);
+    expect(warnings()).toContain(
+      'customer pets capture over budget (1500 ms): continuing in the background',
+    );
+  });
+
+  it('D1: a tool capture that fails after the budget is logged by error name only, never thrown', async () => {
+    jest.useFakeTimers({
+      doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'],
+    });
+    let fail: (error: Error) => void = () => undefined;
+    const pets = stub({
+      capture: jest
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              fail = reject;
+            }),
+        )
+        .mockImplementation(() => Promise.resolve()),
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    const turn = toolTurn(h);
+    await jest.advanceTimersByTimeAsync(1500);
+    const result = await settled(turn);
+    expect((result as { reply: string }).reply).toBe('¡Qué lindo Max!');
+    fail(new TypeError(`down ${SENDER}`));
+    await flush();
+    expect(warnings()).toContain('customer pets capture failed: TypeError');
+    expect(warnings().join('\n')).not.toContain(SENDER);
+  });
+
+  // ─── T4b-fix-2 D2: one pet prepare budget per inbound message ─────────
+  it('D2: the dispatcher warm-up never waits for the pets; the turn joins that prepare and pays one 1500 ms budget in total', async () => {
+    jest.useFakeTimers({
+      doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'],
+    });
+    const pets = stub({
+      prepare: jest.fn(() => new Promise<void>(() => undefined)),
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    // The warm-up returns without any timer advancing.
+    expect(
+      await settled(h.agent.prepareCustomer(SENDER, { warmUp: true })),
+    ).not.toBe(NOT_YET);
+    const turn = h.turn('hola', [[say(REPLY)]]);
+    await jest.advanceTimersByTimeAsync(1499);
+    expect(await settled(turn)).toBe(NOT_YET);
+    await jest.advanceTimersByTimeAsync(1);
+    const result = await settled(turn);
+    expect((result as { reply: string }).reply).toBe(REPLY);
+    // One prepare for the message: the turn joined the warm-up's.
+    expect(pets.prepare.mock.calls).toEqual([[SENDER]]);
+    expect(warnings()).toEqual([
+      'customer pets prepare over budget (1500 ms): continuing without pet writes this turn',
+    ]);
+  });
+
+  it('D2: a warm-up whose prepare settled is not joined; the turn prepares again (today’s calls and reply)', async () => {
+    const pets = stub();
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    await h.agent.prepareCustomer(SENDER, { warmUp: true });
+    await flush();
+    const result = await h.turn('hola', [[say(REPLY)]]);
+    expect(result.reply).toBe(REPLY);
+    expect(pets.prepare.mock.calls).toEqual([[SENDER], [SENDER]]);
+    expect(h.system()).toContain(
+      `${PET_MEMORY_INSTRUCTIONS_TEXT}\n${STUB_LINE}`,
+    );
+  });
+
+  it('D2: a warm-up during a running turn never flips petsOverBudget for that turn', async () => {
+    jest.useFakeTimers({
+      doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'],
+    });
+    const pets = stub();
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    let release: () => void = () => undefined;
+    let reached = false;
+    h.hooks.beforeModel = () =>
+      new Promise<void>((resolve) => {
+        reached = true;
+        release = resolve;
+      });
+    const turn = toolTurn(h);
+    for (let i = 0; i < 40 && !reached; i += 1) await flush();
+    expect(reached).toBe(true);
+    // A second message of the same sender arrives: its warm-up prepare
+    // never settles and runs past the budget while the turn is in flight.
+    pets.prepare.mockImplementation(() => new Promise<void>(() => undefined));
+    void h.agent.prepareCustomer(SENDER, { warmUp: true });
+    await jest.advanceTimersByTimeAsync(1500);
+    release();
+    const result = await settled(turn);
+    expect((result as { reply: string }).reply).toBe('¡Qué lindo Max!');
+    expect(h.toolOutputs).toEqual([{ ok: true, remembered: true }]);
+    expect(pets.capture).toHaveBeenCalled();
+    expect(warnings()).toEqual([]);
+  });
+
+  it('D2: a rejected warm-up prepare is logged by error name only and never thrown', async () => {
+    const pets = stub({
+      prepare: jest.fn(() => Promise.reject(new TypeError(`down ${SENDER}`))),
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, pets);
+    await expect(
+      h.agent.prepareCustomer(SENDER, { warmUp: true }),
+    ).resolves.toBeUndefined();
+    await flush();
+    expect(warnings()).toEqual(['customer pets prepare failed: TypeError']);
   });
 });
