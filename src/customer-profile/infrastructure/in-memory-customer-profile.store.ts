@@ -48,6 +48,15 @@ export class InMemoryCustomerProfileStore implements CustomerProfileStore {
     return Promise.resolve(this.profiles.delete(senderId));
   }
 
+  clearPet(senderId: string, now: Date): Promise<boolean> {
+    const profile = this.profiles.get(senderId);
+    if (profile?.pet === undefined) return Promise.resolve(false);
+    const next = { ...profile, updatedAt: now.toISOString() };
+    delete next.pet;
+    this.profiles.set(senderId, next);
+    return Promise.resolve(true);
+  }
+
   readLocalPets(senderId: string): LocalPet[] {
     if (!this.profiles.has(senderId)) return [];
     return normalizeLocalPets(

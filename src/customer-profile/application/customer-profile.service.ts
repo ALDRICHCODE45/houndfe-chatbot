@@ -107,6 +107,28 @@ export class CustomerProfileService {
     });
   }
 
+  /**
+   * T4c-1 G2: drops the legacy single pet («Bruno ya no está»); the rest of
+   * the profile stays. `true` when the store answered (whether or not a pet
+   * was stored); `false` after «olvida mis datos» or on a store failure.
+   */
+  async clearPet(senderId: string): Promise<boolean> {
+    if (this.forgotten.has(senderId)) return false;
+    try {
+      await this.store.clearPet(senderId, this.now());
+    } catch (error) {
+      this.warn('pet clear', error);
+      return false;
+    }
+    const cached = this.cache.get(senderId);
+    if (cached !== undefined && cached !== null && cached.pet !== undefined) {
+      const next = { ...cached };
+      delete next.pet;
+      this.remember(senderId, next);
+    }
+    return true;
+  }
+
   /** Deletes the profile; later writes in this process are skipped. */
   async forget(senderId: string): Promise<boolean> {
     this.forgotten.add(senderId);

@@ -13,8 +13,9 @@ import { knownPetPromptLine } from './pet-facts';
  * only folio + date + total for the greeting.
  *
  * Upserts are merge-only: a missing/null/empty patch value keeps the stored
- * one, so a turn can never erase what an earlier turn learned. The only way
- * to drop data is `delete` ("olvida mis datos").
+ * one, so a turn can never erase what an earlier turn learned. The only ways
+ * to drop data are `delete` ("olvida mis datos") and `clearPet` (T4c-1 G2:
+ * «Bruno ya no está» about the legacy single pet).
  */
 
 export const CUSTOMER_PROFILE_STORE = Symbol('CUSTOMER_PROFILE_STORE');
@@ -85,6 +86,12 @@ export interface CustomerProfileStore {
   ): Promise<CustomerProfile | null>;
   /** `true` when a profile existed and was deleted. */
   delete(senderId: string): Promise<boolean>;
+  /**
+   * T4c-1 G2: drops the legacy single pet only (every other field and the
+   * local pet list stay). `true` when a stored pet was cleared; never
+   * creates a row.
+   */
+  clearPet(senderId: string, now: Date): Promise<boolean>;
 }
 
 export const TEXT_LIMITS = {

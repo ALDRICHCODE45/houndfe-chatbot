@@ -1,6 +1,7 @@
 import type { CustomerPet } from './customer-profile';
 import {
   breedSize,
+  extractPetAllergy,
   extractPetFacts,
   knownPetPromptLine,
   petFactsConflict,
@@ -173,5 +174,31 @@ describe('knownPetPromptLine', () => {
   it('is null without searchable facts (a name alone is not enough)', () => {
     expect(knownPetPromptLine(undefined)).toBeNull();
     expect(knownPetPromptLine({ name: 'Luna' })).toBeNull();
+  });
+});
+
+describe('extractPetAllergy (T4c-1 G1)', () => {
+  it.each<[string, { name: string; allergies: string } | null]>([
+    ['Max es alérgico al pollo', { name: 'Max', allergies: 'pollo' }],
+    ['luna es alergica a la res.', { name: 'Luna', allergies: 'res' }],
+    [
+      'oye, Kira es alérgica al pollo y al cerdo, ¿qué me recomiendas?',
+      { name: 'Kira', allergies: 'pollo y al cerdo' },
+    ],
+    ['Bruno es alérgico a los granos', { name: 'Bruno', allergies: 'granos' }],
+    ['Toby es alérgico a mariscos!', { name: 'Toby', allergies: 'mariscos' }],
+    // No pet name: a pronoun, a pet word or a filler word is not a name.
+    ['él es alérgico al pollo', null],
+    ['mi perrita es alérgica al pollo', null],
+    ['que es alérgico al pollo', null],
+    ['yo soy alérgico al pollo', null],
+    ['croquetas sin pollo', null],
+  ])('%s', (text, expected) => {
+    expect(extractPetAllergy(text)).toEqual(expected);
+  });
+
+  it('bounds the allergy text', () => {
+    const allergy = extractPetAllergy(`Max es alérgico al ${'a'.repeat(300)}`);
+    expect(allergy?.allergies.length).toBeLessThanOrEqual(120);
   });
 });

@@ -38,6 +38,18 @@ export const LOCAL_PET_STORE = Symbol('LOCAL_PET_STORE');
 export type PetStage = 'cachorro' | 'adulto' | 'senior';
 export type LocalSpecies = 'perro' | 'gato';
 
+/**
+ * G1 (T4c-1): one statement's facts as captured. The legacy stored pet
+ * (`CustomerPet`) has no allergies; the store keeps them on backend and
+ * local pets only.
+ */
+export interface PetFacts extends CustomerPet {
+  allergies?: string;
+}
+
+/** Contract §1: `allergies` ≤ 500 characters. */
+export const PET_ALLERGIES_MAX = 500;
+
 /** A prospect's pet (or a not-yet-uploaded one) in the chatbot profile. */
 export interface LocalPet {
   /** UUID; part of the upload key `pet-local:<customerId>:<id>`. */
@@ -51,6 +63,8 @@ export interface LocalPet {
   birthDatePrecision?: 'MONTH' | 'YEAR';
   /** «cachorro»/«adulto»/«senior» said without an age; prompt only. */
   stage?: PetStage;
+  /** G1 (T4c-1): allergies the customer stated (appended, deduplicated). */
+  allergies?: string;
   notes?: string;
   createdAt: string;
   /**
@@ -230,10 +244,11 @@ interface NormalizedFacts {
   size?: PetSize;
   approxAge?: PetApproxAge;
   stage?: PetStage;
+  allergies?: string;
   notes?: string;
 }
 
-function normalizeFacts(facts: CustomerPet): NormalizedFacts {
+function normalizeFacts(facts: PetFacts): NormalizedFacts {
   const out: NormalizedFacts = {};
   const name = sanitizeProfileText(facts.name, PET_LIMITS.name);
   if (name !== undefined) out.name = name;
@@ -248,13 +263,44 @@ function normalizeFacts(facts: CustomerPet): NormalizedFacts {
   if (approxAge !== undefined) out.approxAge = approxAge;
   const stage = stageFromText(facts.ageText);
   if (stage !== undefined) out.stage = stage;
+  const allergies = sanitizeProfileText(facts.allergies, PET_ALLERGIES_MAX);
+  if (allergies !== undefined) out.allergies = allergies;
   const notes = sanitizeProfileText(facts.notes, PET_LIMITS.notes);
   if (notes !== undefined) out.notes = notes;
   return out;
 }
 
+/**
+ * G1 (T4c-1): a stated allergy added to a stored one, never replacing it
+ * (losing an allergy is worse than a longer note). `unchanged` when the
+ * stored text already says it (case and accents ignored); `too_long` when
+ * the result would pass the 500-character limit (nothing is cut).
+ */
+export function appendAllergy(
+  stored: string | null | undefined,
+  added: string,
+): { text: string } | 'unchanged' | 'too_long' {
+  if (stored === null || stored === undefined || stored.trim() === '')
+    return { text: added };
+  if (foldPetName(stored).includes(foldPetName(added))) return 'unchanged';
+  const text = `${stored}; ${added}`;
+  return Array.from(text).length > PET_ALLERGIES_MAX ? 'too_long' : { text };
+}
+
+/** G1: true when the facts' allergy cannot be appended to `stored` (over
+ *  the limit), for the caller's log. */
+export function petAllergiesOverflow(
+  stored: string | null | undefined,
+  facts: PetFacts,
+): boolean {
+  const { allergies } = normalizeFacts(facts);
+  return (
+    allergies !== undefined && appendAllergy(stored, allergies) === 'too_long'
+  );
+}
+
 /** True when the facts carry anything to remember. */
-export function hasPetFacts(facts: CustomerPet): boolean {
+export function hasPetFacts(facts: PetFacts): boolean {
   return Object.keys(normalizeFacts(facts)).length > 0;
 }
 
@@ -275,7 +321,7 @@ const sameBreed = (a: string, b: string): boolean =>
 
 export function localPetFromFacts(
   id: string,
-  facts: CustomerPet,
+  facts: PetFacts,
   now: Date,
 ): LocalPet {
   const f = normalizeFacts(facts);
@@ -289,6 +335,7 @@ export function localPetFromFacts(
       ? {}
       : birthDateFromApproxAge(f.approxAge, now)),
     ...(f.stage === undefined ? {} : { stage: f.stage }),
+    ...(f.allergies === undefined ? {} : { allergies: f.allergies }),
     ...(f.notes === undefined ? {} : { notes: f.notes }),
     createdAt: now.toISOString(),
   };
@@ -297,7 +344,7 @@ export function localPetFromFacts(
 /** New facts merged into a local pet; `conflict` for another species. */
 export function mergeFactsIntoLocal(
   pet: LocalPet,
-  facts: CustomerPet,
+  facts: PetFacts,
   now: Date,
 ): LocalPet | 'conflict' | 'unchanged' {
   const f = normalizeFacts(facts);
@@ -325,6 +372,10 @@ export function mergeFactsIntoLocal(
     }
   } else if (f.stage !== undefined && pet.birthDate === undefined)
     next.stage = f.stage;
+  if (f.allergies !== undefined) {
+    const allergies = appendAllergy(pet.allergies, f.allergies);
+    if (typeof allergies === 'object') next.allergies = allergies.text;
+  }
   if (f.notes !== undefined) next.notes = f.notes;
   return JSON.stringify(next) === JSON.stringify(pet) ? 'unchanged' : next;
 }
@@ -354,12 +405,13 @@ export function localCreateBody(pet: LocalPet): CreatePetInput | null {
           birthDate: pet.birthDate,
           birthDatePrecision: pet.birthDatePrecision,
         }),
+    ...(pet.allergies === undefined ? {} : { allergies: pet.allergies }),
     ...(pet.notes === undefined ? {} : { notes: pet.notes }),
   };
 }
 
 /** The facts a local pet carries, to apply to an existing backend pet. */
-export function localPetFacts(pet: LocalPet, now: Date): CustomerPet {
+export function localPetFacts(pet: LocalPet, now: Date): PetFacts {
   const months =
     pet.birthDate === undefined
       ? undefined
@@ -377,6 +429,7 @@ export function localPetFacts(pet: LocalPet, now: Date): CustomerPet {
               ? `${Math.floor(months / 12)} años`
               : `${months} meses`,
         }),
+    ...(pet.allergies === undefined ? {} : { allergies: pet.allergies }),
     ...(pet.notes === undefined ? {} : { notes: pet.notes }),
   };
 }
@@ -385,11 +438,12 @@ export function localPetFacts(pet: LocalPet, now: Date): CustomerPet {
  * C1: the PATCH members (without `version`) that change a backend pet, or
  * `null` when nothing changes. Species is never changed (`conflict`: another
  * pet), a stored size or notes are never overwritten, a stage word is never
- * written, age is sent as `approxAge` only when it differs.
+ * written, age is sent as `approxAge` only when it differs. G1: a stated
+ * allergy is appended to the stored (possibly staff) one, deduplicated.
  */
 export function backendPetPatch(
   pet: BackendPet,
-  facts: CustomerPet,
+  facts: PetFacts,
 ): Omit<PatchPetInput, 'version'> | null | 'conflict' {
   const f = normalizeFacts(facts);
   if (f.species !== undefined && pet.species !== SPECIES_TO_BACKEND[f.species])
@@ -407,6 +461,10 @@ export function backendPetPatch(
     (pet.ageMonths === null || !ageMatches(pet.ageMonths, f.approxAge))
   )
     patch.approxAge = f.approxAge;
+  if (f.allergies !== undefined) {
+    const allergies = appendAllergy(pet.allergies, f.allergies);
+    if (typeof allergies === 'object') patch.allergies = allergies.text;
+  }
   if (f.notes !== undefined && pet.notes === null) patch.notes = f.notes;
   return Object.keys(patch).length === 0 ? null : patch;
 }
@@ -443,7 +501,7 @@ const compatible = (
  */
 export function matchPetForFacts<Ref>(
   candidates: ReadonlyArray<PetCandidate<Ref>>,
-  facts: CustomerPet,
+  facts: PetFacts,
 ): PetMatch<Ref> {
   const f = normalizeFacts(facts);
   const species =
@@ -512,6 +570,8 @@ function normalizeLocalPet(raw: unknown): LocalPet | null {
   }
   if (typeof pet.stage === 'string' && STAGES.has(pet.stage))
     out.stage = pet.stage as PetStage;
+  const allergies = optionalText(pet.allergies, PET_ALLERGIES_MAX);
+  if (allergies !== undefined) out.allergies = allergies;
   const notes = optionalText(pet.notes, PET_LIMITS.notes);
   if (notes !== undefined) out.notes = notes;
   const upload = pet.upload as Record<string, unknown> | undefined;
@@ -613,6 +673,7 @@ export function localPetView(pet: LocalPet, now: Date): PetPromptView {
           ageText: petAgeLabel(months),
           stage: stageFromMonths(months, species),
         }),
+    ...(pet.allergies === undefined ? {} : { allergies: pet.allergies }),
     ...(pet.notes === undefined ? {} : { notes: pet.notes }),
   };
 }

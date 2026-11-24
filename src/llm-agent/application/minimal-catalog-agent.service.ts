@@ -53,8 +53,16 @@ import {
   type CustomerStyle,
 } from '../domain/customer-style';
 import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
-import { CustomerPetsService } from '../../customer-profile/application/customer-pets.service';
 import {
+  CustomerPetsService,
+  type ForgetPetOutcome,
+} from '../../customer-profile/application/customer-pets.service';
+import {
+  foldPetName,
+  type PetFacts,
+} from '../../customer-profile/domain/customer-pets';
+import {
+  extractPetAllergy,
   extractPetFacts,
   knownPetPromptLine,
   petFactsConflict,
@@ -320,12 +328,24 @@ export const FORGET_MY_DATA_REPLY =
 // T4b-fix A2: the longest a turn waits for the pet store's prepare.
 export const PET_PREPARE_BUDGET_MS = 1500;
 
-// S1: guidance for the customer-memory tool (pet facts).
+// S1: guidance for the customer-memory tools (pet facts; T4c-1: allergies,
+// forgetPet and the tact instruction).
 const PET_MEMORY_INSTRUCTIONS =
-  'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
+  'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad, alergias), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
   'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación. ' +
   'Si hay una sola línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte. ' +
-  'Si hay varias, siga la indicación que las acompaña.';
+  'Si hay varias, siga la indicación que las acompaña. ' +
+  'Si el cliente dice que una mascota ya no está (murió, se perdió, la regaló) o pide olvidarla, llame forgetPet con su nombre y el motivo que él dio; responda con tacto y calidez, en pocas palabras, sin ofrecer productos para esa mascota. ' +
+  'Si forgetPet responde ok false, no se guardó nada: dígalo con amabilidad y pregunte de cuál mascota se trata.';
+
+const REMEMBER_PET_DESCRIPTION =
+  'Guarda datos que el cliente dijo explícitamente sobre SU mascota para recordarlos en otras conversaciones. ' +
+  'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, alergias, notas); omita lo demás. Nunca invente ni deduzca.';
+
+// T4c-1 G2: «Bruno ya no está» / «olvida a Bruno» (archive, never delete).
+const FORGET_PET_DESCRIPTION =
+  'Deja de recordar una mascota del cliente que ya no está o que pidió olvidar («Bruno ya no está», «olvida a Bruno»): la archiva, sin borrar sus pedidos. ' +
+  'name: el nombre que dio el cliente. reason: el motivo en sus palabras, solo si lo dijo. Si responde ok false, no se guardó nada.';
 
 /** Generous input cap; the profile store bounds each field again. */
 const PET_FACT = z.string().min(1).max(500).optional();
@@ -366,6 +386,16 @@ const IMITATED_CONFIRMATION =
   /confirm[ae] (?:sus|tus) datos de entrega|resumen de (?:su|tu) pedido|respond[ae]\s*[«"“']?\s*s[ií]\b[^\n]{0,40}\b(?:crear el pedido|confirmar (?:estos|sus|tus) datos)/i;
 
 const toolError = (kind: string) => ({ ok: false as const, error: kind });
+
+/** T4c-1 G2: the forgetPet tool result for each store outcome. */
+const forgetPetResult = (outcome: ForgetPetOutcome) =>
+  outcome === 'archived' || outcome === 'removed' || outcome === 'cleared'
+    ? { ok: true as const, forgotten: true as const }
+    : outcome === 'none'
+      ? toolError('no_pet_with_that_name')
+      : outcome === 'ambiguous'
+        ? toolError('several_pets_with_that_name')
+        : toolError('pet_memory_unavailable');
 
 // The read-only prompt denies a registration tool; when `prepareRestock` or
 // `prepareExpiration` is present these clauses are reworded and the matching
@@ -3830,15 +3860,15 @@ export class MinimalCatalogAgentService {
     if (profiles === undefined) return {};
     return {
       rememberPetDetails: tool({
-        description:
-          'Guarda datos que el cliente dijo explícitamente sobre SU mascota para recordarlos en otras conversaciones. ' +
-          'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, notas); omita lo demás. Nunca invente ni deduzca.',
+        description: REMEMBER_PET_DESCRIPTION,
         inputSchema: z.strictObject({
           name: PET_FACT,
           species: PET_FACT,
           breed: PET_FACT,
           size: PET_FACT,
           ageText: PET_FACT,
+          // T4c-1 G1: appended to the stored allergies, never replacing them.
+          allergies: PET_FACT,
           notes: PET_FACT,
         }),
         execute: async (pet) => {
@@ -3874,6 +3904,53 @@ export class MinimalCatalogAgentService {
             if (outcome.failed) throw outcome.error;
           } else await profiles.record(senderId, { pet });
           return { ok: true as const, remembered: true as const };
+        },
+      }),
+      forgetPet: tool({
+        description: FORGET_PET_DESCRIPTION,
+        inputSchema: z.strictObject({
+          name: z.string().min(1).max(60),
+          reason: z.string().min(1).max(500).optional(),
+        }),
+        execute: async ({ name, reason }) => {
+          const pets = this.pets;
+          // Without the pet store only the legacy single pet exists.
+          if (pets === undefined) {
+            const legacy = profiles.cached(senderId)?.pet?.name;
+            if (
+              legacy === undefined ||
+              foldPetName(legacy) !== foldPetName(name)
+            )
+              return toolError('no_pet_with_that_name');
+            return (await profiles.clearPet(senderId))
+              ? { ok: true as const, forgotten: true as const }
+              : toolError('pet_memory_unavailable');
+          }
+          // T4b-fix A2: the pets of this turn are not loaded; no writes.
+          if (this.petsOverBudget.has(senderId))
+            return toolError('pet_memory_unavailable');
+          // Same budget as rememberPetDetails (D1); past it the archive goes
+          // on in the background and the tool says it is pending.
+          const forget = (async () => pets.forgetPet(senderId, name, reason))();
+          const outcome = await this.withinPetBudget(
+            forget.then(
+              (value) => ({ failed: false as const, value }),
+              (error: unknown) => ({ failed: true as const, error }),
+            ),
+          );
+          if (outcome === 'over_budget') {
+            this.logger.warn(
+              `customer pets forget pet over budget (${PET_PREPARE_BUDGET_MS} ms): continuing in the background`,
+            );
+            void this.petsInBackground('forget pet', () => forget);
+            return {
+              ok: true as const,
+              forgotten: false as const,
+              pending: true as const,
+            };
+          }
+          if (outcome.failed) throw outcome.error;
+          return forgetPetResult(outcome.value);
         },
       }),
     };
@@ -3924,11 +4001,24 @@ export class MinimalCatalogAgentService {
       input.interactiveReplyId === undefined &&
       !this.petsOverBudget.has(input.senderId)
     ) {
-      const facts = extractPetFacts(input.text);
+      const facts: PetFacts = extractPetFacts(input.text);
       const legacy = profiles.cached(input.senderId)?.pet;
+      // T4c-1 G1: «<Nombre> es alérgico a X». With the same name as the
+      // statement's pet facts it joins them; else it goes only to a known
+      // pet with that name.
+      const allergy = extractPetAllergy(input.text);
+      const joined =
+        allergy !== null &&
+        facts.name !== undefined &&
+        foldPetName(facts.name) === foldPetName(allergy.name);
+      if (joined) facts.allergies = allergy.allergies;
       void this.petsInBackground('capture', () =>
         pets.capture(input.senderId, facts, legacy),
       );
+      if (allergy !== null && !joined)
+        void this.petsInBackground('capture', () =>
+          pets.captureAllergy(input.senderId, allergy, legacy),
+        );
     }
   }
 
@@ -3938,6 +4028,14 @@ export class MinimalCatalogAgentService {
     text: string;
   }): Promise<MinimalCatalogAgentDecision> {
     const style = this.customerStyle(input.senderId, input.text);
+    // T4c-1 G3: the backend pets are deleted in the background (bounded by
+    // the pet store, never awaited): started before the profile is
+    // forgotten, the reply never waits for it.
+    const pets = this.pets;
+    if (pets !== undefined)
+      void this.petsInBackground('forget', () =>
+        pets.forgetAll(input.senderId),
+      );
     await this.profiles!.forget(input.senderId);
     this.order?.dismiss(input.senderId);
     const reply = applyCustomerStyle(FORGET_MY_DATA_REPLY, style);

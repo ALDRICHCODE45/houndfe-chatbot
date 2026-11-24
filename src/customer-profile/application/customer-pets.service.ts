@@ -25,14 +25,26 @@ import {
   localPetView,
   matchPetForFacts,
   mergeFactsIntoLocal,
+  petAllergiesOverflow,
   uploadBackoffMs,
   type LocalPet,
   type LocalPetStore,
   type LocalSpecies,
   type PetCandidate,
+  type PetFacts,
+  type PetStage,
 } from '../domain/customer-pets';
-import type { CustomerPet } from '../domain/customer-profile';
-import { petFactsConflict, type PetPromptView } from '../domain/pet-facts';
+import {
+  sanitizeProfileText,
+  type CustomerPet,
+} from '../domain/customer-profile';
+import {
+  breedSpecies,
+  petFactsConflict,
+  petLifeStage,
+  petSpeciesWord,
+  type PetPromptView,
+} from '../domain/pet-facts';
 import { CustomerProfileService } from './customer-profile.service';
 
 export const CUSTOMER_PETS_CLOCK = Symbol('CUSTOMER_PETS_CLOCK');
@@ -57,6 +69,60 @@ export const CUSTOMER_PETS_LOCAL_IO_TIMEOUT_MS = 10_000;
 
 /** Bounded process cache, like the profile cache. */
 const CACHE_MAX = 2000;
+
+/** G2: archive `reason` ≤ 280 characters (contract §4.3). */
+const ARCHIVE_REASON_MAX = 280;
+
+/** G3: `GET …?status=ALL` answers at most 100 pets (contract §1); the erase
+ *  lists again while a full page was deleted, at most this many times. */
+const ERASE_PAGE = 100;
+const ERASE_ROUNDS_MAX = 5;
+
+/**
+ * G4 (T4c-1): one known ACTIVE pet as T4c-2 shows it (buttons). `ref` is
+ * `backend:<petId>`, `local:<localId>` or `legacy`; same pets and order as
+ * the prompt lines.
+ */
+export interface KnownPet {
+  ref: string;
+  name?: string;
+  species?: string;
+  breed?: string;
+  ageLabel?: string;
+  stage?: PetStage;
+  source: 'backend' | 'local' | 'legacy';
+}
+
+/** G4: a local entry blocked as ambiguous and the backend pets it may be. */
+export interface AmbiguousPetEntry {
+  localId: string;
+  name: string;
+  species: LocalSpecies;
+  candidates: KnownPet[];
+}
+
+/**
+ * G2: what `forgetPet` did. `archived` (backend), `removed` (local entry),
+ * `cleared` (legacy single pet): forgotten. `none` / `ambiguous`: 0 or 2+
+ * pets with that name, nothing written. `unavailable`: pets unknown this
+ * turn (read-only scope, lookup down, local list unknown, forgotten).
+ * `failed`: the write did not land.
+ */
+export type ForgetPetOutcome =
+  | 'archived'
+  | 'removed'
+  | 'cleared'
+  | 'none'
+  | 'ambiguous'
+  | 'unavailable'
+  | 'failed';
+
+/** G4: what `resolveAmbiguous` did. */
+export type ResolveAmbiguousOutcome =
+  | 'resolved'
+  | 'not_found'
+  | 'failed'
+  | 'unavailable';
 
 /** Upload key of a local pet (contract §4.1: 1–200 chars, per sucursal). */
 export const localPetUploadKey = (customerId: string, localId: string) =>
@@ -105,6 +171,16 @@ type Ref =
   | { kind: 'backend'; id: string }
   | { kind: 'local'; id: string }
   | { kind: 'legacy' };
+
+/** One known pet with its prompt view (prompt lines, `knownPets`). */
+interface KnownEntry {
+  ref: string;
+  source: KnownPet['source'];
+  view: PetPromptView;
+}
+
+/** G3: one pet delete's outcome; `stop` = no scope or customer gone. */
+type EraseOutcome = 'deleted' | 'failed' | { stop: string };
 
 /** F1: a local store call's outcome (`timedOut`: past its bound). */
 type StoreAnswer<T> = { ok: true; value: T } | { ok: false; timedOut: boolean };
@@ -219,13 +295,146 @@ export class CustomerPetsService {
    */
   async capture(
     senderId: string,
-    facts: CustomerPet,
+    facts: PetFacts,
     legacy?: CustomerPet,
   ): Promise<void> {
     if (!hasPetFacts(facts) || this.profiles.isForgotten(senderId)) return;
     await this.serialized(senderId, (fence) =>
-      this.captureNow(senderId, facts, legacy, fence),
+      this.captureNow(senderId, facts, legacy, fence, false),
     );
+  }
+
+  /**
+   * G1 (T4c-1): the deterministic «<Nombre> es alérgic[oa] a X» statement.
+   * Applied only to the single known pet with that name (never a new pet,
+   * never a nameless one); appended to its allergies, deduplicated.
+   */
+  async captureAllergy(
+    senderId: string,
+    statement: { name: string; allergies: string },
+    legacy?: CustomerPet,
+  ): Promise<void> {
+    const facts: PetFacts = {
+      name: statement.name,
+      allergies: statement.allergies,
+    };
+    if (!hasPetFacts(facts) || this.profiles.isForgotten(senderId)) return;
+    await this.serialized(senderId, (fence) =>
+      this.captureNow(senderId, facts, legacy, fence, true),
+    );
+  }
+
+  /**
+   * G2 (T4c-1): «Bruno ya no está» / «olvida a Bruno». The single known pet
+   * with that name is forgotten: a backend pet is archived with the reason
+   * (version-conflict reread), a local entry removed, the legacy single pet
+   * cleared. 0 or 2+ matches write nothing. Serialized and fenced like the
+   * other pet work; never throws.
+   */
+  async forgetPet(
+    senderId: string,
+    name: string,
+    reason?: string,
+  ): Promise<ForgetPetOutcome> {
+    if (this.profiles.isForgotten(senderId)) return 'unavailable';
+    let outcome: ForgetPetOutcome = 'unavailable';
+    await this.serialized(senderId, async (fence) => {
+      try {
+        outcome = await this.forgetPetNow(senderId, name, reason, fence);
+      } catch (error) {
+        this.warn('forget pet', error);
+        outcome = 'failed';
+      }
+    });
+    return outcome;
+  }
+
+  /**
+   * G3 (T4c-1): «olvida mis datos» — deletes every backend pet of the
+   * sender's Customer (`?status=ALL`, DELETE with each version; 404 = done).
+   * Start it before `CustomerProfileService.forget`: unlike every other
+   * method it keeps working once the profile is forgotten. Best effort,
+   * bounded by the queue task bound (no new delete after it); never throws.
+   */
+  async forgetAll(senderId: string): Promise<void> {
+    await this.serialized(senderId, async (fence) => {
+      try {
+        await this.eraseBackendPets(senderId, fence);
+      } catch (error) {
+        this.warn('erase', error);
+      }
+    });
+  }
+
+  /**
+   * G4 (T4c-1): the sender's known ACTIVE pets (same pets and order as the
+   * prompt lines), from what this process already loaded. `[]` when not
+   * loaded or forgotten.
+   */
+  knownPets(senderId: string): KnownPet[] {
+    if (this.profiles.isForgotten(senderId)) return [];
+    return this.knownEntries(senderId, this.profiles.cached(senderId)?.pet).map(
+      knownPet,
+    );
+  }
+
+  /** G4 (T4c-1): local entries blocked as ambiguous (C2) with the backend
+   *  pets each may be, for T4c-2's buttons. */
+  ambiguousEntries(senderId: string): AmbiguousPetEntry[] {
+    if (this.profiles.isForgotten(senderId)) return [];
+    const state = this.cache.get(senderId);
+    if (state === undefined || state.scope.kind !== 'customer') return [];
+    const out: AmbiguousPetEntry[] = [];
+    for (const entry of state.local) {
+      if (entry.blocked !== 'ambiguous') continue;
+      const body = localCreateBody(entry);
+      if (body === null) continue;
+      const key = twinKey(body.name, body.species);
+      out.push({
+        localId: entry.id,
+        name: body.name,
+        species: body.species === 'CAT' ? 'gato' : 'perro',
+        candidates: state.scope.pets
+          .filter((pet) => twinKey(pet.name, pet.species) === key)
+          .map((pet) =>
+            knownPet({
+              ref: `backend:${pet.id}`,
+              source: 'backend',
+              view: backendPetView(pet),
+            }),
+          ),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * G4 (T4c-1): the customer picked which backend pet a blocked entry is:
+   * its facts PATCH that pet (staff values kept, allergies appended) and the
+   * entry is removed. A pet that is not a twin of the entry is refused; a
+   * failed PATCH keeps the entry blocked. Serialized and fenced.
+   */
+  async resolveAmbiguous(
+    senderId: string,
+    localId: string,
+    backendPetId: string,
+  ): Promise<ResolveAmbiguousOutcome> {
+    if (this.profiles.isForgotten(senderId)) return 'unavailable';
+    let outcome: ResolveAmbiguousOutcome = 'unavailable';
+    await this.serialized(senderId, async (fence) => {
+      try {
+        outcome = await this.resolveAmbiguousNow(
+          senderId,
+          localId,
+          backendPetId,
+          fence,
+        );
+      } catch (error) {
+        this.warn('resolve ambiguous', error);
+        outcome = 'failed';
+      }
+    });
+    return outcome;
   }
 
   private isFresh(senderId: string): boolean {
@@ -338,9 +547,10 @@ export class CustomerPetsService {
 
   private async captureNow(
     senderId: string,
-    facts: CustomerPet,
+    facts: PetFacts,
     legacy: CustomerPet | undefined,
     fence: Fence,
+    knownOnly: boolean,
   ): Promise<void> {
     if (this.profiles.isForgotten(senderId)) return;
     try {
@@ -352,23 +562,38 @@ export class CustomerPetsService {
         scope.kind === 'unavailable' ||
         scope.kind === 'customer_pets_unknown'
       ) {
+        // G1: the legacy pet has no allergies; an allergy statement alone
+        // has nothing to record there.
+        if (knownOnly) {
+          this.logger.log(`pet allergies not stored: pets ${scope.kind}`);
+          return;
+        }
         // B4: no pet store this turn, but the legacy single pet keeps the
         // baseline merge-only profile write (another pet is never mixed in).
         if (petFactsConflict(legacy, facts)) {
           this.logger.log(`pet facts not stored: pets ${scope.kind}`);
           return;
         }
-        await this.profiles.record(senderId, { pet: facts });
+        await this.recordLegacy(senderId, facts);
         return;
       }
       if (!state.localKnown) {
         this.logger.log('pet facts not stored: local pets unknown');
         return;
       }
-      const match = matchPetForFacts<Ref>(
-        this.candidates(state, legacy),
-        facts,
-      );
+      const candidates = this.candidates(state, legacy);
+      if (knownOnly) {
+        // G1: only the single known pet with that name.
+        const named = this.named(candidates, facts.name ?? '');
+        if (named.length !== 1) {
+          this.logger.log(
+            'pet allergies not stored: no single pet with that name',
+          );
+          return;
+        }
+        return await this.applyTo(senderId, state, named[0].ref, facts, fence);
+      }
+      const match = matchPetForFacts<Ref>(candidates, facts);
       switch (match.kind) {
         case 'none':
           this.logger.log('pet facts not stored: no single matching pet');
@@ -390,29 +615,59 @@ export class CustomerPetsService {
    */
   promptLines(senderId: string, legacy?: CustomerPet): string | null {
     if (this.profiles.isForgotten(senderId)) return null;
-    const state = this.cache.get(senderId);
-    const views: PetPromptView[] = [];
-    if (state?.scope.kind === 'customer')
-      views.push(...state.scope.pets.map(backendPetView));
-    const now = this.now();
-    views.push(
-      ...(state === undefined ? [] : this.visibleLocal(state)).map((pet) =>
-        localPetView(pet, now),
-      ),
+    return knownPetsPrompt(
+      this.knownEntries(senderId, legacy).map((entry) => entry.view),
     );
+  }
+
+  /** The known pets behind the prompt lines and `knownPets`, in order. */
+  private knownEntries(
+    senderId: string,
+    legacy: CustomerPet | undefined,
+  ): KnownEntry[] {
+    const state = this.cache.get(senderId);
+    const out: KnownEntry[] = [];
+    if (state?.scope.kind === 'customer')
+      for (const pet of state.scope.pets)
+        out.push({
+          ref: `backend:${pet.id}`,
+          source: 'backend',
+          view: backendPetView(pet),
+        });
+    const now = this.now();
+    for (const pet of state === undefined ? [] : this.visibleLocal(state))
+      out.push({
+        ref: `local:${pet.id}`,
+        source: 'local',
+        view: localPetView(pet, now),
+      });
     if (legacy !== undefined && Object.keys(legacy).length > 0) {
       const name = legacy.name;
       const shadowed =
         name === undefined
-          ? views.length > 0
-          : views.some(
-              (view) =>
+          ? out.length > 0
+          : out.some(
+              ({ view }) =>
                 view.name !== undefined &&
                 foldPetName(view.name) === foldPetName(name),
             );
-      if (!shadowed) views.push(legacy);
+      if (!shadowed)
+        out.push({ ref: 'legacy', source: 'legacy', view: legacy });
     }
-    return knownPetsPrompt(views);
+    return out;
+  }
+
+  /** Candidates whose name folds to `name`'s. */
+  private named(
+    candidates: Array<PetCandidate<Ref>>,
+    name: string,
+  ): Array<PetCandidate<Ref>> {
+    const key = foldPetName(name);
+    if (key === '') return [];
+    return candidates.filter(
+      (candidate) =>
+        candidate.name !== undefined && foldPetName(candidate.name) === key,
+    );
   }
 
   /* -------------------------------------------------------------- scope */
@@ -514,12 +769,12 @@ export class CustomerPetsService {
     senderId: string,
     state: SenderPets,
     ref: Ref,
-    facts: CustomerPet,
+    facts: PetFacts,
     fence: Fence,
   ): Promise<void> {
     if (ref.kind === 'legacy') {
       // Until T6 the legacy single pet keeps its merge-only profile write.
-      await this.profiles.record(senderId, { pet: facts });
+      await this.recordLegacy(senderId, facts);
       return;
     }
     if (ref.kind === 'backend') {
@@ -540,6 +795,7 @@ export class CustomerPetsService {
     const wrote = await this.writeLocal(senderId, fence, (current) => {
       const pet = current.find((candidate) => candidate.id === ref.id);
       if (pet === undefined) return null;
+      if (petAllergiesOverflow(pet.allergies, facts)) this.allergiesOverflow();
       const merged = mergeFactsIntoLocal(pet, facts, this.now());
       if (merged === 'conflict' || merged === 'unchanged') {
         outcome = merged;
@@ -557,10 +813,24 @@ export class CustomerPetsService {
       await this.uploadPending(senderId, fence);
   }
 
+  /** The legacy single pet's merge-only write (G1: it has no allergies). */
+  private async recordLegacy(senderId: string, facts: PetFacts): Promise<void> {
+    const { allergies, ...pet } = facts;
+    if (allergies !== undefined)
+      this.logger.log('pet allergies not stored: legacy pet');
+    if (hasPetFacts(pet)) await this.profiles.record(senderId, { pet });
+  }
+
+  private allergiesOverflow(): void {
+    this.logger.warn(
+      'pet allergies not stored: over 500 characters (stored value kept)',
+    );
+  }
+
   private async addLocal(
     senderId: string,
     state: SenderPets,
-    facts: CustomerPet,
+    facts: PetFacts,
     fence: Fence,
   ): Promise<void> {
     if (state.local.length >= LOCAL_PETS_MAX) {
@@ -822,11 +1092,12 @@ export class CustomerPetsService {
     senderId: string,
     customerId: string,
     pet: BackendPet,
-    facts: CustomerPet,
+    facts: PetFacts,
     fence: Fence,
     twin?: string,
   ): Promise<PatchOutcome> {
     let target = pet;
+    if (petAllergiesOverflow(pet.allergies, facts)) this.allergiesOverflow();
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const diff = backendPetPatch(target, facts);
       if (diff === 'conflict') {
@@ -882,6 +1153,253 @@ export class CustomerPetsService {
       this.warn('pet reread', error);
       return null;
     }
+  }
+
+  /* ------------------------------------------- forget, erase, resolve */
+
+  private async forgetPetNow(
+    senderId: string,
+    name: string,
+    reason: string | undefined,
+    fence: Fence,
+  ): Promise<ForgetPetOutcome> {
+    if (this.profiles.isForgotten(senderId)) return 'unavailable';
+    if (!this.cache.has(senderId)) await this.load(senderId, false, fence);
+    const state = this.cache.get(senderId);
+    if (
+      state === undefined ||
+      state.scope.kind === 'unavailable' ||
+      state.scope.kind === 'customer_pets_unknown' ||
+      !state.localKnown
+    )
+      return 'unavailable';
+    const matches = this.named(
+      this.candidates(state, this.profiles.cached(senderId)?.pet),
+      name,
+    );
+    if (matches.length === 0) return 'none';
+    if (matches.length > 1) return 'ambiguous';
+    const ref = matches[0].ref;
+    switch (ref.kind) {
+      case 'legacy':
+        return (await this.profiles.clearPet(senderId)) ? 'cleared' : 'failed';
+      case 'local':
+        return (await this.writeLocal(senderId, fence, (current) =>
+          current.some((entry) => entry.id === ref.id)
+            ? current.filter((entry) => entry.id !== ref.id)
+            : null,
+        ))
+          ? 'removed'
+          : 'failed';
+      case 'backend': {
+        const { scope } = state;
+        if (scope.kind !== 'customer') return 'unavailable';
+        const pet = scope.pets.find((candidate) => candidate.id === ref.id);
+        if (pet === undefined) return 'none';
+        return this.archiveBackend(
+          senderId,
+          scope.customerId,
+          pet,
+          sanitizeProfileText(reason, ARCHIVE_REASON_MAX),
+          fence,
+        );
+      }
+    }
+  }
+
+  /** G2: archive with the version; on `PET_VERSION_CONFLICT` reread
+   *  (`?status=ALL`): already archived or gone = done, else retry once. */
+  private async archiveBackend(
+    senderId: string,
+    customerId: string,
+    pet: BackendPet,
+    reason: string | undefined,
+    fence: Fence,
+  ): Promise<ForgetPetOutcome> {
+    let target = pet;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (this.profiles.isForgotten(senderId)) return 'unavailable';
+      let result: Awaited<ReturnType<CustomerPetsClient['archivePet']>>;
+      try {
+        result = await this.client.archivePet(customerId, target.id, {
+          version: target.version,
+          ...(reason === undefined ? {} : { reason }),
+        });
+      } catch (error) {
+        this.warn('pet archive', error);
+        return 'failed';
+      }
+      if (result.kind === 'ok') {
+        this.upsertBackend(senderId, fence, result.pet);
+        await this.forgetTwinEntries(senderId, fence, target);
+        return 'archived';
+      }
+      if (result.kind === 'PET_ARCHIVED' || result.kind === 'PET_NOT_FOUND') {
+        this.dropBackend(senderId, fence, target.id);
+        await this.forgetTwinEntries(senderId, fence, target);
+        return 'archived';
+      }
+      if (result.kind !== 'PET_VERSION_CONFLICT' || attempt > 0) {
+        this.logger.warn(`pet archive not done: ${result.kind}`);
+        return 'failed';
+      }
+      const fresh = await this.reread(customerId, target.id);
+      if (fresh === null || fresh.status !== 'ACTIVE') {
+        // Already archived (or deleted) by someone else: forgotten.
+        if (fresh === null) this.dropBackend(senderId, fence, target.id);
+        else this.upsertBackend(senderId, fence, fresh);
+        await this.forgetTwinEntries(senderId, fence, target);
+        return 'archived';
+      }
+      this.upsertBackend(senderId, fence, fresh);
+      target = fresh;
+    }
+    return 'failed';
+  }
+
+  /** G2: a local entry with the archived pet's name and species (pending,
+   *  hidden by B6) is that pet: removed so it is never uploaded later. */
+  private async forgetTwinEntries(
+    senderId: string,
+    fence: Fence,
+    pet: BackendPet,
+  ): Promise<void> {
+    const key = twinKey(pet.name, pet.species);
+    await this.writeLocal(senderId, fence, (current) => {
+      const next = current.filter((entry) => {
+        if (entry.blocked === 'ambiguous') return true;
+        const body = localCreateBody(entry);
+        return body === null || twinKey(body.name, body.species) !== key;
+      });
+      return next.length === current.length ? null : next;
+    });
+  }
+
+  /** G3: the Customer's pets, every page of `?status=ALL`, deleted. */
+  private async eraseBackendPets(
+    senderId: string,
+    fence: Fence,
+  ): Promise<void> {
+    const cached = this.cache.get(senderId)?.scope;
+    this.cache.delete(senderId);
+    const scope =
+      cached?.kind === 'customer' || cached?.kind === 'customer_pets_unknown'
+        ? cached
+        : await this.resolveScope(senderId);
+    if (scope.kind !== 'customer' && scope.kind !== 'customer_pets_unknown')
+      return;
+    const { customerId } = scope;
+    let deleted = 0;
+    let failed = 0;
+    for (let round = 0; round < ERASE_ROUNDS_MAX; round += 1) {
+      if (fence.expired) break;
+      const listed = await this.client.listPets(customerId, 'ALL');
+      if (listed.kind !== 'ok') {
+        this.logger.warn(`customer pets erase stopped: ${listed.kind}`);
+        break;
+      }
+      let progress = 0;
+      for (const pet of listed.pets) {
+        if (fence.expired) break;
+        const outcome = await this.erasePet(customerId, pet);
+        if (typeof outcome === 'object') {
+          this.logger.warn(`customer pets erase stopped: ${outcome.stop}`);
+          this.logErase(deleted, failed);
+          return;
+        }
+        if (outcome === 'deleted') {
+          deleted += 1;
+          progress += 1;
+        } else failed += 1;
+      }
+      if (listed.pets.length < ERASE_PAGE || progress === 0) break;
+    }
+    if (fence.expired)
+      this.logger.warn(
+        `customer pets erase stopped: past ${CUSTOMER_PETS_TASK_TIMEOUT_MS} ms`,
+      );
+    this.logErase(deleted, failed);
+  }
+
+  /** G3: DELETE with the version. 404 = done (also after a timeout); a
+   *  conflict retries with `currentVersion`; a thrown call retries once
+   *  with the same version. */
+  private async erasePet(
+    customerId: string,
+    pet: BackendPet,
+  ): Promise<EraseOutcome> {
+    let version = pet.version;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let result: Awaited<ReturnType<CustomerPetsClient['deletePet']>>;
+      try {
+        result = await this.client.deletePet(customerId, pet.id, version);
+      } catch (error) {
+        this.warn('pet delete', error);
+        continue;
+      }
+      switch (result.kind) {
+        case 'ok':
+        case 'PET_NOT_FOUND':
+          return 'deleted';
+        case 'PET_VERSION_CONFLICT':
+          if (result.currentVersion === null) return 'failed';
+          version = result.currentVersion;
+          continue;
+        default:
+          return { stop: result.kind };
+      }
+    }
+    return 'failed';
+  }
+
+  private logErase(deleted: number, failed: number): void {
+    if (failed > 0)
+      this.logger.warn(
+        `customer pets erase: ${deleted} deleted, ${failed} not deleted`,
+      );
+    else this.logger.log(`customer pets erase: ${deleted} deleted`);
+  }
+
+  private async resolveAmbiguousNow(
+    senderId: string,
+    localId: string,
+    backendPetId: string,
+    fence: Fence,
+  ): Promise<ResolveAmbiguousOutcome> {
+    if (this.profiles.isForgotten(senderId)) return 'unavailable';
+    if (!this.cache.has(senderId)) await this.load(senderId, false, fence);
+    const state = this.cache.get(senderId);
+    if (
+      state === undefined ||
+      state.scope.kind !== 'customer' ||
+      !state.localKnown
+    )
+      return 'unavailable';
+    const entry = state.local.find(
+      (candidate) =>
+        candidate.id === localId && candidate.blocked === 'ambiguous',
+    );
+    const body = entry === undefined ? null : localCreateBody(entry);
+    if (entry === undefined || body === null) return 'not_found';
+    const key = twinKey(body.name, body.species);
+    const target = state.scope.pets.find(
+      (pet) =>
+        pet.id === backendPetId && twinKey(pet.name, pet.species) === key,
+    );
+    if (target === undefined) return 'not_found';
+    const outcome = await this.patchBackend(
+      senderId,
+      state.scope.customerId,
+      target,
+      localPetFacts(entry, this.now()),
+      fence,
+      key,
+    );
+    if (outcome === 'forgotten') return 'unavailable';
+    if (outcome === 'not_twin') return 'not_found';
+    if (typeof outcome === 'object') return 'failed';
+    await this.removeLocal(senderId, fence, localId);
+    return 'resolved';
   }
 
   /* -------------------------------------------------------------- cache */
@@ -1056,6 +1574,30 @@ function backendSpecies(
  *  `backendSpecies` on both sides (OTHER is never a cat). */
 function twinKey(name: string, species: BackendPet['species']): string {
   return `${foldPetName(name)}|${backendSpecies({ species })}`;
+}
+
+/** G4: the T4c-2 view of one known pet (only the members it has). */
+function knownPet({ ref, source, view }: KnownEntry): KnownPet {
+  const species =
+    (view.species === undefined
+      ? undefined
+      : (petSpeciesWord(view.species) ?? view.species)) ??
+    (view.breed === undefined ? undefined : breedSpecies(view.breed));
+  const stage =
+    view.stage ??
+    petLifeStage(
+      view.ageText,
+      species === 'perro' || species === 'gato' ? species : undefined,
+    );
+  return {
+    ref,
+    ...(view.name === undefined ? {} : { name: view.name }),
+    ...(species === undefined ? {} : { species }),
+    ...(view.breed === undefined ? {} : { breed: view.breed }),
+    ...(view.ageText === undefined ? {} : { ageLabel: view.ageText }),
+    ...(stage === undefined ? {} : { stage }),
+    source,
+  };
 }
 
 function speciesOf(species: LocalSpecies | undefined): {

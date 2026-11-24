@@ -281,6 +281,35 @@ export function extractPetFacts(text: string): CustomerPet {
   return facts;
 }
 
+/** G1 (T4c-1): longest allergy text taken from one statement. */
+const ALLERGY_TEXT_MAX = 120;
+/** «Max es alérgico al pollo», «Luna es alérgica a la res». */
+const ALLERGY = new RegExp(
+  `(?<!\\p{L})(${NAME})\\s+es\\s+al[eé]rgic[oa]s?\\s+a(?:l)?\\s+(?:(?:la|las|los|el)\\s+)?([^.,;:!¡?¿\\n]+)`,
+  'iu',
+);
+const PET_WORD_ONLY = new RegExp(`^(?:${PET_WORD})$`, 'iu');
+
+/**
+ * G1 (T4c-1): «<Nombre> es alérgic[oa] a(l) X» from the customer's own text,
+ * or `null`. The caller applies it only to a known pet with that name (never
+ * a new pet), so a word taken for a name by mistake writes nothing.
+ */
+export function extractPetAllergy(
+  text: string,
+): { name: string; allergies: string } | null {
+  const match = ALLERGY.exec(customerOwnText(text));
+  if (match === null) return null;
+  const [, word, rest] = match;
+  if (!acceptableName(word) || PET_WORD_ONLY.test(word)) return null;
+  const allergies = Array.from(rest.replace(/\s+/g, ' ').trim())
+    .slice(0, ALLERGY_TEXT_MAX)
+    .join('')
+    .trim();
+  if (allergies === '') return null;
+  return { name: capitalize(word), allergies };
+}
+
 function sizeFromWord(word: string): PetSize | undefined {
   const folded = fold(word);
   return SIZE_WORDS.find(([pattern]) => pattern.test(folded))?.[1];
