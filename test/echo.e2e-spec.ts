@@ -5,6 +5,8 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { InMemoryConversationStore } from '../src/conversation/infrastructure/in-memory-conversation.store';
 import { InMemoryWebhookDedupStore } from '../src/whatsapp/infrastructure/in-memory-webhook-dedup.store';
+import { InMemoryTranscriptStore } from '../src/conversation-transcript/infrastructure/in-memory-transcript.store';
+import { InMemoryBackendOutboxStore } from '../src/backend-outbox/infrastructure/in-memory-backend-outbox.store';
 import type { LlmAgentPort } from '../src/llm-agent/domain/llm-agent.port';
 import type { VerifiedWebhookSnapshot } from '../src/whatsapp/presentation/signature.guard';
 
@@ -20,6 +22,8 @@ describe('Webhook agent flow (e2e)', () => {
     >;
   };
   let conversationStoreToken: symbol;
+  let transcriptToken: symbol;
+  let outboxStoreToken: symbol;
   let whatsappSenderToken: symbol;
   let webhookDedupToken: symbol;
   let llmAgentToken: symbol;
@@ -55,6 +59,12 @@ describe('Webhook agent flow (e2e)', () => {
     ({ CONVERSATION_STORE: conversationStoreToken } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       require('../src/conversation/domain/conversation-store') as typeof import('../src/conversation/domain/conversation-store'));
+    ({ CONVERSATION_TRANSCRIPT: transcriptToken } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/conversation-transcript/domain/transcript.port') as typeof import('../src/conversation-transcript/domain/transcript.port'));
+    ({ BACKEND_OUTBOX_STORE: outboxStoreToken } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../src/backend-outbox/domain/backend-outbox') as typeof import('../src/backend-outbox/domain/backend-outbox'));
     ({ WHATSAPP_SENDER: whatsappSenderToken } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       require('../src/whatsapp/domain/whatsapp-sender.port') as typeof import('../src/whatsapp/domain/whatsapp-sender.port'));
@@ -105,6 +115,11 @@ describe('Webhook agent flow (e2e)', () => {
       .useValue(new InMemoryConversationStore())
       .overrideProvider(webhookDedupToken)
       .useValue(new InMemoryWebhookDedupStore())
+      // No database here: the transcript and its backend outbox stay in memory.
+      .overrideProvider(transcriptToken)
+      .useValue(new InMemoryTranscriptStore())
+      .overrideProvider(outboxStoreToken)
+      .useValue(new InMemoryBackendOutboxStore())
       .overrideProvider(llmAgentToken)
       .useValue(llmAgent)
       // Customer turns run on the minimal route: answer without a network call.

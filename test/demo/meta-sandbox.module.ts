@@ -16,6 +16,7 @@ import { MinimalCatalogAgentService } from '../../src/llm-agent/application/mini
 import { ReceiptIngressService } from '../../src/receipt-media/application/receipt-ingress.service';
 import { HUMAN_HANDOFF_SERVICE_TOKEN } from '../../src/sale-flow/infrastructure/real-tool-registry';
 import { RestockInboundCapture } from '../../src/whatsapp/application/restock-inbound-capture';
+import { HandoffModeService } from '../../src/conversation/application/handoff-mode.service';
 import { WebhookDispatcherService } from '../../src/whatsapp/application/webhook-dispatcher.service';
 import { RECENT_OUTBOUND } from '../../src/whatsapp/domain/recent-outbound.store';
 import { WEBHOOK_DEDUP } from '../../src/whatsapp/domain/webhook-dedup.store';
@@ -363,6 +364,9 @@ function scanRawSenders(
     { provide: RestockInboundCapture, useValue: SANDBOX_RESTOCK_CAPTURE },
     { provide: CUSTOMER_INBOUND_CAPTURE, useValue: SANDBOX_CUSTOMER_CAPTURE },
     { provide: CONVERSATION_STORE, useClass: InMemoryConversationStore },
+    // S7 handoff mode (required by the dispatcher): the real service over
+    // the in-memory conversation store, so every sandbox sender stays BOT.
+    HandoffModeService,
     { provide: AgentRunner, useValue: SANDBOX_AGENT_RUNNER },
     {
       provide: MinimalCatalogAgentService,
