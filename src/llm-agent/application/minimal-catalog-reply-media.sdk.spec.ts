@@ -65,7 +65,7 @@ const adjust = (
 // S13: a search turn's reply is the application's options message.
 const KONG_OPTIONS = [
   'Encontré estas opciones:',
-  '• *Juguete Kong Classic para Perro*: Juguete de hule resistente rellenable con premios. Juguete Kong Classic para Perro Chico $249.00 MXN, Juguete Kong Classic para Perro Mediano $329.00 MXN, Juguete Kong Classic para Perro Grande $429.00 MXN (agotada)',
+  '• *Juguete Kong Classic para Perro*: Juguete de hule resistente rellenable con premios. Juguete Kong Classic para Perro Chico $249.00, Juguete Kong Classic para Perro Mediano $329.00, Juguete Kong Classic para Perro Grande $429.00 (agotada)',
   '',
   '¿Cuál le gustaría llevar?',
 ].join('\n');

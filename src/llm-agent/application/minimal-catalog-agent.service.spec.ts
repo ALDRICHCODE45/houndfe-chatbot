@@ -71,7 +71,7 @@ const variantStock = { ...simpleStock, variants: [variant] };
 const variantFixtures = { item: variantItem, stock: variantStock };
 // S13: a search turn's reply is the application's options message.
 const IBUPROFENO_OPTIONS =
-  'Encontré estas opciones:\n• *Ibuprofeno 400 mg*: $99.00 MXN\n\n¿Cuál le gustaría llevar?';
+  'Encontré estas opciones:\n• *Ibuprofeno 400 mg*: $99.00\n\n¿Cuál le gustaría llevar?';
 const flow = [
   call('s1', 'searchCatalog', { q: 'ibuprofeno' }),
   say('¿Buscaba esa presentación?'),
@@ -885,8 +885,8 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
     };
     const PROD_REPLY = [
       'Croquetas Pedigree no tengo, pero tengo estas opciones:',
-      '• *[PRUEBA] Croquetas Naturales sin Grano Salmón y Camote 2 kg* (de otra marca): Croquetas para perros adultos de raza grande. $450.00 MXN',
-      '• *Pedigree Dentastix Premios Dentales Perro Mediano 7 pzas*: Premios para la limpieza dental de su perro. $89.00 MXN',
+      '• *[PRUEBA] Croquetas Naturales sin Grano Salmón y Camote 2 kg* (de otra marca): Croquetas para perros adultos de raza grande. $450.00',
+      '• *Pedigree Dentastix Premios Dentales Perro Mediano 7 pzas*: Premios para la limpieza dental de su perro. $89.00',
       `Además, tengo ${LATA}, pero está agotado.`,
       '',
       `¿Cuál le gustaría llevar? Y si la que busca es ${LATA}, con gusto le averiguo cuándo nos vuelve a llegar.`,
@@ -1502,7 +1502,8 @@ describe('MinimalCatalogAgentService (minimal SDK route)', () => {
             true,
           );
           expect(result.reply).toContain('*Alpiste 1 kg*');
-          expect(result.reply).toContain('$45.00 MXN');
+          expect(result.reply).toContain('$45.00');
+          expect(result.reply).not.toContain('MXN');
           expect(result.reply).not.toMatch(/jaula|Tetra|Hill/i);
           expect(result.reply).not.toContain('no tengo');
         });

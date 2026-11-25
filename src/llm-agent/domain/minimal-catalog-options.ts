@@ -4,6 +4,7 @@ import {
   type ItemAvailability,
 } from './minimal-catalog-availability';
 import { MAX_CATALOG_OPTIONS } from './minimal-catalog-relevance';
+import { money } from './whatsapp-format';
 import {
   fold,
   significantQueryWords,
@@ -608,7 +609,6 @@ export function planCatalogOptions(
   };
 }
 
-const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
 const isCents = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
@@ -637,7 +637,7 @@ function priceText(option: CatalogOption): string | null {
       .slice(0, PRESENTATIONS_MAX)
       .map((variant) => {
         const price = isCents(variant.priceCents)
-          ? ` ${mxn(variant.priceCents)}`
+          ? ` ${money(variant.priceCents)}`
           : '';
         const gone =
           status.get(variant.variantId) === 'out_of_stock' ? ' (agotada)' : '';
@@ -647,9 +647,9 @@ function priceText(option: CatalogOption): string | null {
     const rest = variants.length - PRESENTATIONS_MAX;
     return rest > 0 ? `${listed} y ${rest} presentaciones más` : listed;
   }
-  if (isCents(item.price?.priceCents)) return mxn(item.price.priceCents);
+  if (isCents(item.price?.priceCents)) return money(item.price.priceCents);
   if (isCents(item.price?.fromPriceCents))
-    return `desde ${mxn(item.price.fromPriceCents)}`;
+    return `desde ${money(item.price.fromPriceCents)}`;
   return null;
 }
 
