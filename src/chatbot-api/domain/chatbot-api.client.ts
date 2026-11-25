@@ -26,6 +26,7 @@ import {
   CancelSaleInput,
   CancelSaleResult,
   CreateSaleInput,
+  OrderHistoryQuery,
   OrderHistoryResponse,
   UpdateDeliveryInput,
 } from './dtos/sales.dto';
@@ -151,7 +152,16 @@ export interface ChatbotApiClient {
    *  so hand-built fakes stay valid. */
   setPayInStoreIntent?(saleId: string): Promise<PayInStoreHold>;
   updateDelivery(saleId: string, dto: UpdateDeliveryInput): Promise<void>;
-  getOrderHistory(phone: string, cc: string): Promise<OrderHistoryResponse[]>;
+  /** `GET /chatbot-api/customers/by-phone/:phone/orders` (scope
+   *  `customers:read`). `options.petId` adds `?petId=` (orders with at least
+   *  one line for that pet, each with all its lines); a pet of another
+   *  customer, an unknown pet or an unknown phone with `petId` rejects with
+   *  `NotFoundError` `errorCode: 'PET_NOT_FOUND'`. */
+  getOrderHistory(
+    phone: string,
+    cc: string,
+    options?: OrderHistoryQuery,
+  ): Promise<OrderHistoryResponse[]>;
   /** HD-R2b2: `POST /chatbot-api/human-decisions` RESTOCK intake (scope
    *  `human-decisions:create`). Single attempt, no retry; resolves only on
    *  `201`/`200` with a strictly validated immutable historical receipt

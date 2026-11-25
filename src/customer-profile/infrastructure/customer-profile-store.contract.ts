@@ -145,6 +145,34 @@ export function runCustomerProfileStoreContract(
       await expect(store.read('sender-1')).resolves.toBeNull();
     });
 
+    it('clears only the legacy pet (T4c-1 G2), keeping every other field', async () => {
+      await store.upsert(
+        SENDER,
+        { displayName: 'Ana', pet: { name: 'Luna', species: 'perro' } },
+        T1,
+      );
+      await expect(store.clearPet(SENDER, T2)).resolves.toBe(true);
+      await expect(store.read(SENDER)).resolves.toEqual({
+        senderId: SENDER,
+        displayName: 'Ana',
+        register: 'usted',
+        emojis: false,
+        tone: 'neutral',
+        updatedAt: T2.toISOString(),
+      });
+      // Nothing left to clear, unknown or invalid sender: false, no row.
+      await expect(store.clearPet(SENDER, T2)).resolves.toBe(false);
+      await expect(store.clearPet(OTHER, T2)).resolves.toBe(false);
+      await expect(store.read(OTHER)).resolves.toBeNull();
+      await expect(store.clearPet('sender-1', T2)).resolves.toBe(false);
+      // A later pet fact starts a fresh pet (not merged into the old one).
+      await store.upsert(SENDER, { pet: { name: 'Max' } }, T2);
+      await expect(store.read(SENDER)).resolves.toMatchObject({
+        pet: { name: 'Max' },
+      });
+      expect((await store.read(SENDER))?.pet?.species).toBeUndefined();
+    });
+
     it('deletes the profile', async () => {
       await store.upsert(SENDER, { displayName: 'Ana' }, T1);
       await store.upsert(OTHER, { displayName: 'Beto' }, T1);

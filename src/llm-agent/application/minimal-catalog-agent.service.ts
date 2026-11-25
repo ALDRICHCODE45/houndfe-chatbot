@@ -54,6 +54,15 @@ import {
 } from '../domain/customer-style';
 import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
 import {
+  CustomerPetsService,
+  type ForgetPetOutcome,
+} from '../../customer-profile/application/customer-pets.service';
+import {
+  foldPetName,
+  type PetFacts,
+} from '../../customer-profile/domain/customer-pets';
+import {
+  extractPetAllergy,
   extractPetFacts,
   knownPetPromptLine,
   petFactsConflict,
@@ -316,11 +325,34 @@ export const BUSY_REPLY =
 export const FORGET_MY_DATA_REPLY =
   'Listo, borré los datos que tenía guardados de usted (nombre, estilo de trato y mascota). Sus pedidos registrados en la tienda no se borran.';
 
-// S1: guidance for the customer-memory tool (pet facts).
+// T4b-fix A2: the longest a turn waits for the pet store's prepare.
+export const PET_PREPARE_BUDGET_MS = 1500;
+
+// S1: guidance for the customer-memory tools (pet facts; T4c-1: allergies,
+// forgetPet and the tact instruction).
 const PET_MEMORY_INSTRUCTIONS =
-  'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
+  'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad, alergias), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
   'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación. ' +
-  'Si hay una línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte.';
+  'Si hay una sola línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte. ' +
+  'Si hay varias, siga la indicación que las acompaña. ' +
+  'Si el cliente dice que una mascota ya no está (murió, se perdió, la regaló) o pide olvidarla, llame forgetPet con su nombre y el motivo que él dio; responda con tacto y calidez, en pocas palabras, sin ofrecer productos para esa mascota. ' +
+  'Si forgetPet responde ok false, no se guardó nada: dígalo con amabilidad y pregunte de cuál mascota se trata. ' +
+  'Si forgetPet responde pending true, todavía se está guardando: no diga que ya la olvidó; responda con tacto sin confirmarlo.';
+
+const REMEMBER_PET_DESCRIPTION =
+  'Guarda datos que el cliente dijo explícitamente sobre SU mascota para recordarlos en otras conversaciones. ' +
+  'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, alergias, notas); omita lo demás. Nunca invente ni deduzca.';
+
+// T4c-1 G2: «Bruno ya no está» / «olvida a Bruno» (archive, never delete).
+const FORGET_PET_DESCRIPTION =
+  'Deja de recordar una mascota del cliente que ya no está o que pidió olvidar («Bruno ya no está», «olvida a Bruno»): la archiva, sin borrar sus pedidos. ' +
+  'name: el nombre que dio el cliente. reason: el motivo en sus palabras, solo si lo dijo. Si responde ok false, no se guardó nada. ' +
+  'Si responde pending true, todavía se está guardando: no diga que ya la olvidó; responda con tacto sin confirmarlo.';
+
+// T4c-1-fix H1: after forgetPet names a pet, no capture (deterministic or
+// rememberPetDetails) writes a pet with that name for this long, so the
+// message that forgets it («mi perrito Bruno ya no está») never re-creates it.
+export const PET_FORGOTTEN_WINDOW_MS = 5 * 60_000;
 
 /** Generous input cap; the profile store bounds each field again. */
 const PET_FACT = z.string().min(1).max(500).optional();
@@ -361,6 +393,16 @@ const IMITATED_CONFIRMATION =
   /confirm[ae] (?:sus|tus) datos de entrega|resumen de (?:su|tu) pedido|respond[ae]\s*[«"“']?\s*s[ií]\b[^\n]{0,40}\b(?:crear el pedido|confirmar (?:estos|sus|tus) datos)/i;
 
 const toolError = (kind: string) => ({ ok: false as const, error: kind });
+
+/** T4c-1 G2: the forgetPet tool result for each store outcome. */
+const forgetPetResult = (outcome: ForgetPetOutcome) =>
+  outcome === 'archived' || outcome === 'removed' || outcome === 'cleared'
+    ? { ok: true as const, forgotten: true as const }
+    : outcome === 'none'
+      ? toolError('no_pet_with_that_name')
+      : outcome === 'ambiguous'
+        ? toolError('several_pets_with_that_name')
+        : toolError('pet_memory_unavailable');
 
 // The read-only prompt denies a registration tool; when `prepareRestock` or
 // `prepareExpiration` is present these clauses are reworded and the matching
@@ -1001,6 +1043,25 @@ export class MinimalCatalogAgentService {
   // run's order summary must not outlive the interruption.
   private readonly interrupted = new Set<string>();
   private readonly logger = new Logger(MinimalCatalogAgentService.name);
+  // T4b-fix A2: senders whose pet prepare ran past its budget this turn; the
+  // turn writes no pets (the prepare finishes in the background).
+  private readonly petsOverBudget = new Set<string>();
+  // T4c-1-fix H1: per sender, the folded names given to forgetPet and when
+  // their PET_FORGOTTEN_WINDOW_MS ends.
+  // I3: one mark per forgetPet call (its own expiry); a failed call drops
+  // only its own mark, so a parallel call that archived keeps the window.
+  private readonly forgottenPets = new Map<
+    string,
+    Map<string, Array<{ until: number; failed: boolean }>>
+  >();
+  // T4c-1-fix N1: senders whose current turn called forgetPet; that turn's
+  // deterministic pet capture is skipped (the message describes the pet
+  // being forgotten, never the one that remains).
+  private readonly petForgetTurns = new Set<string>();
+  // T4b-fix-2 D2: the pet prepare started by the dispatcher warm-up, still
+  // in flight; the next turn of the sender joins it instead of paying a
+  // second budget.
+  private readonly petWarmUps = new Map<string, Promise<void>>();
   /** Durable copy of the payment offer; `undefined` without gates. */
   private readonly paymentOffers?: DurablePaymentOffer;
 
@@ -1050,6 +1111,11 @@ export class MinimalCatalogAgentService {
     // and schedule an expired one again; optional only as a test seam.
     @Optional()
     private readonly backorderConfirm?: MinimalBackorderConfirmService,
+    // Multi-pet T4b: backend pets for a Customer, a local list for a
+    // prospect; optional only as a test seam (without it the single stored
+    // pet of the profile is used as before).
+    @Optional()
+    private readonly pets?: CustomerPetsService,
   ) {
     const llm = config.get<{
       model: string;
@@ -1112,6 +1178,7 @@ export class MinimalCatalogAgentService {
       // S4: restore the sender's durable gates (pending summaries,
       // references, RESTOCK question) before any route reads them.
       await this.gates?.begin(input.senderId);
+      this.petForgetTurns.delete(input.senderId);
       await this.prepareCustomer(input.senderId);
       const decision = this.withConfirmationButtons(
         input.senderId,
@@ -1124,6 +1191,7 @@ export class MinimalCatalogAgentService {
         this.order?.dismiss(input.senderId);
       }
       this.busy.delete(input.senderId);
+      this.petsOverBudget.delete(input.senderId);
       // The turn's gate changes are durable before its reply is sent.
       await this.gates?.settle(input.senderId);
     }
@@ -3588,8 +3656,13 @@ export class MinimalCatalogAgentService {
    * S1: loads the stored profile at the start of a session (no in-memory
    * turns) or when it is not cached yet. Never throws. The dispatcher also
    * calls it before media/handoff replies so they use the stored style.
+   * T4b-fix-2 D2: with `warmUp` (the dispatcher) the pet prepare starts in
+   * the background and is never waited for; the turn pays the one budget.
    */
-  async prepareCustomer(senderId: string): Promise<void> {
+  async prepareCustomer(
+    senderId: string,
+    options: { warmUp?: true } = {},
+  ): Promise<void> {
     const profiles = this.profiles;
     if (profiles === undefined) return;
     if (
@@ -3597,6 +3670,84 @@ export class MinimalCatalogAgentService {
       !profiles.isLoaded(senderId)
     )
       await profiles.load(senderId);
+    // T4b: the sender's pets (refreshed at most once a minute); uploads a
+    // former prospect's local pets once the sender is a Customer (S8).
+    // T4b-fix A2: bounded by PET_PREPARE_BUDGET_MS; past it the turn goes on
+    // with the state the store already has and the prepare finishes in the
+    // background.
+    if (options.warmUp === true) this.warmUpPets(senderId);
+    else await this.preparePetsWithinBudget(senderId);
+  }
+
+  /**
+   * T4b-fix-2 D2: starts the pet prepare without waiting and without
+   * touching `petsOverBudget` (a turn of the same sender may be running).
+   */
+  private warmUpPets(senderId: string): void {
+    const pets = this.pets;
+    if (pets === undefined || this.petWarmUps.has(senderId)) return;
+    const work = this.petsInBackground('prepare', () => pets.prepare(senderId));
+    this.petWarmUps.set(senderId, work);
+    void work.then(() => {
+      if (this.petWarmUps.get(senderId) === work)
+        this.petWarmUps.delete(senderId);
+    });
+  }
+
+  private async preparePetsWithinBudget(senderId: string): Promise<void> {
+    const pets = this.pets;
+    this.petsOverBudget.delete(senderId);
+    if (pets === undefined) return;
+    // D2: join the warm-up's prepare (taken once) rather than a second one.
+    const warmUp = this.petWarmUps.get(senderId);
+    this.petWarmUps.delete(senderId);
+    const work =
+      warmUp ?? this.petsInBackground('prepare', () => pets.prepare(senderId));
+    const outcome = await this.withinPetBudget(
+      work.then(() => 'done' as const),
+    );
+    if (outcome === 'over_budget') {
+      this.petsOverBudget.add(senderId);
+      this.logger.warn(
+        `customer pets prepare over budget (${PET_PREPARE_BUDGET_MS} ms): continuing without pet writes this turn`,
+      );
+    }
+  }
+
+  /** T4b-fix: `work`, or 'over_budget' once PET_PREPARE_BUDGET_MS passed. */
+  private async withinPetBudget<T>(
+    work: Promise<T>,
+  ): Promise<T | 'over_budget'> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<'over_budget'>((resolve) => {
+      timer = setTimeout(() => resolve('over_budget'), PET_PREPARE_BUDGET_MS);
+    });
+    try {
+      return await Promise.race([work, budget]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * T4b-fix: runs a pet store call without letting it throw; a failure is
+   * logged (error name only: the text may carry the phone). The returned
+   * promise always resolves; callers that must not wait simply drop it.
+   */
+  private petsInBackground(
+    operation: string,
+    start: () => Promise<unknown>,
+  ): Promise<void> {
+    const failed = (error: unknown) =>
+      this.logger.warn(
+        `customer pets ${operation} failed: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+    try {
+      return Promise.resolve(start()).then(() => undefined, failed);
+    } catch (error) {
+      failed(error);
+      return Promise.resolve();
+    }
   }
 
   /** S1: the stored style that seeds this sender's session, if any. */
@@ -3611,7 +3762,10 @@ export class MinimalCatalogAgentService {
     const profile = this.profiles.cached(senderId);
     const known = [
       knownCustomerPromptLine(profile),
-      knownPetPromptLine(profile?.pet),
+      // T4b: one line per known pet (backend, local and the legacy one).
+      this.pets === undefined
+        ? knownPetPromptLine(profile?.pet)
+        : this.pets.promptLines(senderId, profile?.pet),
     ].filter((line): line is string => line !== null);
     return `\n\n${[PET_MEMORY_INSTRUCTIONS, ...known].join('\n')}`;
   }
@@ -3726,23 +3880,132 @@ export class MinimalCatalogAgentService {
     if (profiles === undefined) return {};
     return {
       rememberPetDetails: tool({
-        description:
-          'Guarda datos que el cliente dijo explícitamente sobre SU mascota para recordarlos en otras conversaciones. ' +
-          'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, notas); omita lo demás. Nunca invente ni deduzca.',
+        description: REMEMBER_PET_DESCRIPTION,
         inputSchema: z.strictObject({
           name: PET_FACT,
           species: PET_FACT,
           breed: PET_FACT,
           size: PET_FACT,
           ageText: PET_FACT,
+          // T4c-1 G1: appended to the stored allergies, never replacing them.
+          allergies: PET_FACT,
           notes: PET_FACT,
         }),
         execute: async (pet) => {
-          await profiles.record(senderId, { pet });
+          // T4c-1-fix H1: never brings back a pet forgotten moments ago.
+          if (this.petRecentlyForgotten(senderId, pet.name))
+            return toolError('pet_recently_forgotten');
+          // T4b: the matched pet of the pet store (never mixes two pets).
+          if (this.pets !== undefined) {
+            // T4b-fix A2: the pets of this turn are not loaded; no writes.
+            if (this.petsOverBudget.has(senderId))
+              return { ok: true as const, remembered: false as const };
+            // T4b-fix-2 D1: waits at most PET_PREPARE_BUDGET_MS (the capture
+            // may queue behind other pet work of the sender); past it the
+            // capture goes on in the background. A failure inside the
+            // budget is thrown as before.
+            const pets = this.pets;
+            const capture = (async () =>
+              pets.capture(senderId, pet, profiles.cached(senderId)?.pet))();
+            const outcome = await this.withinPetBudget(
+              capture.then(
+                () => ({ failed: false as const }),
+                (error: unknown) => ({ failed: true as const, error }),
+              ),
+            );
+            if (outcome === 'over_budget') {
+              this.logger.warn(
+                `customer pets capture over budget (${PET_PREPARE_BUDGET_MS} ms): continuing in the background`,
+              );
+              void this.petsInBackground('capture', () => capture);
+              return {
+                ok: true as const,
+                remembered: false as const,
+                pending: true as const,
+              };
+            }
+            if (outcome.failed) throw outcome.error;
+          } else await profiles.record(senderId, { pet });
           return { ok: true as const, remembered: true as const };
         },
       }),
+      forgetPet: tool({
+        description: FORGET_PET_DESCRIPTION,
+        inputSchema: z.strictObject({
+          name: z.string().min(1).max(60),
+          reason: z.string().min(1).max(500).optional(),
+        }),
+        execute: async ({ name, reason }) => {
+          // T4c-1-fix N1: whatever the outcome, this turn's deterministic
+          // capture is skipped. H1/I3: the window is open while the call
+          // runs (a parallel rememberPetDetails is refused) and stays only
+          // for a forgotten, pending or unknown-name (pinned) outcome.
+          const undo = this.markPetForgotten(senderId, name);
+          let keep = false;
+          try {
+            const result = await this.forgetPetNow(senderId, name, reason);
+            keep =
+              result.ok ||
+              ('error' in result && result.error === 'no_pet_with_that_name');
+            return result;
+          } finally {
+            if (!keep) undo();
+          }
+        },
+      }),
     };
+  }
+
+  /** T4c-1 G2: the forgetPet tool body (store or legacy pet). */
+  private async forgetPetNow(
+    senderId: string,
+    name: string,
+    reason: string | undefined,
+  ): Promise<
+    | { ok: true; forgotten: true }
+    | { ok: true; forgotten: false; pending: true }
+    | { ok: false; error: string }
+  > {
+    const profiles = this.profiles;
+    const pets = this.pets;
+    // Without the pet store only the legacy single pet exists.
+    if (pets === undefined) {
+      const legacy = profiles?.cached(senderId)?.pet?.name;
+      if (
+        profiles === undefined ||
+        legacy === undefined ||
+        foldPetName(legacy) !== foldPetName(name)
+      )
+        return toolError('no_pet_with_that_name');
+      return (await profiles.clearPet(senderId))
+        ? { ok: true as const, forgotten: true as const }
+        : toolError('pet_memory_unavailable');
+    }
+    // T4b-fix A2: the pets of this turn are not loaded; no writes.
+    if (this.petsOverBudget.has(senderId))
+      return toolError('pet_memory_unavailable');
+    // Same budget as rememberPetDetails (D1); past it the archive goes
+    // on in the background and the tool says it is pending.
+    const forget = (async () => pets.forgetPet(senderId, name, reason))();
+    const outcome = await this.withinPetBudget(
+      forget.then(
+        (value) => ({ failed: false as const, value }),
+        (error: unknown) => ({ failed: true as const, error }),
+      ),
+    );
+    if (outcome === 'over_budget') {
+      this.logger.warn(
+        `customer pets forget pet over budget (${PET_PREPARE_BUDGET_MS} ms): continuing in the background`,
+      );
+      void this.petsInBackground('forget pet', () => forget);
+      return {
+        ok: true as const,
+        forgotten: false as const,
+        pending: true as const,
+      };
+    }
+    if (outcome.failed) throw outcome.error;
+    return forgetPetResult(outcome.value);
   }
 
   /**
@@ -3757,6 +4020,8 @@ export class MinimalCatalogAgentService {
     profileName?: string;
   }): Promise<void> {
     const profiles = this.profiles;
+    // T4c-1-fix N1: a turn that forgot a pet captures no pet facts.
+    const forgotPet = this.petForgetTurns.delete(input.senderId);
     if (profiles === undefined) return;
     const patch: CustomerProfilePatch = {};
     if (input.profileName !== undefined) patch.displayName = input.profileName;
@@ -3771,15 +4036,96 @@ export class MinimalCatalogAgentService {
       const name = explicitPreferredName(input.text);
       if (name !== null) patch.preferredName = name;
       // Deterministic pet capture, in addition to rememberPetDetails; a
-      // different pet is skipped so two pets are never mixed.
+      // different pet is skipped so two pets are never mixed. With the pet
+      // store (T4b) the facts go to the matched pet instead (below).
       const pet = extractPetFacts(input.text);
       if (
+        this.pets === undefined &&
+        !forgotPet &&
         Object.keys(pet).length > 0 &&
-        !petFactsConflict(profiles.cached(input.senderId)?.pet, pet)
+        !petFactsConflict(profiles.cached(input.senderId)?.pet, pet) &&
+        !this.petRecentlyForgotten(input.senderId, pet.name)
       )
         patch.pet = pet;
     }
     await profiles.record(input.senderId, patch);
+    const pets = this.pets;
+    // T4b-fix A3: the capture runs in the background (never delays the
+    // reply; a failure is logged). A2: none after an over-budget prepare.
+    if (
+      pets !== undefined &&
+      input.interactiveReplyId === undefined &&
+      !forgotPet &&
+      !this.petsOverBudget.has(input.senderId)
+    ) {
+      const facts: PetFacts = extractPetFacts(input.text);
+      const legacy = profiles.cached(input.senderId)?.pet;
+      // T4c-1 G1: «<Nombre> es alérgico a X». With the same name as the
+      // statement's pet facts it joins them; else it goes only to a known
+      // pet with that name.
+      const allergy = extractPetAllergy(input.text);
+      const joined =
+        allergy !== null &&
+        facts.name !== undefined &&
+        foldPetName(facts.name) === foldPetName(allergy.name);
+      if (joined) facts.allergies = allergy.allergies;
+      // T4c-1-fix H1: a pet forgotten earlier in the turn (or the window)
+      // is never captured again (with the same name, the allergy neither).
+      if (!this.petRecentlyForgotten(input.senderId, facts.name))
+        void this.petsInBackground('capture', () =>
+          pets.capture(input.senderId, facts, legacy),
+        );
+      if (
+        allergy !== null &&
+        !joined &&
+        !this.petRecentlyForgotten(input.senderId, allergy.name)
+      )
+        void this.petsInBackground('capture', () =>
+          pets.captureAllergy(input.senderId, allergy, legacy),
+        );
+    }
+  }
+
+  /** T4c-1-fix H1: starts (or renews) the window of a forgotten name;
+   *  expired or failed marks of every sender are dropped on the way. I3:
+   *  returns the undo that drops this call's own mark only (another call's
+   *  mark for the same name, earlier or parallel, keeps the window). */
+  private markPetForgotten(senderId: string, name: string): () => void {
+    const now = Date.now();
+    for (const [sender, names] of this.forgottenPets) {
+      for (const [folded, marks] of names) {
+        const live = marks.filter((mark) => !mark.failed && mark.until > now);
+        if (live.length === 0) names.delete(folded);
+        else names.set(folded, live);
+      }
+      if (names.size === 0) this.forgottenPets.delete(sender);
+    }
+    const names =
+      this.forgottenPets.get(senderId) ??
+      new Map<string, Array<{ until: number; failed: boolean }>>();
+    const folded = foldPetName(name);
+    const mark = { until: now + PET_FORGOTTEN_WINDOW_MS, failed: false };
+    names.set(folded, [...(names.get(folded) ?? []), mark]);
+    this.forgottenPets.set(senderId, names);
+    this.petForgetTurns.add(senderId);
+    return () => {
+      mark.failed = true;
+    };
+  }
+
+  /** T4c-1-fix H1: true while `name` has a live (not failed) mark. */
+  private petRecentlyForgotten(
+    senderId: string,
+    name: string | undefined,
+  ): boolean {
+    if (name === undefined) return false;
+    const now = Date.now();
+    return (
+      this.forgottenPets
+        .get(senderId)
+        ?.get(foldPetName(name))
+        ?.some((mark) => !mark.failed && mark.until > now) ?? false
+    );
   }
 
   /** S1: "olvida mis datos" — delete the profile and confirm. */
@@ -3788,6 +4134,14 @@ export class MinimalCatalogAgentService {
     text: string;
   }): Promise<MinimalCatalogAgentDecision> {
     const style = this.customerStyle(input.senderId, input.text);
+    // T4c-1 G3: the backend pets are deleted in the background (bounded by
+    // the pet store, never awaited): started before the profile is
+    // forgotten, the reply never waits for it.
+    const pets = this.pets;
+    if (pets !== undefined)
+      void this.petsInBackground('forget', () =>
+        pets.forgetAll(input.senderId),
+      );
     await this.profiles!.forget(input.senderId);
     this.order?.dismiss(input.senderId);
     const reply = applyCustomerStyle(FORGET_MY_DATA_REPLY, style);

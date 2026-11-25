@@ -16,6 +16,27 @@ import type {
 } from '../domain/chatbot-api.client';
 import type { AttachReceiptTransportOptions } from '../domain/chatbot-api.client';
 import type { ConversationMirrorClient } from '../domain/conversation-mirror.port';
+import type { CustomerPetsClient } from '../domain/customer-pets.port';
+import {
+  PET_IDEMPOTENCY_KEY_MAX_LENGTH,
+  isPetVersion,
+  parseCustomerPetList,
+  parseCustomerPetWrite,
+  toPetBody,
+  type ArchivePetInput,
+  type ArchivePetResult,
+  type CreatePetInput,
+  type CreatePetResult,
+  type DeletePetResult,
+  type ListPetsResult,
+  type PatchPetInput,
+  type PatchPetResult,
+  type PetListStatus,
+  type PetVersionConflict,
+  type PetWriteOk,
+  type RestorePetInput,
+  type RestorePetResult,
+} from '../domain/dtos/customer-pets.dto';
 import type { LiveConversationClient } from '../domain/live-conversation.port';
 import type { SchedulingClient } from '../domain/scheduling.port';
 import {
@@ -144,12 +165,14 @@ import type {
   CancelSaleInput,
   CancelSaleResult,
   CreateSaleInput,
+  OrderHistoryQuery,
   OrderHistoryResponse,
   UpdateDeliveryInput,
 } from '../domain/dtos/sales.dto';
 import {
   CancelSaleInputSchema,
   CreateSaleInputSchema,
+  dropInvalidHistoryLinePets,
   parseOrderHistoryResponse,
 } from '../domain/dtos/sales.dto';
 import {
@@ -284,7 +307,8 @@ export class ChatbotApiHttpClient
     HumanRequestsClient,
     ConversationMirrorClient,
     LiveConversationClient,
-    SchedulingClient
+    SchedulingClient,
+    CustomerPetsClient
 {
   constructor(
     private readonly httpService: HttpService,
@@ -389,11 +413,16 @@ export class ChatbotApiHttpClient
     return parsed.value;
   }
 
-  getCustomerByPhone(
+  /** The body is passed through as before; only `customer.pets` (present
+   *  with `pets:read`, customer-pets contract §2) is parsed. A malformed
+   *  pets array is dropped as absent (never a partial list), so pet logic
+   *  treats the pets as unknown while checkout and lookups keep working;
+   *  absent stays absent. */
+  async getCustomerByPhone(
     cc: string,
     phone: string,
   ): Promise<CustomerLookupResponse> {
-    return this.request<CustomerLookupResponse>(
+    const lookup = await this.request<CustomerLookupResponse>(
       {
         method: 'GET',
         url: '/chatbot-api/customers/by-phone',
@@ -404,6 +433,26 @@ export class ChatbotApiHttpClient
       },
       { retryable: true },
     );
+    const customer = lookup?.customer as
+      | (Record<string, unknown> & CustomerLookupResponse['customer'])
+      | null
+      | undefined;
+    if (
+      typeof customer !== 'object' ||
+      customer === null ||
+      !('pets' in customer)
+    )
+      return lookup;
+    const pets = parseCustomerPetList(customer.pets);
+    if (pets === null) {
+      new Logger(ChatbotApiHttpClient.name).warn(
+        'Chatbot API customer lookup pets were invalid; treating them as absent',
+      );
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { pets: _invalid, ...withoutPets } = customer;
+      return { ...lookup, customer: withoutPets };
+    }
+    return { ...lookup, customer: { ...customer, pets } };
   }
 
   /**
@@ -490,7 +539,7 @@ export class ChatbotApiHttpClient
         'INVALID_CHECKOUT_REQUEST',
       );
     }
-    const data = withoutNullBackorderIds(parsed.data);
+    const data = withoutNullLineIds(parsed.data);
     const response = await this.requestWithResponse<unknown>({
       method: 'POST',
       url: '/chatbot-api/checkouts',
@@ -773,6 +822,7 @@ export class ChatbotApiHttpClient
   async getOrderHistory(
     phone: string,
     cc: string,
+    options: OrderHistoryQuery = {},
   ): Promise<OrderHistoryResponse[]> {
     if (typeof cc !== 'string' || cc.trim() === '') {
       throw new ChatbotApiError(
@@ -788,15 +838,25 @@ export class ChatbotApiHttpClient
         url: `/chatbot-api/customers/by-phone/${encodeURIComponent(phone)}/orders`,
         params: {
           phoneCountryCode: cc,
+          // T4b (L13 b): a blank petId is never sent as `?petId=`.
+          ...(typeof options.petId === 'string' && options.petId.trim() !== ''
+            ? { petId: options.petId }
+            : {}),
         },
       },
       { retryable: true },
     );
+    // T4b (L13 c): a drifted per-line pet degrades to absent (by-phone policy).
+    const { body, dropped } = dropInvalidHistoryLinePets(response.data);
+    if (dropped > 0)
+      new Logger(ChatbotApiHttpClient.name).warn(
+        `Chatbot API order history line pet was invalid; treating it as absent (lines=${dropped})`,
+      );
     return this.acceptTolerantRead(
       'order history',
       response,
       [200],
-      parseOrderHistoryResponse(response.data),
+      parseOrderHistoryResponse(body),
     );
   }
 
@@ -2182,6 +2242,175 @@ export class ChatbotApiHttpClient
     }
   }
 
+  // ------------------------------------------------------- customer pets
+
+  /**
+   * `GET /chatbot-api/customers/:customerId/pets` (customer-pets contract
+   * §2, scope `pets:read`). Safe GET retry policy; `status` is sent only when
+   * given (the backend defaults to ACTIVE). Any invalid pet rejects the list.
+   */
+  async listPets(
+    customerId: string,
+    status?: PetListStatus,
+  ): Promise<ListPetsResult> {
+    let response: AxiosResponse<unknown>;
+    try {
+      response = await this.requestWithResponse<unknown>(
+        {
+          method: 'GET',
+          url: petsUrl(customerId),
+          ...(status === undefined ? {} : { params: { status } }),
+        },
+        { retryable: true },
+      );
+    } catch (error) {
+      const failure = petFailure(error);
+      if (failure === 'FORBIDDEN' || failure === 'CUSTOMER_NOT_FOUND')
+        return { kind: failure };
+      throw error;
+    }
+    const pets =
+      response.status === 200 ? parseCustomerPetList(response.data) : null;
+    if (pets === null) throw invalidPetResponse(response);
+    return { kind: 'ok', pets };
+  }
+
+  /**
+   * `POST …/pets` (§4.1, scope `pets:write`). Exactly one POST with the
+   * trimmed `X-Idempotency-Key`; the body carries only the documented
+   * members, in a fixed order, so a retry under the same key is
+   * byte-identical. `201` is a new pet, `200` the replay of the first one.
+   */
+  async createPet(
+    customerId: string,
+    input: CreatePetInput,
+    idempotencyKey: string,
+  ): Promise<CreatePetResult> {
+    const key = typeof idempotencyKey === 'string' ? idempotencyKey.trim() : '';
+    if (key === '' || key.length > PET_IDEMPOTENCY_KEY_MAX_LENGTH)
+      return { kind: 'INVALID_IDEMPOTENCY_KEY' };
+    let response: AxiosResponse<unknown>;
+    try {
+      response = await this.requestWithResponse<unknown>({
+        method: 'POST',
+        url: petsUrl(customerId),
+        data: toPetBody(input, {}, 'create'),
+        headers: { 'X-Idempotency-Key': key },
+      });
+    } catch (error) {
+      const failure = petFailure(error);
+      switch (failure) {
+        case 'FORBIDDEN':
+        case 'CUSTOMER_NOT_FOUND':
+        case 'PET_LIMIT_REACHED':
+        case 'IDEMPOTENCY_KEY_CONFLICT':
+        case 'IDEMPOTENCY_KEY_IN_FLIGHT':
+        case 'INVALID_IDEMPOTENCY_KEY':
+          return { kind: failure };
+        default:
+          throw error;
+      }
+    }
+    const ok = acceptPetWrite(response, [200, 201]);
+    return { ...ok, created: response.status === 201 };
+  }
+
+  /** `PATCH …/pets/:petId` (§4.2, scope `pets:write`): `version` first,
+   *  then only the members given (absent = unchanged, `null` clears). */
+  async patchPet(
+    customerId: string,
+    petId: string,
+    input: PatchPetInput,
+  ): Promise<PatchPetResult> {
+    assertPetVersion(input?.version);
+    return this.petVersionedWrite(
+      {
+        method: 'PATCH',
+        url: petUrl(customerId, petId),
+        data: toPetBody(input, { version: input.version }),
+      },
+      ['PET_ARCHIVED'],
+    );
+  }
+
+  /** `POST …/pets/:petId/archive` (§4.3, scope `pets:write`). */
+  async archivePet(
+    customerId: string,
+    petId: string,
+    input: ArchivePetInput,
+  ): Promise<ArchivePetResult> {
+    assertPetVersion(input?.version);
+    return this.petVersionedWrite(
+      {
+        method: 'POST',
+        url: `${petUrl(customerId, petId)}/archive`,
+        data: {
+          version: input.version,
+          ...(input.reason === undefined ? {} : { reason: input.reason }),
+        },
+      },
+      ['PET_ARCHIVED'],
+    );
+  }
+
+  /** `POST …/pets/:petId/restore` (§4.4, scope `pets:write`). */
+  async restorePet(
+    customerId: string,
+    petId: string,
+    input: RestorePetInput,
+  ): Promise<RestorePetResult> {
+    assertPetVersion(input?.version);
+    return this.petVersionedWrite(
+      {
+        method: 'POST',
+        url: `${petUrl(customerId, petId)}/restore`,
+        data: { version: input.version },
+      },
+      ['PET_NOT_ARCHIVED', 'PET_LIMIT_REACHED'],
+    );
+  }
+
+  /** `DELETE …/pets/:petId?version=N` (§4.5, scope `pets:delete`): the
+   *  version is a query parameter, no body; only `204` resolves `ok`. */
+  async deletePet(
+    customerId: string,
+    petId: string,
+    version: number,
+  ): Promise<DeletePetResult> {
+    assertPetVersion(version);
+    let response: AxiosResponse<unknown>;
+    try {
+      response = await this.requestWithResponse<unknown>({
+        method: 'DELETE',
+        url: petUrl(customerId, petId),
+        params: { version },
+      });
+    } catch (error) {
+      const handled = versionedPetFailure(error, []);
+      if (handled === null) throw error;
+      return handled as DeletePetResult;
+    }
+    if (response.status !== 204) throw invalidPetResponse(response);
+    return { kind: 'ok' };
+  }
+
+  /** PATCH/archive/restore: one attempt (not keyed), the complete pet plus
+   *  `warnings` on `200`, documented codes as typed results. */
+  private async petVersionedWrite<R>(
+    config: AxiosRequestConfig,
+    extraKinds: readonly PetWriteKind[],
+  ): Promise<R> {
+    let response: AxiosResponse<unknown>;
+    try {
+      response = await this.requestWithResponse<unknown>(config);
+    } catch (error) {
+      const handled = versionedPetFailure(error, extraKinds);
+      if (handled === null) throw error;
+      return handled as R;
+    }
+    return acceptPetWrite(response, [200]) as R;
+  }
+
   /**
    * One POST for the unit 9 routes, never retried here. Failures are reduced
    * to status / backend code / Retry-After / transport cause: the axios error
@@ -2430,20 +2659,23 @@ export class ChatbotApiHttpClient
   }
 }
 
-/** Restock backorder T3: `backorderId: null` means "omitted"; the member is
- *  sent only when present, so every other request stays byte-identical. */
-function withoutNullBackorderIds(
-  input: CreateCheckoutInput,
-): CreateCheckoutInput {
-  if (input.sale.items.every((item) => item.backorderId !== null)) return input;
+/** Restock backorder T3 `backorderId` and customer-pets §5 `petId`: `null`
+ *  means "omitted"; each member is sent only when present, so every other
+ *  request (and its idempotency hash) stays byte-identical. */
+function withoutNullLineIds(input: CreateCheckoutInput): CreateCheckoutInput {
+  const present = (item: CreateCheckoutInput['sale']['items'][number]) =>
+    !('backorderId' in item && item.backorderId == null) &&
+    !('petId' in item && item.petId == null);
+  if (input.sale.items.every(present)) return input;
   return {
     ...input,
     sale: {
       ...input.sale,
       items: input.sale.items.map((item) => {
-        if (item.backorderId !== null) return item;
-        const { backorderId: omitted, ...rest } = item;
-        void omitted;
+        if (present(item)) return item;
+        const rest = { ...item };
+        if (rest.backorderId == null) delete rest.backorderId;
+        if (rest.petId == null) delete rest.petId;
         return rest;
       }),
     },
@@ -2630,6 +2862,124 @@ function classifyMirrorFailure(
       retryAfterSeconds: failure.retryAfterSeconds,
     };
   return { kind: 'UNEXPECTED', status, code };
+}
+
+/* ---------------------------------------------------- customer pets helpers */
+
+/** Documented customer-pets error codes (contract §9) the bot branches on. */
+const PET_ERROR_CODES = [
+  'CUSTOMER_NOT_FOUND',
+  'PET_NOT_FOUND',
+  'PET_VERSION_CONFLICT',
+  'PET_ARCHIVED',
+  'PET_NOT_ARCHIVED',
+  'PET_LIMIT_REACHED',
+  'IDEMPOTENCY_KEY_CONFLICT',
+  'IDEMPOTENCY_KEY_IN_FLIGHT',
+  'INVALID_IDEMPOTENCY_KEY',
+] as const;
+type PetErrorCode = (typeof PET_ERROR_CODES)[number];
+type PetWriteKind = 'PET_ARCHIVED' | 'PET_NOT_ARCHIVED' | 'PET_LIMIT_REACHED';
+
+/** Status each documented code must come with; another status is not it. */
+const PET_ERROR_STATUS: Record<PetErrorCode, number> = {
+  CUSTOMER_NOT_FOUND: 404,
+  PET_NOT_FOUND: 404,
+  PET_VERSION_CONFLICT: 409,
+  PET_ARCHIVED: 422,
+  PET_NOT_ARCHIVED: 422,
+  PET_LIMIT_REACHED: 422,
+  IDEMPOTENCY_KEY_CONFLICT: 409,
+  IDEMPOTENCY_KEY_IN_FLIGHT: 409,
+  INVALID_IDEMPOTENCY_KEY: 400,
+};
+
+function petsUrl(customerId: string): string {
+  return `/chatbot-api/customers/${encodeURIComponent(customerId)}/pets`;
+}
+
+function petUrl(customerId: string, petId: string): string {
+  return `${petsUrl(customerId)}/${encodeURIComponent(petId)}`;
+}
+
+/** A local contract violation: never sent (the backend would answer 400). */
+function assertPetVersion(version: unknown): void {
+  if (!isPetVersion(version))
+    throw new ChatbotApiError(
+      'Customer pet version must be an integer >= 1',
+      null,
+      undefined,
+      null,
+    );
+}
+
+/**
+ * The documented reading of a failed pet request: `FORBIDDEN` for a `403`
+ * (missing `pets:*` scope), the §9 code when it comes with its status, or
+ * `null` (transport, 401, 429, 5xx, validation, an undocumented code).
+ */
+function petFailure(error: unknown): PetErrorCode | 'FORBIDDEN' | null {
+  const failure = documentedFailure(error);
+  if (failure === null) return null;
+  if (failure.status === 403) return 'FORBIDDEN';
+  const code = failure.code as PetErrorCode | null;
+  return code !== null &&
+    (PET_ERROR_CODES as readonly string[]).includes(code) &&
+    PET_ERROR_STATUS[code] === failure.status
+    ? code
+    : null;
+}
+
+/** PATCH/archive/restore/DELETE failures shared by every versioned write. */
+function versionedPetFailure(
+  error: unknown,
+  extraKinds: readonly PetWriteKind[],
+):
+  | { kind: 'FORBIDDEN' | 'CUSTOMER_NOT_FOUND' | 'PET_NOT_FOUND' }
+  | { kind: PetWriteKind }
+  | PetVersionConflict
+  | null {
+  const failure = petFailure(error);
+  if (
+    failure === 'FORBIDDEN' ||
+    failure === 'CUSTOMER_NOT_FOUND' ||
+    failure === 'PET_NOT_FOUND'
+  )
+    return { kind: failure };
+  if (failure === 'PET_VERSION_CONFLICT') {
+    const current = numberField(
+      (error as ChatbotApiError).responseBody,
+      'currentVersion',
+    );
+    return {
+      kind: failure,
+      currentVersion: isPetVersion(current) ? current : null,
+    };
+  }
+  if (failure !== null && (extraKinds as readonly string[]).includes(failure))
+    return { kind: failure as PetWriteKind };
+  return null;
+}
+
+/** A write answer: the complete pet plus `warnings`, or `UpstreamError`. */
+function acceptPetWrite(
+  response: AxiosResponse<unknown>,
+  statuses: number[],
+): PetWriteOk {
+  const parsed = statuses.includes(response.status)
+    ? parseCustomerPetWrite(response.data)
+    : null;
+  if (parsed === null) throw invalidPetResponse(response);
+  return { kind: 'ok', ...parsed };
+}
+
+function invalidPetResponse(response: AxiosResponse<unknown>): UpstreamError {
+  return new UpstreamError(
+    'Chatbot API customer pet response was invalid',
+    response.status,
+    response.data,
+    extractErrorCode(response.data),
+  );
 }
 
 /** Module-level flag so the legacy-omission warning logs at most once. */

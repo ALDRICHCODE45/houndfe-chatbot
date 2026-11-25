@@ -1,3 +1,5 @@
+import type { CustomerPet } from './customer-pets.dto';
+
 export interface CustomerDeliveryAddressResponse {
   id: string;
   label: string | null;
@@ -21,6 +23,10 @@ export interface CustomerProfileResponse {
   phone: string | null;
   preferredPaymentMethod: string | null;
   address: CustomerDeliveryAddressResponse | null;
+  /** ACTIVE pets, sorted by name (customer-pets contract §2). Only in the
+   *  by-phone lookup, and only when the credential has `pets:read`: absent
+   *  (not `[]`) otherwise. */
+  pets?: CustomerPet[];
 }
 
 export interface CustomerLookupResponse {

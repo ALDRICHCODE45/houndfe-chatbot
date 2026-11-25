@@ -119,7 +119,11 @@ describe('S1 dispatcher wiring', () => {
       event([{ wa_id: SENDER, profile: { name: 'Ana' } }]),
     );
     expect(order).toEqual(['prepare', 'turn']);
-    expect(agent.prepareCustomer).toHaveBeenCalledWith(SENDER);
+    // T4b-fix-2 D2: a warm-up (the pets prepare is not waited for here;
+    // the turn pays the single pet budget).
+    expect(agent.prepareCustomer.mock.calls).toEqual([
+      [SENDER, { warmUp: true }],
+    ]);
     expect(agent.tryHandle).toHaveBeenCalledWith(
       expect.objectContaining({ senderId: SENDER, profileName: 'Ana' }),
     );

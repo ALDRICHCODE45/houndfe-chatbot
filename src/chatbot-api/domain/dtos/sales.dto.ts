@@ -136,6 +136,11 @@ export interface UpdateDeliveryInput {
   estimatedDeliveryAt?: string | null;
 }
 
+export interface OrderHistoryQuery {
+  /** Customer-pets contract §6 `?petId=`; omitted when unset. */
+  petId?: string;
+}
+
 export interface OrderHistoryResponse {
   saleId: string;
   folio: string | null;
@@ -153,6 +158,11 @@ export interface OrderHistoryResponse {
     variantName: string | null;
     quantity: number;
     unitPriceCents: number;
+    /** Customer-pets contract §6: the line's pet snapshot. Absent before the
+     *  backend's pets deploy; `null` for no pet, old lines and really deleted
+     *  pets; `id`/`status` `null` when only the snapshot remains (its
+     *  customer was deleted). */
+    pet?: OrderHistoryLinePet | null;
   }>;
   payments: Array<{
     method: string;
@@ -165,9 +175,41 @@ export interface OrderHistoryResponse {
   } | null;
 }
 
+/** `status` is the pet's CURRENT status; the rest is the frozen snapshot. */
+export type OrderHistoryLinePet =
+  | {
+      id: string;
+      name: string;
+      species: 'DOG' | 'CAT' | 'OTHER';
+      status: 'ACTIVE' | 'ARCHIVED';
+    }
+  | {
+      id: null;
+      name: string;
+      species: 'DOG' | 'CAT' | 'OTHER';
+      status: null;
+    };
+
 /* ---- Runtime parser (tolerant read: unknown keys stripped, see tolerant-read.ts) ---- */
 
 const historyCents = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+
+const historyPetSpecies = z.enum(['DOG', 'CAT', 'OTHER']);
+/** Never an object of nulls: a pet-less line is `null`. */
+const historyLinePet = z.union([
+  z.object({
+    id: z.string().min(1),
+    name: z.string(),
+    species: historyPetSpecies,
+    status: z.enum(['ACTIVE', 'ARCHIVED']),
+  }),
+  z.object({
+    id: z.null(),
+    name: z.string(),
+    species: historyPetSpecies,
+    status: z.null(),
+  }),
+]);
 
 const orderHistorySchema = z.array(
   z.object({
@@ -188,6 +230,7 @@ const orderHistorySchema = z.array(
         variantName: z.string().nullable(),
         quantity: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
         unitPriceCents: historyCents,
+        pet: historyLinePet.nullable().optional(),
       }),
     ),
     payments: z.array(
@@ -205,6 +248,39 @@ const orderHistorySchema = z.array(
       .nullable(),
   }),
 );
+
+/**
+ * T4b (L13 c): a per-line `pet` that fails its contract is removed (the line
+ * reads as pet-less) instead of failing the whole history — the same policy
+ * as `customer.pets` on by-phone. Returns a copy and how many were dropped;
+ * anything that is not the documented array shape is returned untouched (the
+ * parser then rejects it as before).
+ */
+export function dropInvalidHistoryLinePets(body: unknown): {
+  body: unknown;
+  dropped: number;
+} {
+  if (!Array.isArray(body)) return { body, dropped: 0 };
+  let dropped = 0;
+  const next = body.map((order: unknown) => {
+    if (typeof order !== 'object' || order === null) return order;
+    const items = (order as { items?: unknown }).items;
+    if (!Array.isArray(items)) return order;
+    return {
+      ...order,
+      items: items.map((item: unknown) => {
+        if (typeof item !== 'object' || item === null || !('pet' in item))
+          return item;
+        const { pet, ...rest } = item;
+        if (historyLinePet.nullable().optional().safeParse(pet).success)
+          return item;
+        dropped += 1;
+        return rest;
+      }),
+    };
+  });
+  return { body: dropped === 0 ? body : next, dropped };
+}
 
 /** `GET /chatbot-api/customers/by-phone/:phone/orders`; null on contract breaks.
  *  Names and unit prices are historical: never a price for a new sale. */

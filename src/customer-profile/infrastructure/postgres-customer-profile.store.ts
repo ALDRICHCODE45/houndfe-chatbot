@@ -132,6 +132,17 @@ export class PostgresCustomerProfileStore implements CustomerProfileStore {
     return row === undefined ? null : toProfile(row);
   }
 
+  /** T4c-1 G2: only `pet` (and `updated_at`); the local `pets` list and
+   *  every other column stay. */
+  async clearPet(senderId: string, now: Date): Promise<boolean> {
+    if (!isValidProfileSenderId(senderId)) return false;
+    const result = await this.pool.query(
+      'UPDATE customer_profiles SET pet = NULL, updated_at = $2 WHERE sender_id = $1 AND pet IS NOT NULL',
+      [senderId, now.toISOString()],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
   async delete(senderId: string): Promise<boolean> {
     if (!isValidProfileSenderId(senderId)) return false;
     const result = await this.pool.query(

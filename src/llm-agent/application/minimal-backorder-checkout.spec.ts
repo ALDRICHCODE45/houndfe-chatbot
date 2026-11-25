@@ -472,7 +472,10 @@ describe('checkout refusals of a backorder line (contract §7)', () => {
   beforeEach(() => {
     warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
   });
-  afterEach(() => jest.restoreAllMocks());
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
 
   const refuse = async (
     h: Harness,
@@ -768,6 +771,23 @@ describe('checkout refusals of a backorder line (contract §7)', () => {
   });
 
   it('with two backorder lines only the one the backend no longer honours leaves the cart', async () => {
+    // The fixtures reserve until BO_UNTIL (2026-11-21); pin only Date so the
+    // still-reserved line stays reserved whatever day the suite runs.
+    jest.useFakeTimers({
+      now: Date.parse('2026-11-20T15:00:00.000Z'),
+      doNotFake: [
+        'nextTick',
+        'setImmediate',
+        'clearImmediate',
+        'setTimeout',
+        'clearTimeout',
+        'setInterval',
+        'clearInterval',
+        'queueMicrotask',
+        'hrtime',
+        'performance',
+      ],
+    });
     const h = setup();
     const second = backorderCartLine({
       id: BO_ID_2,

@@ -1,3 +1,4 @@
+import { normalizeLocalPets, type LocalPet } from '../domain/customer-pets';
 import {
   isEmptyProfilePatch,
   isValidProfileSenderId,
@@ -15,6 +16,8 @@ import {
  */
 export class InMemoryCustomerProfileStore implements CustomerProfileStore {
   private readonly profiles = new Map<string, CustomerProfile>();
+  /** T4b: the `pets` column of the same rows (see InMemoryLocalPetStore). */
+  private readonly localPets = new Map<string, LocalPet[]>();
 
   read(senderId: string): Promise<CustomerProfile | null> {
     const profile = this.profiles.get(senderId);
@@ -41,6 +44,39 @@ export class InMemoryCustomerProfileStore implements CustomerProfileStore {
   }
 
   delete(senderId: string): Promise<boolean> {
+    this.localPets.delete(senderId);
     return Promise.resolve(this.profiles.delete(senderId));
+  }
+
+  clearPet(senderId: string, now: Date): Promise<boolean> {
+    const profile = this.profiles.get(senderId);
+    if (profile?.pet === undefined) return Promise.resolve(false);
+    const next = { ...profile, updatedAt: now.toISOString() };
+    delete next.pet;
+    this.profiles.set(senderId, next);
+    return Promise.resolve(true);
+  }
+
+  readLocalPets(senderId: string): LocalPet[] {
+    if (!this.profiles.has(senderId)) return [];
+    return normalizeLocalPets(
+      structuredClone(this.localPets.get(senderId) ?? []),
+    );
+  }
+
+  /** Replace semantics; an empty list never creates a profile row. */
+  writeLocalPets(senderId: string, pets: LocalPet[], now: Date): void {
+    if (!isValidProfileSenderId(senderId)) return;
+    const existing = this.profiles.get(senderId) ?? null;
+    if (pets.length === 0) {
+      this.localPets.delete(senderId);
+      return;
+    }
+    if (existing === null)
+      this.profiles.set(
+        senderId,
+        mergeCustomerProfile(senderId, null, {}, now),
+      );
+    this.localPets.set(senderId, structuredClone(pets));
   }
 }

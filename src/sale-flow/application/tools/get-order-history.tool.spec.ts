@@ -101,4 +101,52 @@ describe('makeGetOrderHistoryTool', () => {
       error: { kind: 'upstream', retryable: true },
     });
   });
+
+  it('T4a: keeps the tool output unchanged when order lines carry a pet (per-pet history is T5)', async () => {
+    const line = {
+      productId: 'p1',
+      variantId: null,
+      productName: 'Croquetas',
+      variantName: null,
+      quantity: 1,
+      unitPriceCents: 1000,
+    };
+    const order = {
+      saleId: 'sale-1',
+      folio: null,
+      confirmedAt: null,
+      channel: 'ONLINE',
+      deliveryStatus: 'PENDING',
+      paymentStatus: 'CREDIT',
+      totalCents: 2000,
+      paidCents: 0,
+      debtCents: 2000,
+      payments: [],
+      shippingAddress: null,
+    };
+    const getOrderHistory = jest.fn().mockResolvedValue([
+      {
+        ...order,
+        items: [
+          {
+            ...line,
+            pet: { id: 'x', name: 'Bruno', species: 'DOG', status: 'ACTIVE' },
+          },
+          { ...line, pet: null },
+        ],
+      },
+    ]);
+    const tool = makeGetOrderHistoryTool({
+      ...baseDeps,
+      chatbotApi: { getOrderHistory } as unknown as ChatbotApiClient,
+    });
+    const result = await tool.execute(
+      { phone: '5550001111', phoneCountryCode: '+52' },
+      { toolCallId: 't', messages: [], context: {} },
+    );
+    expect(result).toEqual({
+      ok: true,
+      results: [{ ...order, items: [line, line] }],
+    });
+  });
 });

@@ -54,6 +54,21 @@ describe('PostgresCustomerProfileStore SQL (no database)', () => {
     expect(params).toContain(JSON.stringify({ name: 'Luna' }));
   });
 
+  it('clears the legacy pet in one UPDATE that touches only pet and updated_at (T4c-1 G2)', async () => {
+    const { pool, store } = fake([[{}]]);
+    await expect(
+      store.clearPet(SENDER, new Date('2026-11-24T00:00:00.000Z')),
+    ).resolves.toBe(true);
+    expect(pool.calls).toEqual([
+      {
+        sql: 'UPDATE customer_profiles SET pet = NULL, updated_at = $2 WHERE sender_id = $1 AND pet IS NOT NULL',
+        params: [SENDER, '2026-11-24T00:00:00.000Z'],
+      },
+    ]);
+    await expect(store.clearPet('sender-1', new Date())).resolves.toBe(false);
+    expect(pool.calls).toHaveLength(1);
+  });
+
   it('never queries for an invalid sender or an empty first patch', async () => {
     const { pool, store } = fake();
     await expect(
@@ -145,6 +160,8 @@ ddescribe('customer_profiles migration 3700 + store (real PostgreSQL)', () => {
       'last_order_folio',
       'last_order_total_cents',
       'pet',
+      // T4b (migration 5700): the prospect's local pet list.
+      'pets',
       'preferred_name',
       'register',
       'sender_id',
