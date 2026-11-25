@@ -193,6 +193,8 @@ describe('extractPetAllergy (T4c-1 G1)', () => {
     ['que es alérgico al pollo', null],
     ['yo soy alérgico al pollo', null],
     ['croquetas sin pollo', null],
+    // Owners often call a pet «mi bebé»: not a person word.
+    ['mi bebé Max es alérgico al pollo', { name: 'Max', allergies: 'pollo' }],
   ])('%s', (text, expected) => {
     expect(extractPetAllergy(text)).toEqual(expected);
   });

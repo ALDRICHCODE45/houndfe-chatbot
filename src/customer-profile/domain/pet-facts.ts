@@ -291,7 +291,7 @@ const ALLERGY = new RegExp(
 const PET_WORD_ONLY = new RegExp(`^(?:${PET_WORD})$`, 'iu');
 /** H2: a person word right before the name (folded): «mi esposo Max». */
 const PERSON_BEFORE =
-  /(?:^|[^\p{L}])(?:espos[oa]|marido|mujer|hij[oa]|mama|papa|herman[oa]|novi[oa]|abuel[oa]|ti[oa]|prim[oa]|amig[oa]|suegr[oa]|sobrin[oa]|bebe)s?\s+$/u;
+  /(?:^|[^\p{L}])(?:espos[oa]|marido|mujer|hij[oa]|mama|papa|herman[oa]|novi[oa]|abuel[oa]|ti[oa]|prim[oa]|amig[oa]|suegr[oa]|sobrin[oa])s?\s+$/u;
 /** H2: where the allergy clause ends («… pero …», «… y quiero …»). */
 const CLAUSE_JOINER =
   /\s(?:pero|porque|y\s+(?:quiero|le|me|necesito|busco|quisiera))(?!\p{L})/iu;
