@@ -4,6 +4,7 @@ import {
   DurablePetChoice,
   MINIMAL_PET_CHOICE_TTL_MS,
   matchPetChoiceAnswer,
+  PET_CHOICE_OPTIONS_MAX,
   type PetChoice,
 } from './pet-choice.gate';
 
@@ -139,5 +140,76 @@ describe('typed answer to the which-pet question (T4c-2a P3)', () => {
         'other',
       ),
     ).toBeNull();
+  });
+});
+
+describe('pet choice options (T4c-2a-fix J4)', () => {
+  it('a row written by 5ab9410 (options without `matchable`) still loads and answers', async () => {
+    const w = world();
+    await w.store.put({
+      senderId: SENDER,
+      kind: 'pet_choice',
+      payload: {
+        purpose: 'request',
+        options: [
+          { ref: MAX, text: 'Max' },
+          { ref: BRUNO, text: 'Bruno' },
+        ],
+        request: 'busco croquetas',
+      },
+      expiresAt: new Date(T0 + 60_000),
+    });
+    const restarted = w.boot();
+    await restarted.gates.begin(SENDER);
+    const live = restarted.choices.read(SENDER);
+    expect(live).toEqual(CHOICE);
+    expect(matchPetChoiceAnswer('Max', live!.options, 'other')?.ref).toBe(MAX);
+  });
+
+  it('a nameless option keeps its display text across a restart but never matches a typed answer', async () => {
+    const w = world();
+    const first = w.boot();
+    const choice: PetChoice = {
+      ...CHOICE,
+      options: [
+        ...CHOICE.options,
+        { ref: 'legacy', text: 'Siamés', matchable: false },
+      ],
+    };
+    first.choices.ask(SENDER, choice);
+    first.gates.touch(SENDER);
+    await first.gates.settle(SENDER);
+    const restarted = w.boot();
+    await restarted.gates.begin(SENDER);
+    const live = restarted.choices.read(SENDER);
+    expect(live).toEqual(choice);
+    expect(matchPetChoiceAnswer('siames', live!.options, 'other')).toBeNull();
+    expect(
+      matchPetChoiceAnswer('para el siamés', live!.options, 'other'),
+    ).toBeNull();
+  });
+
+  it('the options cap is the exported PET_CHOICE_OPTIONS_MAX', async () => {
+    expect(PET_CHOICE_OPTIONS_MAX).toBe(50);
+    const w = world();
+    const options = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        ref: `local:p${i}`,
+        text: `P${i}`,
+      }));
+    for (const [n, kept] of [
+      [PET_CHOICE_OPTIONS_MAX, true],
+      [PET_CHOICE_OPTIONS_MAX + 1, false],
+    ] as const) {
+      await w.store.put({
+        senderId: SENDER,
+        kind: 'pet_choice',
+        payload: { purpose: 'request', options: options(n), request: 'x' },
+        expiresAt: new Date(T0 + 60_000),
+      });
+      const restarted = w.boot();
+      await restarted.gates.begin(SENDER);
+      expect(restarted.choices.read(SENDER) !== null).toBe(kept);
+    }
   });
 });

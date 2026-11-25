@@ -385,6 +385,26 @@ export class CustomerPetsService {
   }
 
   /**
+   * T4c-2a-fix J1: true when this process holds the sender's pet list as
+   * read from its stores (backend pets of a Customer, or a prospect's local
+   * list, with the local list known and the profile loaded), so a pet absent
+   * from `knownPets` is really gone. False when it is unknown: not loaded
+   * yet (a restart, a prepare still running), lookup unavailable, a Customer
+   * without `pets` (read-only scope), a local list unknown, or forgotten.
+   * Like `knownPets` it only reads the cache, which only fenced tasks update.
+   */
+  petsLoaded(senderId: string): boolean {
+    if (this.profiles.isForgotten(senderId)) return false;
+    if (!this.profiles.isLoaded(senderId)) return false;
+    const state = this.cache.get(senderId);
+    return (
+      state !== undefined &&
+      state.localKnown &&
+      (state.scope.kind === 'customer' || state.scope.kind === 'prospect')
+    );
+  }
+
+  /**
    * T4c-2a (S12): the same pets as `knownPets`, newest first (backend and
    * local `createdAt`); the legacy pet, which has no date, goes last.
    */

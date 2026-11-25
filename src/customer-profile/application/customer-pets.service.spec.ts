@@ -2985,6 +2985,38 @@ describe('CustomerPetsService (T4c-1)', () => {
       ).toBeNull();
     });
 
+    it('T4c-2a-fix J1: petsLoaded tells a loaded pet list from an unknown one', async () => {
+      const h = harness(found([backend()]));
+      await h.profiles.load(SENDER);
+      // Not loaded yet (a restart, a prepare still running).
+      expect(h.service.petsLoaded(SENDER)).toBe(false);
+      await h.service.prepare(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(true);
+      // Lookup unavailable: unknown.
+      h.setLookup(new Error('down'));
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(false);
+      // A Customer without `pets` (read-only scope): unknown.
+      h.setLookup(found());
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(false);
+      // A prospect's local list is a loaded list.
+      h.setLookup(notFound);
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(true);
+      await h.profiles.forget(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(false);
+    });
+
+    it('T4c-2a-fix J1: petsLoaded is false while the profile is not loaded', async () => {
+      const h = harness(found([backend()]));
+      await h.service.prepare(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(false);
+    });
+
     it('knownPets is empty when unknown or forgotten', async () => {
       const h = harness(found([backend()]));
       expect(h.service.knownPets(SENDER)).toEqual([]);

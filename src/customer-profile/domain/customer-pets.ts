@@ -728,6 +728,18 @@ export function chosenPetPromptLine(view: PetPromptView): string {
 }
 
 /**
+ * T4c-2a-fix J1: the «Mascota de este pedido» line when this turn's pets are
+ * not loaded: only the text the question offered (the pet's name, or the
+ * kind of a nameless pet), no store facts.
+ */
+export function chosenPetOptionPromptLine(text: string): string {
+  return (
+    `Mascota de este pedido (la eligió el cliente): ${JSON.stringify(text)} (sus datos no están disponibles en este turno).` +
+    ' Continúe la solicitud del cliente para esta mascota; no vuelva a preguntar para cuál es.'
+  );
+}
+
+/**
  * The pet part of the system prompt: one «Mascota conocida» line per known
  * ACTIVE pet. One pet keeps today's single line (search directly); 2+ pets
  * add the instruction not to assume which pet; any allergy adds the S5

@@ -58,6 +58,7 @@ import {
   type ForgetPetOutcome,
 } from '../../customer-profile/application/customer-pets.service';
 import {
+  chosenPetOptionPromptLine,
   foldPetName,
   type PetFacts,
 } from '../../customer-profile/domain/customer-pets';
@@ -91,6 +92,7 @@ import {
   INTERACTIVE_LIMITS,
   parseInteractiveReplyId,
   PET_CHOICE_OTHER_REF,
+  petChoiceOptions,
   petChoicePick,
   productImageCaption,
   reorderConfirmationButtons,
@@ -177,8 +179,10 @@ import { DurablePaymentOffer } from './gates/payment-offer.gate';
 import {
   DurablePetChoice,
   matchPetChoiceAnswer,
+  PET_CHOICE_OPTIONS_MAX,
   PET_CHOICE_REQUEST_MAX_CHARS,
   type PetChoice,
+  type PetChoiceOption,
 } from './gates/pet-choice.gate';
 import { statedPurchaseCount } from './backorder-quantity';
 import { MinimalBackorderManageService } from './minimal-backorder-manage.service';
@@ -3981,15 +3985,20 @@ export class MinimalCatalogAgentService {
             return Promise.resolve(toolError('pet_choice_settled'));
           run.attempted = true;
           const known = pets.knownPets(input.senderId);
+          // J4: one error code per reason.
+          if (known.length < 2)
+            return Promise.resolve(toolError('fewer_than_two_pets'));
+          const request = input.text.slice(0, PET_CHOICE_REQUEST_MAX_CHARS);
+          if (request.trim() === '')
+            return Promise.resolve(toolError('blank_request'));
           // S12: past the list cap, the most recent pets are shown.
           const shown =
             known.length > INTERACTIVE_LIMITS.rows
               ? pets.knownPetsByRecency(input.senderId)
               : known;
           const pick = petChoicePick(shown, styled(PET_CHOICE_QUESTION));
-          const request = input.text.slice(0, PET_CHOICE_REQUEST_MAX_CHARS);
-          if (pick === null || request.trim() === '')
-            return Promise.resolve(toolError('fewer_than_two_pets'));
+          if (pick === null)
+            return Promise.resolve(toolError('no_valid_options'));
           run.value = {
             interactive: pick.interactive,
             choice: { purpose: 'request', options: pick.options, request },
@@ -4008,10 +4017,40 @@ export class MinimalCatalogAgentService {
   }
 
   /**
+   * T4c-2a-fix J1: whether this turn's pet list is loaded, so a pet absent
+   * from it is really gone. Not on a turn whose prepare ran over budget, nor
+   * while the store holds no current list (restart, lookup unavailable,
+   * read-only scope).
+   */
+  private petListLoaded(senderId: string): boolean {
+    return (
+      this.pets !== undefined &&
+      !this.petsOverBudget.has(senderId) &&
+      this.pets.petsLoaded(senderId)
+    );
+  }
+
+  /**
+   * T4c-2a-fix J1: the «Mascota de este pedido» line for an offered option:
+   * with the pet list loaded, the store facts of that pet (`null` when it is
+   * gone: the answer is stale); with the list unknown, the option's own text
+   * (never stale: the request is not lost).
+   */
+  private chosenPetLine(
+    senderId: string,
+    option: PetChoiceOption,
+  ): string | null {
+    if (!this.petListLoaded(senderId))
+      return chosenPetOptionPromptLine(option.text);
+    return this.pets?.chosenPetPromptLine(senderId, option.ref) ?? null;
+  }
+
+  /**
    * T4c-2a P3: a tapped pet of the which-pet question. Honoured only while
-   * the question is live, offered that ref and the pet is still known (else
-   * the stale-button reply); «Otra mascota» asks the name; a pet continues
-   * the original request with it as the turn's pet context.
+   * the question is live and offered that ref; a loaded pet list without
+   * that pet makes it stale (J1: with the list unknown it is answered from
+   * the offered option). «Otra mascota» asks the name; a pet continues the
+   * original request with it as the turn's pet context.
    */
   private async answerPetChoiceTap(
     input: {
@@ -4040,19 +4079,29 @@ export class MinimalCatalogAgentService {
       return this.decision({ reply: styledText });
     };
     const live = this.petChoices?.read(senderId) ?? null;
-    if (live === null || !live.options.some((option) => option.ref === ref))
+    const option = live?.options.find((candidate) => candidate.ref === ref);
+    if (live === null || option === undefined)
       return reply(STALE_BUTTON_FALLBACK);
     if (ref === PET_CHOICE_OTHER_REF) {
-      // S12: the name is typed next; every known pet's name answers it.
-      const options = (this.pets?.knownPets(senderId) ?? [])
-        .filter((pet) => pet.name !== undefined)
-        .slice(0, 50)
-        .map((pet) => ({ ref: pet.ref, text: pet.name! }));
+      // S12: the name is typed next; every known pet's name answers it (J4:
+      // same option builder; J1: with the list unknown, the pets the
+      // question offered).
+      const offered = this.petListLoaded(senderId)
+        ? petChoiceOptions(
+            this.pets?.knownPets(senderId) ?? [],
+            PET_CHOICE_OPTIONS_MAX,
+          )
+        : live.options;
+      const options = offered.filter(
+        (candidate) =>
+          candidate.ref !== PET_CHOICE_OTHER_REF &&
+          candidate.matchable !== false,
+      );
       return options.length === 0
         ? reply(STALE_BUTTON_FALLBACK)
         : reply(PET_CHOICE_NAME_REPLY, { ...live, options });
     }
-    const line = this.pets?.chosenPetPromptLine(senderId, ref) ?? null;
+    const line = this.chosenPetLine(senderId, option);
     if (line === null) return reply(STALE_BUTTON_FALLBACK);
     return this.continuePetChoice(input, live.request, line);
   }
@@ -4073,8 +4122,7 @@ export class MinimalCatalogAgentService {
       PET_CHOICE_OTHER_REF,
     );
     if (option === null) return null;
-    const line =
-      this.pets?.chosenPetPromptLine(input.senderId, option.ref) ?? null;
+    const line = this.chosenPetLine(input.senderId, option);
     if (line === null) return null;
     return this.continuePetChoice(input, live.request, line);
   }

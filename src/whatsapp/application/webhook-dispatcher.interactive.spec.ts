@@ -176,6 +176,52 @@ describe('WebhookDispatcherService interactive replies (S4)', () => {
     expect(logged).toContain('wa:…1111');
   });
 
+  describe('T4c-2a-fix J3: a reply with its own text fallback (the which-pet question)', () => {
+    const PET_BUTTONS = {
+      type: 'buttons' as const,
+      buttons: [
+        { id: 'pet_pick:backend:a1', title: 'Max (labrador, adul…' },
+        { id: 'pet_pick:backend:b2', title: 'Bruno (chihuahua, c…' },
+      ],
+      prompt: '¿Para quién es?',
+      textFallback:
+        '¿Para quién es? ¿Para Max (labrador, adulto) o para Bruno (chihuahua, cachorro)?',
+    };
+
+    it('the interactive send carries no fallback field', async () => {
+      const h = setup({ reply: '¿Para quién es?', interactive: PET_BUTTONS });
+      await h.service.dispatch(textEvent('busco croquetas'));
+      expect(h.sender.sendInteractive).toHaveBeenCalledWith({
+        to: SENDER,
+        body: '¿Para quién es?',
+        interactive: { type: 'buttons', buttons: PET_BUTTONS.buttons },
+        shortBody: '¿Para quién es?',
+      });
+      expect(h.sender.sendText).not.toHaveBeenCalled();
+    });
+
+    it('a failed interactive send falls back to the text naming the options', async () => {
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const h = setup({ reply: '¿Para quién es?', interactive: PET_BUTTONS });
+      h.sender.sendInteractive.mockRejectedValueOnce(new Error('131009'));
+      await h.service.dispatch(textEvent('busco croquetas'));
+      expect(h.sender.sendText).toHaveBeenCalledWith({
+        to: SENDER,
+        text: PET_BUTTONS.textFallback,
+      });
+    });
+
+    it('a sender without interactive messages also gets the text naming the options', async () => {
+      const h = setup({ reply: '¿Para quién es?', interactive: PET_BUTTONS });
+      delete (h.sender as Partial<typeof h.sender>).sendInteractive;
+      await h.service.dispatch(textEvent('busco croquetas'));
+      expect(h.sender.sendText).toHaveBeenCalledWith({
+        to: SENDER,
+        text: PET_BUTTONS.textFallback,
+      });
+    });
+  });
+
   it('a failed fallback text still fails the webhook (Meta re-delivers)', async () => {
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);

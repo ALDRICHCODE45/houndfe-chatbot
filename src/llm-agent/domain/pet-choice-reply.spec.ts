@@ -2,6 +2,7 @@ import {
   INTERACTIVE_LIMITS,
   interactiveReplyText,
   parseInteractiveReplyId,
+  petChoiceOptions,
   petChoicePick,
   type PetChoicePet,
 } from './customer-reply';
@@ -51,6 +52,8 @@ describe('which-pet question (pet_pick)', () => {
           },
         ],
         prompt: '¿Para quién es?',
+        textFallback:
+          '¿Para quién es? ¿Para Max (labrador, adulto) o para Bruno (chihuahua, cachorro)?',
       },
       options: [
         { ref: `backend:${MAX_ID}`, text: 'Max' },
@@ -72,6 +75,8 @@ describe('which-pet question (pet_pick)', () => {
         { id: `pet_pick:backend:${MAX_ID}`, title: 'Max (labrador, adul…' },
       ],
       prompt: '¿Para quién es?',
+      textFallback:
+        '¿Para quién es? ¿Para Luna, Michi (gato) o para Max (labrador, adulto)?',
     });
     for (const button of result!.interactive.type === 'buttons'
       ? result!.interactive.buttons
@@ -108,6 +113,8 @@ describe('which-pet question (pet_pick)', () => {
         { id: 'pet_pick:legacy', title: 'Luna' },
       ],
       prompt: '¿Para quién es?',
+      textFallback:
+        '¿Para quién es? ¿Para Max (labrador, adulto), Bruno (chihuahua, cachorro), Michi (gato) o para Luna?',
     });
     const ten = petChoicePick(pets(10), 'p');
     expect(ten?.interactive.type).toBe('list');
@@ -178,5 +185,118 @@ describe('which-pet question (pet_pick)', () => {
       choice: 'variant',
       reference: 'ref-1',
     });
+  });
+});
+
+/** T4c-2a-fix J2/J3/J4 (S3, S12): readable titles, text fallback, one builder. */
+describe('which-pet question hardening (T4c-2a-fix)', () => {
+  const rowsOf = (result: ReturnType<typeof petChoicePick>) =>
+    result?.interactive.type === 'list' ? result.interactive.rows : [];
+
+  it('J2: two pets whose fitted button titles are identical → a list told apart by age', () => {
+    const a: PetChoicePet = {
+      ref: `backend:${MAX_ID}`,
+      name: 'Max',
+      species: 'perro',
+      breed: 'labrador',
+      ageLabel: '~3 años',
+      stage: 'adulto',
+    };
+    const b: PetChoicePet = {
+      ...a,
+      ref: `backend:${BRUNO_ID}`,
+      ageLabel: '~5 años',
+    };
+    const result = petChoicePick([a, b], '¿Para quién es?');
+    expect(result?.interactive.type).toBe('list');
+    expect(rowsOf(result)).toEqual([
+      {
+        id: `pet_pick:backend:${MAX_ID}`,
+        title: 'Max (~3 años)',
+        description: 'labrador, adulto',
+      },
+      {
+        id: `pet_pick:backend:${BRUNO_ID}`,
+        title: 'Max (~5 años)',
+        description: 'labrador, adulto',
+      },
+    ]);
+  });
+
+  it('J2: same names without a telling age → a trailing number in the row title', () => {
+    const a: PetChoicePet = {
+      ref: `backend:${MAX_ID}`,
+      name: 'Max',
+      breed: 'labrador',
+    };
+    const b: PetChoicePet = { ref: 'local:x2', name: 'max', breed: 'labrador' };
+    const rows = rowsOf(petChoicePick([a, b, michi], '¿Para quién es?'));
+    expect(rows.map((row) => row.title)).toEqual(['Max 1', 'max 2', 'Michi']);
+    expect(rows.map((row) => row.id)).toEqual([
+      `pet_pick:backend:${MAX_ID}`,
+      'pet_pick:local:x2',
+      `pet_pick:local:${LOCAL_ID}`,
+    ]);
+  });
+
+  it('J2: a name that does not fit a button title → a list (name never cut in a button)', () => {
+    const long: PetChoicePet = {
+      ref: `backend:${MAX_ID}`,
+      name: 'Maximiliano Bigotón Tercero',
+      breed: 'labrador',
+    };
+    const result = petChoicePick([long, bruno], 'p');
+    expect(result?.interactive.type).toBe('list');
+  });
+
+  it('J2: distinct readable titles keep buttons (cut detail allowed when titles differ)', () => {
+    expect(petChoicePick([max, bruno], 'p')?.interactive.type).toBe('buttons');
+  });
+
+  it('J3: the text fallback names the options («¿Para A o para B?»)', () => {
+    const result = petChoicePick([max, bruno], '¿Para quién es?');
+    expect(result?.interactive.textFallback).toBe(
+      '¿Para quién es? ¿Para Max (labrador, adulto) o para Bruno (chihuahua, cachorro)?',
+    );
+  });
+
+  it('J3: three or more → commas, then « o para » before the last', () => {
+    const result = petChoicePick(
+      [max, bruno, michi, { ref: 'legacy', name: 'Luna' }],
+      '¿Para quién es?',
+    );
+    expect(result?.interactive.textFallback).toBe(
+      '¿Para quién es? ¿Para Max (labrador, adulto), Bruno (chihuahua, cachorro), Michi (gato) o para Luna?',
+    );
+  });
+
+  it('J4: a nameless pet shows its kind but its option is not matchable by typed text', () => {
+    const nameless: PetChoicePet = {
+      ref: 'legacy',
+      species: 'gato',
+      breed: 'siamés',
+    };
+    const result = petChoicePick([max, nameless], 'p');
+    expect(result?.options).toEqual([
+      { ref: `backend:${MAX_ID}`, text: 'Max' },
+      { ref: 'legacy', text: 'Siamés', matchable: false },
+    ]);
+  });
+
+  it('J4: petChoiceOptions is the one option builder (usable refs, cap, nameless flag)', () => {
+    expect(
+      petChoiceOptions(
+        [
+          max,
+          { ref: 'bad ref', name: 'X' },
+          { ref: 'legacy', species: 'perro' },
+          bruno,
+        ],
+        2,
+      ),
+    ).toEqual([
+      { ref: `backend:${MAX_ID}`, text: 'Max' },
+      { ref: 'legacy', text: 'Perro', matchable: false },
+    ]);
   });
 });

@@ -18,12 +18,22 @@ export const PET_CHOICE_REQUEST_MAX_CHARS = 8000;
 export const PET_CHOICE_PURPOSES = ['request'] as const;
 export type PetChoicePurpose = (typeof PET_CHOICE_PURPOSES)[number];
 
-/** One offered answer: a pet ref (`backend:<id>`, `local:<id>`, `legacy`)
- *  or `other` («Otra mascota»), and the pet's name (the text a typed answer
- *  is matched against). */
+/** Most options one question keeps (the «Otra mascota» follow-up offers
+ *  every known pet up to this cap). */
+export const PET_CHOICE_OPTIONS_MAX = 50;
+
+/**
+ * One offered answer: a pet ref (`backend:<id>`, `local:<id>`, `legacy`) or
+ * `other` («Otra mascota»), and its display text: the pet's name, or the
+ * kind (breed/species) of a nameless pet. A typed answer is matched against
+ * the text unless `matchable` is `false` (a nameless pet: its breed is never
+ * an answer). Rows written before the flag carry no `matchable` and keep
+ * matching by text.
+ */
 export type PetChoiceOption = {
   readonly ref: string;
   readonly text: string;
+  readonly matchable?: false;
 };
 
 export type PetChoice = {
@@ -40,10 +50,11 @@ const payloadSchema = z.strictObject({
       z.strictObject({
         ref: z.string().min(1).max(190),
         text: z.string().min(1).max(200),
+        matchable: z.literal(false).optional(),
       }),
     )
     .min(1)
-    .max(50),
+    .max(PET_CHOICE_OPTIONS_MAX),
   request: z.string().min(1).max(PET_CHOICE_REQUEST_MAX_CHARS),
 });
 
@@ -120,7 +131,11 @@ export class DurablePetChoice {
 function copy(choice: PetChoice): PetChoice {
   return {
     purpose: choice.purpose,
-    options: choice.options.map(({ ref, text }) => ({ ref, text })),
+    options: choice.options.map(({ ref, text, matchable }) => ({
+      ref,
+      text,
+      ...(matchable === false ? { matchable } : {}),
+    })),
     request: choice.request,
   };
 }
@@ -151,8 +166,9 @@ function answerForms(text: string): Set<string> {
 /**
  * T4c-2a P3: a typed answer to the which-pet question. Counts only when the
  * whole message is one offered pet's name (optionally «para …», «es para …»,
- * «el/la/mi …») and exactly one option has that name; «Otra mascota» never
- * matches. `null` otherwise (the message is a new one).
+ * «el/la/mi …») and exactly one option has that name; «Otra mascota» and a
+ * nameless pet's option (`matchable: false`) never match. `null` otherwise
+ * (the message is a new one).
  */
 export function matchPetChoiceAnswer(
   text: string,
@@ -163,6 +179,7 @@ export function matchPetChoiceAnswer(
   const matched = options.filter(
     (option) =>
       option.ref !== otherRef &&
+      option.matchable !== false &&
       foldAnswer(option.text) !== '' &&
       forms.has(foldAnswer(option.text)),
   );

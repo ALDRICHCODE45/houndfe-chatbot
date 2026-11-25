@@ -985,7 +985,9 @@ export class WebhookDispatcherService {
   /**
    * S4: the reply text, with its buttons/list when the sender supports them.
    * A missing or failed interactive send falls back to the same plain text
-   * (it already says how to answer), so the reply is never lost.
+   * (it already says how to answer), so the reply is never lost; a reply
+   * whose text alone cannot be answered (T4c-2a-fix J3: «¿Para quién es?»)
+   * carries its own `textFallback`, sent instead.
    */
   private async sendReplyText(
     to: string,
@@ -997,7 +999,9 @@ export class WebhookDispatcherService {
       this.whatsappSender.sendInteractive !== undefined
     ) {
       try {
-        const { prompt, ...controls } = interactive;
+        // The text fallback stays here: Meta never receives it.
+        const { prompt, textFallback, ...controls } = interactive;
+        void textFallback;
         const sent = await this.whatsappSender.sendInteractive({
           to,
           body: reply.reply,
@@ -1015,7 +1019,7 @@ export class WebhookDispatcherService {
     }
     const { providerMessageId } = await this.whatsappSender.sendText({
       to,
-      text: reply.reply,
+      text: interactive?.textFallback ?? reply.reply,
     });
     return [providerMessageId];
   }

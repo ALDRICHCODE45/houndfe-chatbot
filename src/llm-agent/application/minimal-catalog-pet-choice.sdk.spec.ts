@@ -124,7 +124,12 @@ type PetsStub = Pick<
 >;
 
 /** One process: shared durable stores survive `boot()` (a restart). */
-function world(lookup: { current: CustomerLookupResponse }) {
+function world(lookup: {
+  current: CustomerLookupResponse;
+  /** T4c-2a-fix J1: `hang` never answers (over the prepare budget),
+   *  `fail` rejects (lookup unavailable). */
+  mode?: 'hang' | 'fail';
+}) {
   let now = NOW.getTime();
   const gateStore = new InMemoryConversationGateStore(() => new Date(now));
   const profileStore = new InMemoryCustomerProfileStore();
@@ -159,7 +164,11 @@ function world(lookup: { current: CustomerLookupResponse }) {
             new InMemoryLocalPetStore(profileStore),
             {
               getCustomerByPhone: () =>
-                Promise.resolve(structuredClone(lookup.current)),
+                lookup.mode === 'hang'
+                  ? new Promise<CustomerLookupResponse>(() => undefined)
+                  : lookup.mode === 'fail'
+                    ? Promise.reject(new Error('lookup down'))
+                    : Promise.resolve(structuredClone(lookup.current)),
             },
             client() satisfies Record<keyof CustomerPetsClient, jest.Mock>,
             profiles,
@@ -248,6 +257,9 @@ describe('T4c-2a which-pet question (S3, S12, S13)', () => {
         { id: `pet_pick:backend:${MAX_ID}`, title: 'Max (Labrador, adul…' },
       ],
       prompt: '¿Para quién es?',
+      // T4c-2a-fix J3: sent instead when the buttons cannot be.
+      textFallback:
+        '¿Para quién es? ¿Para Bruno (Chihuahua, cachorro) o para Max (Labrador, adulto)?',
     });
     await expect(w.gateStore.get(SENDER, 'pet_choice')).resolves.toEqual({
       senderId: SENDER,
@@ -487,4 +499,148 @@ describe('T4c-2a which-pet question (S3, S12, S13)', () => {
     expect(h.tools()).toContain('rememberPetDetails');
     expect(h.tools()).not.toContain('askWhichPet');
   }, 10_000);
+});
+
+describe('T4c-2a-fix which-pet hardening (J1, J4)', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const OPTION_LINE = (name: string) =>
+    `Mascota de este pedido (la eligió el cliente): "${name}" (sus datos no están disponibles en este turno). ` +
+    'Continúe la solicitud del cliente para esta mascota; no vuelva a preguntar para cuál es.';
+
+  it('J1: after a restart with a lookup slower than 1500 ms, the tap continues the request from the gate option', async () => {
+    const lookup: Parameters<typeof world>[0] = {
+      current: customer([pet({}), max()]),
+    };
+    const w = world(lookup);
+    await w.boot().turn('busco croquetas', ask());
+    lookup.mode = 'hang';
+    const h = w.boot();
+    const decision = await h.turn(
+      'Max (Labrador, adul…',
+      [[say('Para Max…')]],
+      `pet_pick:backend:${MAX_ID}`,
+    );
+    expect(decision.reply).toBe('Para Max…');
+    expect(h.lastUser()).toBe('busco croquetas');
+    expect(lineOf(h.system())).toBe(OPTION_LINE('Max'));
+    await expect(w.gateStore.get(SENDER, 'pet_choice')).resolves.toBeNull();
+  }, 10_000);
+
+  it('J1: with the lookup unavailable, the typed «para Max» continues the request', async () => {
+    const lookup: Parameters<typeof world>[0] = {
+      current: customer([pet({}), max()]),
+    };
+    const w = world(lookup);
+    await w.boot().turn('busco croquetas', ask());
+    lookup.mode = 'fail';
+    const h = w.boot();
+    await h.turn('para Max', [[say('Para Max…')]]);
+    expect(h.lastUser()).toBe('busco croquetas');
+    expect(lineOf(h.system())).toBe(OPTION_LINE('Max'));
+    await expect(w.gateStore.get(SENDER, 'pet_choice')).resolves.toBeNull();
+  });
+
+  it('J1: in a read-only scope (customer without pets) the tap continues the request', async () => {
+    const lookup: Parameters<typeof world>[0] = {
+      current: customer([pet({}), max()]),
+    };
+    const w = world(lookup);
+    await w.boot().turn('busco croquetas', ask());
+    const readOnly = customer([]);
+    delete (readOnly.customer as { pets?: unknown }).pets;
+    lookup.current = readOnly;
+    const h = w.boot();
+    await h.turn(
+      'Bruno',
+      [[say('Para Bruno…')]],
+      `pet_pick:backend:${BRUNO_ID}`,
+    );
+    expect(h.lastUser()).toBe('busco croquetas');
+    expect(lineOf(h.system())).toBe(OPTION_LINE('Bruno'));
+  });
+
+  it('J1: «Otra mascota» with pets not loaded asks the name; a shown name then continues', async () => {
+    const many = Array.from({ length: 12 }, (_, i) =>
+      pet({
+        id: `c0000000-0000-4000-8000-${String(i + 1).padStart(12, '0')}`,
+        name: `Pet${i + 1}`,
+        createdAt: new Date(Date.UTC(2026, 0, i + 1)).toISOString(),
+      }),
+    );
+    const lookup: Parameters<typeof world>[0] = { current: customer(many) };
+    const w = world(lookup);
+    await w.boot().turn('busco croquetas', ask());
+    lookup.mode = 'fail';
+    const h = w.boot();
+    const other = await h.turn('Otra mascota', [], 'pet_pick:other');
+    expect(other.reply).toBe(
+      '¿Cómo se llama? Escríbame el nombre de su mascota.',
+    );
+    await h.turn('Pet12', [[say('Para Pet12…')]]);
+    expect(h.lastUser()).toBe('busco croquetas');
+    expect(lineOf(h.system())).toBe(OPTION_LINE('Pet12'));
+  });
+
+  /** A model run that calls askWhichPet, then records the prompt it sees. */
+  const askAndRecord = (sink: string[]) => {
+    let calls = 0;
+    return ((options: { prompt: unknown }) => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve(call('askWhichPet'));
+      sink.push(
+        JSON.stringify(
+          (options.prompt as Array<{ role: string }>).filter(
+            (message) => message.role === 'tool',
+          ),
+        ),
+      );
+      return Promise.resolve(say('¿Para cuál?'));
+    }) as unknown as unknown[];
+  };
+  const stubOf = (knownPets: () => KnownPet[]): PetsStub => ({
+    prepare: () => Promise.resolve(),
+    capture: () => Promise.resolve(),
+    promptLines: () => null,
+    afterCheckout: () => Promise.resolve(),
+    knownPets,
+    knownPetsByRecency: knownPets,
+    chosenPetPromptLine: () => null,
+  });
+  const two: KnownPet[] = [
+    { ref: `backend:${BRUNO_ID}`, name: 'Bruno', source: 'backend' },
+    { ref: `backend:${MAX_ID}`, name: 'Max', source: 'backend' },
+  ];
+
+  it.each([
+    [
+      'no_valid_options',
+      'busco croquetas',
+      () => [
+        { ref: 'backend:bad id', name: 'Bruno', source: 'backend' as const },
+        { ref: 'mystery', name: 'Max', source: 'backend' as const },
+      ],
+    ],
+    ['blank_request', '   ', () => two],
+  ])('J4: askWhichPet answers %s', async (code, text, known) => {
+    const w = world({ current: customer([]) });
+    const h = w.boot(stubOf(known));
+    const sink: string[] = [];
+    await h.turn(text, [askAndRecord(sink)]);
+    expect(sink.join('')).toContain(code);
+    await expect(w.gateStore.get(SENDER, 'pet_choice')).resolves.toBeNull();
+  });
+
+  it('J4: askWhichPet answers fewer_than_two_pets when a pet went away mid-turn', async () => {
+    let reads = 0;
+    const w = world({ current: customer([]) });
+    const h = w.boot(stubOf(() => (++reads <= 1 ? two : two.slice(0, 1))));
+    const sink: string[] = [];
+    await h.turn('busco croquetas', [askAndRecord(sink)]);
+    expect(sink.join('')).toContain('fewer_than_two_pets');
+  });
 });
