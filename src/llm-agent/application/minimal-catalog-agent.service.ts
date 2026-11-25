@@ -820,7 +820,7 @@ const REORDER_INSTRUCTIONS_FRAGMENT =
 
 /** T5b (S4, S14): the per-pet reorder; added only with the pet store. */
 export const REORDER_PET_INSTRUCTIONS_FRAGMENT =
-  ' Si el cliente pide lo de siempre o su último pedido para UNA mascota nombrada ("lo mismo de siempre para Max", "lo de siempre de Bruno", "¿qué le compré a Max la última vez?"), llame getLastOrder con petName: el nombre de esa mascota tal como lo escribió; la aplicación presenta solo lo que fue para esa mascota. Si responde several_pets_with_that_name, llame askWhichPet; si responde no_pet_with_that_name, pregunte de qué mascota habla. Sin un nombre de mascota en el mensaje, llame getLastOrder sin argumentos.';
+  ' Si el cliente pide lo de siempre o su último pedido para UNA mascota nombrada ("lo mismo de siempre para Max", "lo de siempre de Bruno", "¿qué le compré a Max la última vez?"), llame getLastOrder con petName: el nombre de esa mascota tal como lo escribió; la aplicación presenta solo lo que fue para esa mascota. Si responde several_pets_with_that_name, llame askWhichPet; si responde no_pet_with_that_name, pregunte de qué mascota habla; si responde pet_memory_unavailable, dígale con amabilidad que ahora no puede buscar lo de esa mascota y nunca llame getLastOrder sin argumentos en su lugar. Sin un nombre de mascota en el mensaje, llame getLastOrder sin argumentos.';
 
 const GET_LAST_ORDER_DESCRIPTION =
   'Consulta el último pedido de este cliente (por su número de WhatsApp) y pide a la aplicación presentarlo con existencias y precios de hoy para que el cliente confirme si lo agrega al carrito. No modifica el carrito. No acepta argumentos.';

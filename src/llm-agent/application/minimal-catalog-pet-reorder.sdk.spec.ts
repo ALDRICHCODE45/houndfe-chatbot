@@ -535,7 +535,7 @@ describe('T5b: «lo mismo de siempre para Max» (S4, S14, S15)', () => {
 
   it('pins the per-pet instructions, present only with the pet store', async () => {
     expect(REORDER_PET_INSTRUCTIONS_FRAGMENT).toBe(
-      ' Si el cliente pide lo de siempre o su último pedido para UNA mascota nombrada ("lo mismo de siempre para Max", "lo de siempre de Bruno", "¿qué le compré a Max la última vez?"), llame getLastOrder con petName: el nombre de esa mascota tal como lo escribió; la aplicación presenta solo lo que fue para esa mascota. Si responde several_pets_with_that_name, llame askWhichPet; si responde no_pet_with_that_name, pregunte de qué mascota habla. Sin un nombre de mascota en el mensaje, llame getLastOrder sin argumentos.',
+      ' Si el cliente pide lo de siempre o su último pedido para UNA mascota nombrada ("lo mismo de siempre para Max", "lo de siempre de Bruno", "¿qué le compré a Max la última vez?"), llame getLastOrder con petName: el nombre de esa mascota tal como lo escribió; la aplicación presenta solo lo que fue para esa mascota. Si responde several_pets_with_that_name, llame askWhichPet; si responde no_pet_with_that_name, pregunte de qué mascota habla; si responde pet_memory_unavailable, dígale con amabilidad que ahora no puede buscar lo de esa mascota y nunca llame getLastOrder sin argumentos en su lugar. Sin un nombre de mascota en el mensaje, llame getLastOrder sin argumentos.',
     );
     const withPets = world({});
     await withPets.turn('hola', [[say('Hola.')]]);
