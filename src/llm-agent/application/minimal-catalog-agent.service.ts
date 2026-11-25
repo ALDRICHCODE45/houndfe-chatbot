@@ -525,9 +525,12 @@ const ADDRESS_WORDS =
 /** T4c-2b-fix K1: a pet word before the name («mi perrito Bruno»). */
 const PET_WORDS =
   '(?:perr[oa]|perrit[oa]|gat[oa]|gatit[oa]|mascota|mascotita|cachorr[oa]|cachorrit[oa])';
-/** T4c-2b-fix K1: a verb right after the name («Bruno tiene…»). */
-const PET_VERBS =
-  '(?:tiene|es|esta|come|necesita|toma|pesa|usa|quiere|anda|se|ya|no)';
+/** T4c-2b-fix K1: a verb right after the name («Bruno tiene…»). Words
+ *  as common for people as for pets («ya», «no», «se») are left out. */
+const PET_VERBS = '(?:tiene|es|esta|come|necesita|toma|pesa|usa|quiere|anda)';
+/** T4c-2b-fix K1: «Bruno es mi esposo/hijo/…» names a person. */
+const PERSON_WORDS =
+  '(?:espos[oa]|marido|mujer|hij[oa]|herman[oa]|novi[oa]|papa|mama|padre|madre|abuel[oa]|ti[oa]|prim[oa]|amig[oa]|suegr[oa]|sobrin[oa]|vecin[oa]|jefe|jefa|repartidor|chofer)';
 
 /**
  * T4c-2b Q2 / T4c-2b-fix K1: the message uses `name` as a pet reference:
@@ -544,6 +547,12 @@ function refersToPet(text: string, name: string): boolean {
   if (text.includes('#') || ADDRESS_WORDS.test(folded)) return false;
   // Folded: letters, digits and single spaces only (nothing to escape).
   const n = wanted;
+  if (
+    new RegExp(`(?:^| )${n} es (?:mi|el|la|su) ${PERSON_WORDS}(?: |$)`).test(
+      folded,
+    )
+  )
+    return false;
   return new RegExp(
     `(?:^| )(?:(?:para|pa|a|al) (?:(?:el|la|mi) )?${n}|(?:mi|el|la|su) ${PET_WORDS} ${n}|${n} ${PET_VERBS})(?: |$)`,
   ).test(folded);

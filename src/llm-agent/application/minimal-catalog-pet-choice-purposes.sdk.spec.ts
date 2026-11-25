@@ -798,6 +798,10 @@ describe('T4c-2b-fix (S3, S10): pet questions only when they matter, typed «es 
       'Bruno Traven #45 int 2',
       'hablé con Bruno ayer',
       'Hola, soy Bruno',
+      // Verify: a person named like the pet, after «ya/no/se/es».
+      'soy Bruno, ya les pagué',
+      'Bruno no me contesta',
+      'Bruno es mi esposo, él recoge',
     ])('%j (not a pet reference) asks nothing', async (text) => {
       const w = await ambiguousWorld();
       const h = w.boot();
@@ -813,6 +817,7 @@ describe('T4c-2b-fix (S3, S10): pet questions only when they matter, typed «es 
       'mi mascota Bruno necesita arena',
       'Bruno tiene comezón, ¿qué le doy?',
       'Bruno come muy poco',
+      'Bruno es alérgico al pollo, ¿qué croquetas?',
     ])('%j (a pet reference) asks which Bruno', async (text) => {
       const w = await ambiguousWorld();
       const h = w.boot();
