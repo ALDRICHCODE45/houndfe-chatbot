@@ -359,7 +359,7 @@ describe('S6 closings with a purchase in progress (real services)', () => {
       await h.pendingPaymentOffer();
       const decision = await h.turn(text);
       expect(isClosing(decision)).toBe(false);
-      expect(reply(decision)).toContain('CLABE: 012180001234567891');
+      expect(reply(decision)).toContain('*CLABE:* 012180001234567891');
     },
   );
 

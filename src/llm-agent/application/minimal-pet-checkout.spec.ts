@@ -336,7 +336,7 @@ describe('T5a R4/R5: petId per line and «(para Max)» (S16)', () => {
     // The pending summary (with the pet) survives a restart.
     await h.restart();
     const placed = await h.yes();
-    expect(placed?.reply).toContain('folio B-0042');
+    expect(placed?.reply).toContain('*Folio:* B-0042');
     expect(calls(h)).toHaveLength(1);
     expect(JSON.stringify(calls(h)[0][0].sale.items)).toBe(
       `[{"productId":"${BO_PRODUCT}","variantId":null,"productName":"Ibuprofeno","variantName":null,"quantity":2,"unitPriceCents":1500,"petId":"${MAX.id}"},{"productId":"${BO_CROQUETAS}","variantId":null,"productName":"Croquetas Adulto 18 kg","variantName":null,"quantity":1,"unitPriceCents":120000}]`,
@@ -407,7 +407,7 @@ describe('T5a R4/R5: petId per line and «(para Max)» (S16)', () => {
       await h.offer();
       h.api.createCheckout.mockRejectedValueOnce(refusal(status, code));
       const placed = await h.yes();
-      expect(placed?.reply).toContain('folio B-0042');
+      expect(placed?.reply).toContain('*Folio:* B-0042');
       const [first, second] = calls(h);
       expect(calls(h)).toHaveLength(2);
       expect(first[0].sale.items[0]).toMatchObject({ petId: MAX.id });
@@ -442,7 +442,7 @@ describe('T5a R4/R5: petId per line and «(para Max)» (S16)', () => {
     await h.offer('wamid.o3');
     h.api.createCheckout.mockRejectedValueOnce(refusal(422, 'PET_ARCHIVED'));
     const placed = await h.yes('wamid.o4');
-    expect(placed?.reply).toContain('folio B-0042');
+    expect(placed?.reply).toContain('*Folio:* B-0042');
     expect(calls(h)).toHaveLength(3);
     expect(calls(h)[1][1]).toBe(calls(h)[0][1]);
     expect(calls(h)[2][1]).not.toBe(calls(h)[1][1]);

@@ -32,13 +32,14 @@ const EVENT = (messageId: string) => ({
   messageId,
 });
 
-const LEAD = 'Pedido con folio B-0042. Total a pagar: $30.00 MXN.';
+const LEAD = 'Pedido con folio B-0042. Total a pagar: $30.00.';
 const INSTRUCTIONS = [
-  'Para pagar por transferencia:',
-  'Banco: BBVA',
-  'Beneficiario: HoundFe SA de CV',
-  'CLABE: 012180001234567891',
-  'Cuenta: 0123456789',
+  '*Pago por transferencia*',
+  '*Banco:* BBVA',
+  '*Beneficiario:* HoundFe SA de CV',
+  '*CLABE:* 012180001234567891',
+  '*Cuenta:* 0123456789',
+  '',
   'Cuando haga la transferencia, envíe aquí la foto de su comprobante.',
 ].join('\n');
 

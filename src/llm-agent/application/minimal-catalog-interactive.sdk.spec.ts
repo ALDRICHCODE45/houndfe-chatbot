@@ -305,7 +305,7 @@ describe('S4 order summary buttons', () => {
     const calls = h.seen.length;
     const placed = await h.turn('SÍ', [say('no')], 'o2', confirm);
     expect(h.seen).toHaveLength(calls);
-    expect(placed.reply).toContain('folio B-0042');
+    expect(placed.reply).toContain('*Folio:* B-0042');
     // Only the payment-method button; never a confirm button.
     expect(placed.interactive).toMatchObject({
       type: 'buttons',

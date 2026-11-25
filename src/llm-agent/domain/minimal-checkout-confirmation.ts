@@ -156,6 +156,7 @@ export function renderMinimalCheckoutConfirmation(
   const name = [draft.customer.firstName, draft.customer.lastName]
     .filter((part): part is string => isFilled(part))
     .map(plain)
+    .filter((part) => part !== '')
     .join(' ');
   const location = isFilled(fields.city) ? fields.city : fields.municipality;
   const street = [
@@ -168,7 +169,8 @@ export function renderMinimalCheckoutConfirmation(
   return [
     MINIMAL_CHECKOUT_SUMMARY_HEADING,
     '',
-    field('Nombre', name),
+    // F2a advisory: a name `plain` empties leaves no bare «*Nombre:*».
+    ...(name === '' ? [] : [field('Nombre', name)]),
     field('Calle', interior === '' ? street : `${street}, int. ${interior}`),
     field('Colonia', fields.neighborhood),
     field('Código postal', fields.zipCode),

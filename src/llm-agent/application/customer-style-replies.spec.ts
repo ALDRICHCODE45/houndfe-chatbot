@@ -664,8 +664,16 @@ describe('customer style over every fixed customer reply (S2)', () => {
           .split('\n')
           .map((line) => TITLE_EMOJI_LINE.exec(line)?.[1])
           .filter((emoji) => emoji !== undefined);
+        // Message formatting F3b: the shipping quote (🚚) and the order
+        // created (✅) titles join the summary title (🧾).
         expect(titleEmojis).toEqual(
-          reply.startsWith(MINIMAL_ORDER_SUMMARY_HEADING) ? [' 🧾'] : [],
+          reply.startsWith(MINIMAL_ORDER_SUMMARY_HEADING)
+            ? [' 🧾']
+            : reply.startsWith('*Envío a domicilio*')
+              ? [' 🚚']
+              : reply.startsWith('*¡Pedido registrado!*')
+                ? [' ✅']
+                : [],
         );
         expect(
           styled
@@ -689,13 +697,16 @@ describe('customer style over every fixed customer reply (S2)', () => {
       ),
     ).toBe(
       [
-        'Tu pedido quedó registrado con folio A-12. Total a pagar: $899.00 MXN (envío incluido).',
+        '*¡Pedido registrado!* ✅',
+        '*Folio:* A-12',
+        '*Total a pagar:* $899.00 (envío incluido)',
         '',
-        'Para pagar por transferencia:',
-        'Banco: Banco',
-        'Beneficiario: HoundFe',
-        'CLABE: 012345678901234567',
-        'Cuenta: 1234567890',
+        '*Pago por transferencia*',
+        '*Banco:* Banco',
+        '*Beneficiario:* HoundFe',
+        '*CLABE:* 012345678901234567',
+        '*Cuenta:* 1234567890',
+        '',
         'Cuando hagas la transferencia, envía aquí la foto de tu comprobante.',
       ].join('\n'),
     );

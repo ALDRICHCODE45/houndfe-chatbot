@@ -316,7 +316,7 @@ describe('summary and createCheckout with a backorder line (S2, S6, S11)', () =>
     expect(h.api.evaluateCart).not.toHaveBeenCalled();
 
     const placed = await h.yes();
-    expect(placed?.reply).toContain('¡Listo!');
+    expect(placed?.reply).toContain('*¡Pedido registrado!* ✅');
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(sentBody(h)).toEqual({
       phoneCountryCode: '52',
@@ -885,7 +885,7 @@ describe('a backorder refusal after an earlier uncertain attempt (same idempoten
         checkout: { sale: placedSale() },
       } as never);
     const answer = await h.yes('wamid.o4');
-    expect(answer?.reply).toContain('¡Listo!');
+    expect(answer?.reply).toContain('*¡Pedido registrado!* ✅');
     expect(answer?.reply).toContain('B-0042');
     expect((await h.slot()).items).toEqual([]);
   });

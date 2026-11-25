@@ -357,12 +357,14 @@ export function minimalBackorderSuffix(item: {
 
 /**
  * Multi-pet T5a R5 (S16): « (para Max)» after a line for a pet; empty for
- * every other line.
+ * every other line and for a name `plain` empties (only markup characters),
+ * so no bare «(para )» is shown.
  */
 export function minimalPetSuffix(item: {
   readonly pet?: { readonly name: string };
 }): string {
-  return item.pet === undefined ? '' : ` (para ${item.pet.name})`;
+  const name = item.pet === undefined ? '' : plain(item.pet.name);
+  return name === '' ? '' : ` (para ${name})`;
 }
 
 const present = (part: string | null | undefined): part is string =>

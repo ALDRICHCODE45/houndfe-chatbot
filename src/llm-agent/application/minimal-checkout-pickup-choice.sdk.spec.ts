@@ -318,7 +318,7 @@ describe('S4 (N15) checkout start asks delivery or store pickup', () => {
         : '';
     const created = await h.send('SÍ', [say()], confirm);
     expect(created.reply).toContain(
-      'Su pedido quedó registrado con folio B-42.',
+      '*¡Pedido registrado!* ✅\n*Folio:* B-42\n',
     );
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
   });

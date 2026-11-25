@@ -141,7 +141,7 @@ describe('minimal shipping SDK public seam', () => {
     // sentence is not repeated before it.
     expect(quoted.reply.startsWith('*Resumen de su pedido* 🧾')).toBe(true);
     expect(quoted.reply).toContain(free ? '*Envío:* sin costo\n' : '*Envío:* Carrier Ground — $200.00');
-    expect(quoted.reply).not.toContain(free ? 'Su envío al código postal 06000 no tiene costo.' : 'Usted paga $200.00 MXN');
+    expect(quoted.reply).not.toContain(free ? 'Su envío al código postal 06000 no tiene costo.' : '*Usted paga: $200.00*');
     expect(quoted.reply).toMatch(/\*Total a pagar: \$\d[\d,.]*\*\n\n¿Está todo bien\? Responda/);
     expect(quoted.reply).not.toMatch(/aprobaci|999/);
     expect(h.quotes.calls).toHaveLength(1);
@@ -258,18 +258,18 @@ describe('U4 customer shipping conversation', () => {
   });
   it('[S3] SURCHARGE shows carrier, cost, credit, customer charge, ETA and the next step', () => {
     expect(quoted()).toBe(
-      'Envío a domicilio con Envíos Perros (Estándar): $300.00 MXN. Usted tiene un crédito de $240.00 MXN por sus productos. Usted paga $60.00 MXN. ' +
+      '*Envío a domicilio* 🚚\nEnvíos Perros Estándar — $300.00\nUsted tiene un crédito de $240.00 por sus productos.\n*Usted paga: $60.00*\n' +
       'Llega en aproximadamente 4 días hábiles.');
   });
   it('[S3] CARRIER_ONLY without credit or carrier omits those parts', () => {
     const reply = quoted({ zoneStatus: 'CARRIER_ONLY', creditCents: 0, customerChargeCents: 30000, option: null });
-    expect(reply).toContain('Envío a domicilio: $300.00 MXN. Usted paga $300.00 MXN.');
+    expect(reply).toContain('*Envío a domicilio* 🚚\nCosto: $300.00\n*Usted paga: $300.00*');
     expect(reply).not.toContain('crédito');
     expect(reply).not.toContain('Llega en');
   });
   it('[S3] FREE says there is no cost for that ZIP, with the ETA line', () => {
     expect(quoted({ zoneStatus: 'FREE', costCents: 0, creditCents: 0, customerChargeCents: 0, option: null, eta: { days: 1, reason: null } })).toBe(
-      'Su envío al código postal 06000 no tiene costo. Llega en aproximadamente 1 día hábil.');
+      '*Envío a domicilio* 🚚\nSu envío al código postal 06000 no tiene costo.\nLlega en aproximadamente 1 día hábil.');
   });
   it('[S7] STOCK_PENDING replaces the day count', () => {
     expect(quoted({ eta: { days: null, reason: 'STOCK_PENDING' } })).toContain(

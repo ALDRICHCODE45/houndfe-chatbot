@@ -613,7 +613,7 @@ describe('minimal order placement through the SDK route', () => {
         address: { street: 'Calle 5', state: 'Ciudad de México' },
       },
     });
-    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect((placed as { reply: string }).reply).toContain('*Folio:* B-0042');
     expect((placed as { reply: string }).reply).toContain('¿Cómo desea pagar?');
     expect(h.api.upsertCustomer).not.toHaveBeenCalled();
     expect(h.api.createSale).not.toHaveBeenCalled();
@@ -658,7 +658,7 @@ describe('minimal order placement through the SDK route', () => {
         shipping: { quoteId: 'quote-1' },
       },
     });
-    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect((placed as { reply: string }).reply).toContain('*Folio:* B-0042');
     expect((placed as { reply: string }).reply).toContain('¿Cómo desea pagar?');
     expect((placed as { reply: string }).reply).not.toContain(
       'no está incluido',
@@ -703,7 +703,7 @@ describe('minimal order placement through the SDK route', () => {
     );
     expect(h.seen.length).toBe(calls);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
-    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect((placed as { reply: string }).reply).toContain('*Folio:* B-0042');
     expect(h.api.upsertCustomer).not.toHaveBeenCalled();
   });
 
@@ -755,7 +755,7 @@ describe('minimal order placement through the SDK route', () => {
     );
     (offer as { onSent: () => void }).onSent();
     const placed = await h.turn('SÍ', [say('x')], EVENT('wamid.pets4'));
-    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect((placed as { reply: string }).reply).toContain('*Folio:* B-0042');
     expect(afterCheckout).toHaveBeenCalledTimes(1);
   });
 

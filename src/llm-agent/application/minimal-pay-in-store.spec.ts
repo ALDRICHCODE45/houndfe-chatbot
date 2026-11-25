@@ -58,8 +58,12 @@ const LOCATION = {
     summary: 'Lunes a sábado: 09:00–18:00. Domingo: cerrado.',
   },
 };
-const STORE =
-  'Sucursal Centro: Av. Juárez 123, Centro, Cuauhtémoc, Ciudad de México, C.P. 06000. Horario: Lunes a sábado: 09:00–18:00. Domingo: cerrado';
+// Message formatting F3b: the store block of the hold reply, one piece per line.
+const STORE = [
+  '*Sucursal Centro*',
+  'Av. Juárez 123, Centro, Cuauhtémoc, Ciudad de México, C.P. 06000',
+  '*Horario:* Lunes a sábado: 09:00–18:00. Domingo: cerrado.',
+].join('\n');
 // 12:30 p. m. of Thursday 19 November in Mexico City (UTC-6).
 const HOLD = {
   saleId: SALE,
@@ -68,12 +72,12 @@ const HOLD = {
   holdUntil: '2026-11-19T18:30:00.000Z',
   reminderAt: '2026-11-19T15:30:00.000Z',
 };
-const HELD = `Listo, le apartamos su pedido B-0042 hasta el jueves 19 de noviembre a las 12:30 p. m. Páselo a recoger y pagar en ${STORE}. Si no pasa antes de esa fecha, el pedido se cancela.`;
-const HELD_TU = `Listo, te apartamos tu pedido B-0042 hasta el jueves 19 de noviembre a las 12:30 p. m. Pásalo a recoger y pagar en ${STORE}. Si no pasas antes de esa fecha, el pedido se cancela.`;
+const HELD = `Listo, le apartamos su pedido *B-0042* hasta el *jueves 19 de noviembre a las 12:30 p. m.*\n\nPáselo a recoger y pagar en ${STORE}\n\nSi no pasa antes de esa fecha, el pedido se cancela.`;
+const HELD_TU = `Listo, te apartamos tu pedido *B-0042* hasta el *jueves 19 de noviembre a las 12:30 p. m.*\n\nPásalo a recoger y pagar en ${STORE}\n\nSi no pasas antes de esa fecha, el pedido se cancela.`;
 const ALREADY_PAID = 'Su pedido ya está pagado.';
 const FAILED =
   'No pude apartar su pedido en este momento; puede pagar por transferencia o intentarlo de nuevo en unos minutos.';
-const LEAD = 'Pedido con folio B-0042. Total a pagar: $30.00 MXN.';
+const LEAD = 'Pedido con folio B-0042. Total a pagar: $30.00.';
 const QUESTION = 'Para terminar solo falta el pago. ¿Cómo desea pagar?';
 
 const step = (content: unknown[], finish = 'tool-calls') => ({
@@ -416,7 +420,7 @@ describe('pay in store: the offer (S3)', () => {
       });
       // A yes still means transfer (the single-method shortcut stays).
       const answered = await h.turn('sí');
-      expect(reply(answered)).toContain('CLABE: 012180001234567891');
+      expect(reply(answered)).toContain('*CLABE:* 012180001234567891');
       expect(h.api.setPayInStoreIntent).not.toHaveBeenCalled();
     },
   );
@@ -494,7 +498,7 @@ describe('pay in store: the offer (S3)', () => {
       expect(h.seen.length).toBe(llmCalls);
       // The re-asked offer is still pending: a typed method answers it.
       expect(reply(await h.turn('transferencia'))).toContain(
-        'CLABE: 012180001234567891',
+        '*CLABE:* 012180001234567891',
       );
     },
   );
@@ -518,7 +522,7 @@ describe('pay in store: the offer (S3)', () => {
     const h = setup();
     await h.placeOrder();
     const decision = await h.turn('transferencia');
-    expect(reply(decision)).toContain('CLABE: 012180001234567891');
+    expect(reply(decision)).toContain('*CLABE:* 012180001234567891');
     expect(h.api.setPayInStoreIntent).not.toHaveBeenCalled();
   });
 });
@@ -598,7 +602,7 @@ describe('pay in store: the tap (S3)', () => {
       folio: null,
     } as never);
     expect(reply(await tapInStore(h))).toBe(
-      'Listo, le apartamos su pedido hasta el jueves 19 de noviembre a las 12:30 p. m. Páselo a recoger y pagar en la tienda. Si no pasa antes de esa fecha, el pedido se cancela.',
+      'Listo, le apartamos su pedido hasta el *jueves 19 de noviembre a las 12:30 p. m.*\n\nPáselo a recoger y pagar en la tienda.\n\nSi no pasa antes de esa fecha, el pedido se cancela.',
     );
   });
 
@@ -647,7 +651,7 @@ describe('pay in store: the tap (S3)', () => {
       expect(reply(await tapInStore(h))).toBe(FAILED);
       expect(h.api.setPayInStoreIntent).toHaveBeenCalledTimes(1);
       const after = await h.turn('transferencia');
-      expect(reply(after)).toContain('CLABE: 012180001234567891');
+      expect(reply(after)).toContain('*CLABE:* 012180001234567891');
     },
   );
 

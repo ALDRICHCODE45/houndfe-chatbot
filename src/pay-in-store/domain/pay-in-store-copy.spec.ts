@@ -63,7 +63,7 @@ describe('pay in store copy: «a la 1:00» / «a las 2:00» (S5)', () => {
     );
     expect(
       payInStoreHeldReply({ folio: 'B-1', holdUntil: ONE_PM, location: null }),
-    ).toContain('hasta el jueves 19 de noviembre a la 1:00 p. m. Páselo');
+    ).toContain('hasta el *jueves 19 de noviembre a la 1:00 p. m.*\n');
     expect(pickupExtendedText({ folio: 'B-1', holdUntil: ONE_PM })).toBe(
       'Le ampliamos el plazo de su pedido B-1: ahora puede recogerlo y pagarlo hasta el jueves 19 de noviembre a la 1:00 p. m.',
     );

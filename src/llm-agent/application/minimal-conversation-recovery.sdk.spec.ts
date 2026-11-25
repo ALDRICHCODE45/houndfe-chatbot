@@ -242,7 +242,7 @@ describe('G2 a cart change after the order summary continues to the updated summ
 
     // The model would write its own summary again; the armed gate answers.
     const created = await h.turn(t8, [say(FAKE_DELIVERY_SUMMARY)]);
-    expect(created).toContain('folio EV-0001');
+    expect(created).toContain('*Folio:* EV-0001');
     expect(orderedQuantities(h)).toEqual([[2]]);
 
     await h.turn(t9, [say('¡Gracias por su compra!')]);

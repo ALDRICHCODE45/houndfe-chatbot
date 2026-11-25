@@ -450,7 +450,7 @@ describe('S2 reorder: accepting or declining', () => {
     expect(summary.reply).toContain('$2,657.00');
     const create = jest.spyOn(h.api, 'createCheckout');
     const placed = await h.turn('sí');
-    expect(placed.reply).toMatch(/folio EV-0001/);
+    expect(placed.reply).toMatch(/\*Folio:\* EV-0001/);
     expect(h.api.orders.size).toBe(1);
     expect(create.mock.calls[0][0].sale.items).toEqual([
       expect.objectContaining({ productId: NUPEC, quantity: 1 }),

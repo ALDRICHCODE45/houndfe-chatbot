@@ -227,6 +227,13 @@ import {
 } from './minimal-shipping.service';
 import { minimalShippingEtaLine } from '../domain/minimal-shipping';
 import {
+  TITLE_EMOJI,
+  bold,
+  money,
+  plain,
+  sectionTitle,
+} from '../domain/whatsapp-format';
+import {
   searchWithBroadening,
   type BroadenedSearchInfo,
 } from '../domain/minimal-catalog-search-broadening';
@@ -852,11 +859,16 @@ const SHIPPING_INSTRUCTIONS_FRAGMENT =
 const ORDER_INSTRUCTIONS_FRAGMENT =
   ' Pedido: cuando los datos de entrega ya estén confirmados (o el cliente eligió recoger en tienda) y el cliente quiera hacer su pedido, llame prepareOrder sin argumentos. La aplicación muestra el resumen con el total y pide al cliente responder SÍ; solo esa respuesta crea el pedido. Usted nunca crea pedidos ni afirma que un pedido existe; el envío no está incluido.';
 
-const shippingMxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
 const zipPhrase = (zipCode: string | null) =>
   zipCode === null ? 'su código postal' : `su código postal ${zipCode}`;
 
-/** Server-owned reply for one quote attempt; amounts come only from the backend. */
+/**
+ * Server-owned reply for one quote attempt; amounts come only from the
+ * backend. A quote is a block (message formatting S2/S3): the «*Envío a
+ * domicilio* 🚚» title, the carrier/service line with its cost (names
+ * `plain`), the credit, the bold amount the customer pays and the ETA, one
+ * per line.
+ */
 export function minimalShippingReply(result: MinimalShippingResult): string {
   switch (result.kind) {
     case 'quoted': {
@@ -866,9 +878,10 @@ export function minimalShippingReply(result: MinimalShippingResult): string {
           : { days: result.eta?.days ?? result.option?.etaDays ?? null },
       );
       const carrier = result.option
-        ? ` con ${result.option.carrier} (${result.option.service})`
+        ? plain(`${result.option.carrier} ${result.option.service}`)
         : '';
       return [
+        sectionTitle('Envío a domicilio', TITLE_EMOJI.shipping),
         ...(result.zoneStatus === 'FREE'
           ? [
               result.zipCode === null
@@ -876,17 +889,19 @@ export function minimalShippingReply(result: MinimalShippingResult): string {
                 : `Su envío al código postal ${result.zipCode} no tiene costo.`,
             ]
           : [
-              `Envío a domicilio${carrier}: ${shippingMxn(result.costCents)}.`,
+              carrier === ''
+                ? `Costo: ${money(result.costCents)}`
+                : `${carrier} — ${money(result.costCents)}`,
               ...(result.creditCents > 0
                 ? [
-                    `Usted tiene un crédito de ${shippingMxn(result.creditCents)} por sus productos.`,
+                    `Usted tiene un crédito de ${money(result.creditCents)} por sus productos.`,
                   ]
                 : []),
-              `Usted paga ${shippingMxn(result.customerChargeCents)}.`,
+              bold(`Usted paga: ${money(result.customerChargeCents)}`),
             ]),
         // F1: the order summary follows in the same reply; no magic phrase.
         ...(eta === null ? [] : [eta]),
-      ].join(' ');
+      ].join('\n');
     }
     case 'zone_pending':
       return `Estamos validando la entrega a ${zipPhrase(result.zipCode)}. Le avisamos por aquí en cuanto quede lista; mientras tanto, si prefiere, puede recoger su pedido en tienda.`;

@@ -33,6 +33,7 @@ import {
   ReceiptReviewStatusRegistry,
   type ReceiptReviewStatusPort,
 } from '../domain/receipt-review-status';
+import { bold, money, plain, sectionTitle } from '../domain/whatsapp-format';
 import {
   parseMinimalCart,
   type MinimalCartState,
@@ -63,21 +64,26 @@ export function minimalReceiptInReviewReply(folio: string | null): string {
 export const MINIMAL_PAYMENT_UNAVAILABLE_REPLY =
   'No pude obtener los datos en este momento; ya le avisé al equipo y se los comparto en cuanto estén.';
 
-const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
-
-/** Transfer instructions from the backend's active bank account. */
+/**
+ * Transfer instructions from the backend's active bank account, as a block
+ * (message formatting S2): bold title, one bold label per line, the photo
+ * instruction apart. Values are `plain` so they never break the markup.
+ */
 export function minimalPaymentInstructions(
   detail: Pick<
     PaymentDetail,
     'bankName' | 'beneficiary' | 'clabe' | 'accountNumber'
   >,
 ): string {
+  const field = (label: string, value: string) =>
+    `${bold(`${label}:`)} ${plain(value)}`;
   return [
-    'Para pagar por transferencia:',
-    `Banco: ${detail.bankName}`,
-    `Beneficiario: ${detail.beneficiary}`,
-    `CLABE: ${detail.clabe}`,
-    `Cuenta: ${detail.accountNumber}`,
+    sectionTitle('Pago por transferencia'),
+    field('Banco', detail.bankName),
+    field('Beneficiario', detail.beneficiary),
+    field('CLABE', detail.clabe),
+    field('Cuenta', detail.accountNumber),
+    '',
     'Cuando haga la transferencia, envíe aquí la foto de su comprobante.',
   ].join('\n');
 }
@@ -240,7 +246,7 @@ export class MinimalPaymentService {
     if (sale === undefined) return null;
     if (sale.paid === true)
       return {
-        reply: `Pedido ${orderLabel(sale)}. Total: ${mxn(sale.totalCents)}.\n${MINIMAL_PAYMENT_ALREADY_PAID_REPLY}`,
+        reply: `Pedido ${orderLabel(sale)}. Total: ${money(sale.totalCents)}.\n${MINIMAL_PAYMENT_ALREADY_PAID_REPLY}`,
       };
     // Follow-ups S6: no «Pagar en tienda» button while a receipt of this
     // order is in review (a tap or a typed «en tienda» still gets the
@@ -455,13 +461,13 @@ const orderLabel = (sale: PlacedSale) =>
   sale.folio === null ? 'sin folio' : `con folio ${sale.folio}`;
 
 function paymentLead(sale: PlacedSale): string {
-  return `Pedido ${orderLabel(sale)}. Total a pagar: ${mxn(sale.totalCents)}.`;
+  return `Pedido ${orderLabel(sale)}. Total a pagar: ${money(sale.totalCents)}.`;
 }
 
 function pendingQuestion(sale: PlacedSale): string {
   return (
     `El cliente quiere pagar por transferencia el pedido ${orderLabel(sale)} ` +
-    `(total ${mxn(sale.totalCents)}) y no pude obtener los datos bancarios; ` +
+    `(total ${money(sale.totalCents)}) y no pude obtener los datos bancarios; ` +
     'necesita que el equipo se los comparta.'
   );
 }

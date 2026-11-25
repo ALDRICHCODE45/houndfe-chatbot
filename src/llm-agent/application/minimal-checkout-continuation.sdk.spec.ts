@@ -283,7 +283,7 @@ describe('F1 checkout continues to the order summary by itself', () => {
     expect(h.api.createCheckout).not.toHaveBeenCalled();
 
     const created = await h.turn('claro');
-    expect(created).toContain('Su pedido quedó registrado con folio B-42.');
+    expect(created).toContain('*¡Pedido registrado!* ✅\n*Folio:* B-42\n');
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     await h.turn('ok');
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);

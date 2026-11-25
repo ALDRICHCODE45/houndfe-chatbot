@@ -5,6 +5,7 @@ import {
   formatDay,
   zonedParts,
 } from '../../scheduling/domain/slot-time';
+import { bold, plain } from '../../llm-agent/domain/whatsapp-format';
 
 /**
  * Pay in store (odd/tasks/pay-in-store.md S3): the exact customer copy, in
@@ -112,17 +113,53 @@ const endSentence = (text: string): string =>
 const order = (folio: string | null): string =>
   folio === null || folio === '' ? 'su pedido' : `su pedido ${folio}`;
 
-/** The tap answer once the backend holds the order (S3). */
+/**
+ * Message formatting S2: the store of the hold reply on its own lines — the
+ * bold branch name closing the «Páselo…» sentence, then the address and
+ * the bold «Horario:» line (null parts omitted). Unknown location → «la
+ * tienda.». Backend values are `plain`.
+ */
+function heldStoreLines(
+  location: CheckoutPickupLocation | null | undefined,
+): string[] {
+  const lead = 'Páselo a recoger y pagar en ';
+  const name =
+    location === null || location === undefined ? '' : plain(location.name);
+  if (location === null || location === undefined || name === '')
+    return [`${lead}la tienda.`];
+  const address =
+    location.address === null
+      ? ''
+      : plain(withoutFinalDot(location.address.formatted));
+  const hours = location.hours === null ? '' : plain(location.hours.summary);
+  return [
+    `${lead}${bold(withoutFinalDot(name))}`,
+    ...(address === '' ? [] : [address]),
+    ...(hours === '' ? [] : [`${bold('Horario:')} ${hours}`]),
+  ];
+}
+
+/**
+ * The tap answer once the backend holds the order (S3), in the message
+ * formatting S2 layout: folio and deadline in bold, the store block, the
+ * cancellation notice apart.
+ */
 export function payInStoreHeldReply(input: {
   folio: string | null;
   holdUntil: string;
   location: CheckoutPickupLocation | null | undefined;
 }): string {
-  return (
-    `${endSentence(`Listo, le apartamos ${order(input.folio)} hasta el ${payInStoreDateTime(input.holdUntil)}`)} ` +
-    `Páselo a recoger y pagar en ${payInStoreStoreText(input.location)}. ` +
-    'Si no pasa antes de esa fecha, el pedido se cancela.'
-  );
+  const folio =
+    input.folio === null || input.folio === ''
+      ? 'su pedido'
+      : `su pedido ${bold(input.folio)}`;
+  return [
+    `Listo, le apartamos ${folio} hasta el ${bold(payInStoreDateTime(input.holdUntil))}`,
+    '',
+    ...heldStoreLines(input.location),
+    '',
+    'Si no pasa antes de esa fecha, el pedido se cancela.',
+  ].join('\n');
 }
 
 /**
