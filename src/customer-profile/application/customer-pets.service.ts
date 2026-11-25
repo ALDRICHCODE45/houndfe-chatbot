@@ -137,8 +137,13 @@ export type SeparateAmbiguousOutcome =
   | 'failed'
   | 'unavailable';
 
-/** T4c-2b Q3: what `captureForRef` did. `none`: not a current known pet. */
-export type CaptureForRefOutcome = 'applied' | 'none' | 'unavailable';
+/** T4c-2b Q3: what `captureForRef` did. `none`: not a current known pet.
+ *  T4c-2b-fix-2 M2: `failed`: the write did not land (never `applied`). */
+export type CaptureForRefOutcome =
+  | 'applied'
+  | 'none'
+  | 'unavailable'
+  | 'failed';
 
 /** T4c-2b-fix K3: what `archivedPetNameBase` found. `failed`: the archived
  *  pets could not be read (never a guess). */
@@ -596,7 +601,9 @@ export class CustomerPetsService {
    * T4c-2b Q3 (S10): the customer confirmed that a diminutive names this
    * known pet: the statement's facts go to the pet `ref` (backend PATCH,
    * local merge, legacy merge), never by name. A ref that is not a current
-   * known pet is `none`.
+   * known pet is `none`. T4c-2b-fix-2 M2: `applied` only once the write
+   * landed (or nothing was left to write); a refused or thrown write is
+   * `failed`.
    */
   async captureForRef(
     senderId: string,
@@ -615,11 +622,13 @@ export class CustomerPetsService {
           outcome = 'none';
           return;
         }
-        outcome = 'applied';
-        if (hasPetFacts(facts))
-          await this.applyTo(senderId, state, target, facts, fence);
+        const landed =
+          !hasPetFacts(facts) ||
+          (await this.applyTo(senderId, state, target, facts, fence));
+        outcome = landed ? 'applied' : 'failed';
       } catch (error) {
         this.warn('capture', error);
+        outcome = 'failed';
       }
     });
     return outcome;
@@ -857,7 +866,8 @@ export class CustomerPetsService {
           );
           return;
         }
-        return await this.applyTo(senderId, state, named[0].ref, facts, fence);
+        await this.applyTo(senderId, state, named[0].ref, facts, fence);
+        return;
       }
       const match = matchPetForFacts<Ref>(candidates, facts);
       switch (match.kind) {
@@ -867,7 +877,8 @@ export class CustomerPetsService {
         case 'new':
           return await this.addLocal(senderId, state, facts, fence);
         case 'match':
-          return await this.applyTo(senderId, state, match.ref, facts, fence);
+          await this.applyTo(senderId, state, match.ref, facts, fence);
+          return;
       }
     } catch (error) {
       this.warn('capture', error);
@@ -1035,30 +1046,32 @@ export class CustomerPetsService {
 
   /* ------------------------------------------------------------- writes */
 
+  /** The facts go to the pet `ref`; `true` when they landed (or were
+   *  already stored), `false` when the write was refused or did not land. */
   private async applyTo(
     senderId: string,
     state: SenderPets,
     ref: Ref,
     facts: PetFacts,
     fence: Fence,
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (ref.kind === 'legacy') {
       // Until T6 the legacy single pet keeps its merge-only profile write.
       await this.recordLegacy(senderId, facts);
-      return;
+      return true;
     }
     if (ref.kind === 'backend') {
-      if (state.scope.kind !== 'customer') return;
+      if (state.scope.kind !== 'customer') return false;
       const pet = state.scope.pets.find((candidate) => candidate.id === ref.id);
-      if (pet !== undefined)
-        await this.patchBackend(
-          senderId,
-          state.scope.customerId,
-          pet,
-          facts,
-          fence,
-        );
-      return;
+      if (pet === undefined) return false;
+      const patched = await this.patchBackend(
+        senderId,
+        state.scope.customerId,
+        pet,
+        facts,
+        fence,
+      );
+      return patched === 'ok' || patched === 'noop';
     }
     // E1: merged into the entry as the list stands when the write runs.
     let outcome = 'gone' as 'gone' | 'conflict' | 'unchanged' | 'changed';
@@ -1076,11 +1089,12 @@ export class CustomerPetsService {
     });
     if (outcome === 'conflict') {
       this.logger.log('pet facts not stored: another species');
-      return;
+      return false;
     }
-    if (outcome === 'gone' || (outcome === 'changed' && !wrote)) return;
+    if (outcome === 'gone' || (outcome === 'changed' && !wrote)) return false;
     if (state.scope.kind === 'customer')
       await this.uploadPending(senderId, fence);
+    return true;
   }
 
   /** The legacy single pet's merge-only write (G1: it has no allergies). */

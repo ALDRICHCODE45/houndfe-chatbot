@@ -3258,6 +3258,38 @@ describe('CustomerPetsService (T4c-2b)', () => {
       ]);
     });
 
+    it.each([
+      ['a thrown PATCH', () => Promise.reject(new TypeError('down'))],
+      [
+        'a refused PATCH',
+        () => Promise.resolve({ kind: 'PET_ARCHIVED' as const }),
+      ],
+    ])(
+      'T4c-2b-fix-2 M2: %s → failed (never reported applied)',
+      async (_label, answer) => {
+        const h = harness(found([backend(), otherBruno()]));
+        h.client.patchPet.mockImplementation(answer);
+        await h.service.prepare(SENDER);
+        await expect(
+          h.service.captureForRef(SENDER, `backend:${uuid(60)}`, {
+            allergies: 'pollo',
+          }),
+        ).resolves.toBe('failed');
+        expect(h.client.patchPet).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('T4c-2b-fix-2 M2: facts already stored (no PATCH needed) → applied', async () => {
+      const h = harness(found([backend(), otherBruno({ allergies: 'pollo' })]));
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.captureForRef(SENDER, `backend:${uuid(60)}`, {
+          allergies: 'pollo',
+        }),
+      ).resolves.toBe('applied');
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+    });
+
     it('a ref that is not a current pet → none, nothing written', async () => {
       const h = harness(found([backend()]));
       await h.service.prepare(SENDER);

@@ -185,7 +185,10 @@ import { ConversationGates } from '../../conversation-gates/application/conversa
 import { DurablePaymentOffer } from './gates/payment-offer.gate';
 import {
   DurablePetChoice,
+  foldWords,
   matchPetChoiceAnswer,
+  PET_CHOICE_FACT_MAX_CHARS,
+  PET_CHOICE_NAME_MAX_CHARS,
   PET_CHOICE_OPTIONS_MAX,
   PET_CHOICE_REQUEST_MAX_CHARS,
   isOtherPetAnswer,
@@ -402,6 +405,9 @@ export const PET_AMBIGUOUS_ASK_INTERVAL_MS = 24 * 60 * 60_000;
 export const petDiminutiveQuestion = (name: string, base: string) =>
   `¿${name} es ${base} o es otra mascota?`;
 export const PET_DIMINUTIVE_SAME_REPLY = 'Gracias, ya lo anoté.';
+/** T4c-2b-fix-2 M2: the diminutive answer's write is still running (over
+ *  the pet budget): never confirmed. */
+export const PET_DIMINUTIVE_PENDING_REPLY = 'Gracias por contarme.';
 export const PET_DIMINUTIVE_FORGOTTEN_REPLY = 'Entiendo, gracias por contarme.';
 export const PET_DIMINUTIVE_NEW_REPLY =
   'Gracias, ya la anoté como otra mascota.';
@@ -421,7 +427,7 @@ const ASK_WHICH_PET_DESCRIPTION =
 export const PET_FORGOTTEN_WINDOW_MS = 5 * 60_000;
 
 /** Generous input cap; the profile store bounds each field again. */
-const PET_FACT = z.string().min(1).max(500).optional();
+const PET_FACT = z.string().min(1).max(PET_CHOICE_FACT_MAX_CHARS).optional();
 
 export const RESTOCK_CAUTIOUS_REPLY =
   'Por ahora no puedo preparar esa consulta de reposición.';
@@ -490,7 +496,7 @@ function statementPetFacts(text: string): {
 }
 
 /** T4c-2b Q3: the facts the diminutive question keeps (non-empty strings,
- *  ≤ 500 characters each, as the gate payload allows). */
+ *  ≤ PET_CHOICE_FACT_MAX_CHARS each, as the gate payload allows). */
 function choiceFacts(facts: PetFacts): PetChoiceFacts {
   const keys = [
     'name',
@@ -504,19 +510,11 @@ function choiceFacts(facts: PetFacts): PetChoiceFacts {
   const out: Record<string, string> = {};
   for (const key of keys) {
     const value = facts[key]?.trim();
-    if (value !== undefined && value !== '') out[key] = value.slice(0, 500);
+    if (value !== undefined && value !== '')
+      out[key] = value.slice(0, PET_CHOICE_FACT_MAX_CHARS);
   }
   return out;
 }
-
-/** Lowercase, no accents, letters/digits and single spaces only. */
-const foldWords = (value: string) =>
-  value
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .trim();
 
 /** T4c-2b-fix K1: words of an address (or a place) in the message. */
 const ADDRESS_WORDS =
@@ -3018,8 +3016,9 @@ export class MinimalCatalogAgentService {
     /** T4c-2a P4: «Mascota de este pedido» line of the chosen pet. */
     chosenPet?: string,
     /** T4c-2b-fix K4: the message continued after the diminutive question
-     *  about `diminutive` was answered (no second diminutive question). */
-    petContinuation?: { diminutive: string },
+     *  about `diminutive` was answered (no second diminutive question).
+     *  T4c-2b-fix-2 M3: `written` when the answer settled the name. */
+    petContinuation?: { diminutive: string; written: boolean },
   ): Promise<CustomerReply & { onSent?: () => void; silent?: true }> {
     // S2/S5 (cost protection): budget + per-number limit, one store call
     // (skipped when the photo turn was admitted before its vision call).
@@ -3320,7 +3319,12 @@ export class MinimalCatalogAgentService {
           request: input.text,
           ...(petContinuation === undefined
             ? {}
-            : { answeredDiminutive: petContinuation.diminutive }),
+            : {
+                continued: true as const,
+                ...(petContinuation.written
+                  ? { answeredDiminutive: petContinuation.diminutive }
+                  : {}),
+              }),
         }),
         ...this.petChoiceTools(input, petChoiceRun, memoryRun, styled, traceId),
         ...this.askTeamTools(input, askTeamRun, traceId),
@@ -3453,11 +3457,7 @@ export class MinimalCatalogAgentService {
         facts.name === undefined || !this.diminutiveQuestionsOn(input.senderId)
           ? null
           : await this.diminutiveTarget(input.senderId, facts.name);
-      if (
-        target !== null &&
-        target !== 'unknown' &&
-        !(await this.purchaseUnderway(input.senderId))
-      )
+      if (target !== null && !(await this.purchaseUnderway(input.senderId)))
         memoryRun.value = this.diminutiveQuestion(
           facts.name!,
           facts,
@@ -4458,8 +4458,17 @@ export class MinimalCatalogAgentService {
         : await this.petWriteWithinBudget('resolve ambiguous', () =>
             pets.resolveAmbiguous(senderId, live.localId, id),
           );
-    const line =
-      outcome === 'not_found' ? null : this.chosenPetLine(senderId, option);
+    if (outcome === 'not_found')
+      return this.petChoiceReply(input)(STALE_BUTTON_FALLBACK);
+    if (outcome !== 'resolved') {
+      // T4c-2b-fix-2 M4: failed, unavailable or still running: not
+      // resolved. The entry may stay blocked, so the 24 h suppression is
+      // dropped (asked again on a later mention) and the message continues
+      // with no chosen pet.
+      this.petAmbiguousAsked.get(senderId)?.delete(live.localId);
+      return this.continuePetChoice(input, live.request);
+    }
+    const line = this.chosenPetLine(senderId, option);
     if (line === null) return this.petChoiceReply(input)(STALE_BUTTON_FALLBACK);
     return this.continuePetChoice(input, live.request, line);
   }
@@ -4472,6 +4481,10 @@ export class MinimalCatalogAgentService {
    * customer's message stored, it then continues through the model (with
    * the chosen pet's line when it is a known pet, and no second diminutive
    * question); a row without it replies as before.
+   * T4c-2b-fix-2 M2/M3: a failed or still running write is never confirmed
+   * (no «ya lo anoté», no chosen-pet line); the continued message keeps
+   * the diminutive check off only when the answer wrote what it had to (or
+   * was the forgotten pet), so the model can still remember the facts.
    */
   private async answerDiminutiveChoice(
     input: {
@@ -4487,22 +4500,29 @@ export class MinimalCatalogAgentService {
     const { senderId } = input;
     const reply = this.petChoiceReply(input);
     const { request } = live;
-    const answered = (text: string, line?: string) =>
+    /** `written`: the answer settled the name (its write landed, or it was
+     *  the forgotten pet); only then is the continued turn's check off. */
+    const answered = (text: string, written: boolean, line?: string) =>
       request === undefined
         ? reply(text)
-        : this.continuePetChoice(input, request, line, live.name);
+        : this.continuePetChoice(input, request, line, {
+            name: live.name,
+            written,
+          });
     if (option.ref === PET_CHOICE_FORGOTTEN_REF)
-      return answered(PET_DIMINUTIVE_FORGOTTEN_REPLY);
+      return answered(PET_DIMINUTIVE_FORGOTTEN_REPLY, true);
     const pets = this.pets;
     if (pets === undefined || !this.petListLoaded(senderId))
-      return answered(PET_CHOICE_UNAVAILABLE_REPLY);
+      return answered(PET_CHOICE_UNAVAILABLE_REPLY, false);
     const facts: PetFacts = { ...live.facts };
     const legacy = this.profiles?.cached(senderId)?.pet;
     if (option.ref === PET_CHOICE_OTHER_REF) {
-      await this.petWriteWithinBudget('capture', () =>
+      const captured = await this.petWriteWithinBudget('capture', () =>
         pets.capture(senderId, facts, legacy),
       );
-      return answered(PET_DIMINUTIVE_NEW_REPLY);
+      return captured === 'over_budget'
+        ? answered(PET_DIMINUTIVE_PENDING_REPLY, false)
+        : answered(PET_DIMINUTIVE_NEW_REPLY, true);
     }
     // The pet keeps its own name (never renamed to the diminutive).
     const rest: PetFacts = { ...facts };
@@ -4510,13 +4530,21 @@ export class MinimalCatalogAgentService {
     const outcome = await this.petWriteWithinBudget('capture', () =>
       pets.captureForRef(senderId, option.ref, rest, legacy),
     );
-    if (outcome === 'none') return answered(STALE_BUTTON_FALLBACK);
-    if (outcome === 'unavailable')
-      return answered(PET_CHOICE_UNAVAILABLE_REPLY);
-    return answered(
-      PET_DIMINUTIVE_SAME_REPLY,
-      pets.chosenPetPromptLine(senderId, option.ref) ?? undefined,
-    );
+    switch (outcome) {
+      case 'applied':
+        return answered(
+          PET_DIMINUTIVE_SAME_REPLY,
+          true,
+          pets.chosenPetPromptLine(senderId, option.ref) ?? undefined,
+        );
+      case 'none':
+        return answered(STALE_BUTTON_FALLBACK, false);
+      case 'over_budget':
+        return answered(PET_DIMINUTIVE_PENDING_REPLY, false);
+      case 'unavailable':
+      case 'failed':
+        return answered(PET_CHOICE_UNAVAILABLE_REPLY, false);
+    }
   }
 
   /** T4c-2b: a pet store write waited at most PET_PREPARE_BUDGET_MS; past
@@ -4551,8 +4579,9 @@ export class MinimalCatalogAgentService {
     },
     request: string,
     line?: string,
-    /** T4c-2b-fix K4: the answered diminutive (no second question). */
-    diminutive?: string,
+    /** T4c-2b-fix K4: the answered diminutive (no second question);
+     *  M3: `written` when the answer settled it. */
+    diminutive?: { name: string; written: boolean },
   ): Promise<MinimalCatalogAgentDecision> {
     this.order?.dismiss(input.senderId);
     return this.decision(
@@ -4572,7 +4601,9 @@ export class MinimalCatalogAgentService {
         },
         undefined,
         line,
-        diminutive === undefined ? undefined : { diminutive },
+        diminutive === undefined
+          ? undefined
+          : { diminutive: diminutive.name, written: diminutive.written },
       ),
     );
   }
@@ -4759,14 +4790,15 @@ export class MinimalCatalogAgentService {
    * T4c-2b Q3 / T4c-2b-fix K3: the pets `name` may be a diminutive of: a
    * known or just-forgotten pet (as `petDiminutive`), else a pet ARCHIVED
    * in the backend (`pets` empty: answered like a forgotten one), looked
-   * up within the pet budget. `unknown` when that lookup failed or ran
-   * over the budget (logged): never asked, never written. `null` when it
-   * is no such diminutive.
+   * up within the pet budget. `null` when it is no such diminutive.
+   * T4c-2b-fix-2 M1: also `null` when that lookup failed or ran over the
+   * budget (logged): the capture goes ahead as before T4c-2b-fix (local
+   * entry, create through the I1 archived-twin guard), never dropped.
    */
   private async diminutiveTarget(
     senderId: string,
     name: string,
-  ): Promise<{ base: string; pets: KnownPet[] } | 'unknown' | null> {
+  ): Promise<{ base: string; pets: KnownPet[] } | null> {
     const known = this.petDiminutive(senderId, name);
     if (known !== null) return known;
     if (!this.needsArchivedCheck(senderId, name)) return null;
@@ -4775,11 +4807,12 @@ export class MinimalCatalogAgentService {
     );
     if (archived === 'over_budget') {
       this.logger.warn(
-        `customer pets archived pet names over budget (${PET_PREPARE_BUDGET_MS} ms): no pet name question nor write this turn`,
+        `customer pets archived pet names over budget (${PET_PREPARE_BUDGET_MS} ms): no pet name question; the capture goes ahead`,
       );
-      return 'unknown';
+      return null;
     }
-    if (archived.kind === 'failed') return 'unknown';
+    // A failed lookup is logged by the store and by rememberTurn's capture.
+    if (archived.kind === 'failed') return null;
     return archived.kind === 'none' ? null : { base: archived.name, pets: [] };
   }
 
@@ -4811,7 +4844,7 @@ export class MinimalCatalogAgentService {
     target: { base: string; pets: KnownPet[] },
     request: string,
   ): PetChoiceRun['value'] {
-    if (name.trim().length > 60) return null;
+    if (name.trim().length > PET_CHOICE_NAME_MAX_CHARS) return null;
     const shown: PetChoicePet[] =
       target.pets.length > 0
         ? target.pets
@@ -4870,7 +4903,7 @@ export class MinimalCatalogAgentService {
       choice: {
         purpose: 'forget',
         options: pick.options,
-        name: name.trim().slice(0, 60),
+        name: name.trim().slice(0, PET_CHOICE_NAME_MAX_CHARS),
         ...(reason === undefined ? {} : { reason }),
       },
     };
@@ -4878,12 +4911,13 @@ export class MinimalCatalogAgentService {
 
   private memoryTools(
     senderId: string,
-    memoryRun: PetChoiceRun = { attempted: false, value: null },
-    petChoiceRun: PetChoiceRun | null = null,
-    styled: (text: string) => string = (text) => text,
-    /** T4c-2b-fix K4: the turn's message, and the diminutive already
-     *  answered when the turn continues it. */
-    turn: { request: string; answeredDiminutive?: string } = { request: '' },
+    memoryRun: PetChoiceRun,
+    petChoiceRun: PetChoiceRun | null,
+    styled: (text: string) => string,
+    /** T4c-2b-fix K4: the turn's message, whether it continues an
+     *  answered diminutive question (no second question), and (M3) the
+     *  diminutive that answer settled. */
+    turn: { request: string; continued?: true; answeredDiminutive?: string },
   ): ToolSet {
     const profiles = this.profiles;
     if (profiles === undefined) return {};
@@ -4911,7 +4945,10 @@ export class MinimalCatalogAgentService {
           // archived «Bruno» is asked before any write; never written
           // unconfirmed. K4: the name the customer just answered about is
           // not asked again (its answer already wrote what it had to); K5:
-          // no question while a purchase is under way.
+          // no question while a purchase is under way. T4c-2b-fix-2 M3: on
+          // a continued turn whose answer wrote nothing, no second question
+          // either, but the tool says the name needs confirmation (never a
+          // silent `remembered: false`).
           const target =
             this.pets !== undefined &&
             !this.petsOverBudget.has(senderId) &&
@@ -4925,8 +4962,7 @@ export class MinimalCatalogAgentService {
             )
               return { ok: true as const, remembered: false as const };
             const question =
-              target !== 'unknown' &&
-              turn.answeredDiminutive === undefined &&
+              turn.continued === undefined &&
               this.petChoices !== undefined &&
               questionFree() &&
               !(await this.purchaseUnderway(senderId))
@@ -4984,8 +5020,8 @@ export class MinimalCatalogAgentService {
       forgetPet: tool({
         description: FORGET_PET_DESCRIPTION,
         inputSchema: z.strictObject({
-          name: z.string().min(1).max(60),
-          reason: z.string().min(1).max(500).optional(),
+          name: z.string().min(1).max(PET_CHOICE_NAME_MAX_CHARS),
+          reason: z.string().min(1).max(PET_CHOICE_FACT_MAX_CHARS).optional(),
         }),
         execute: async ({ name, reason }) => {
           // T4c-1-fix N1: whatever the outcome, this turn's deterministic
@@ -5139,7 +5175,8 @@ export class MinimalCatalogAgentService {
       // written unconfirmed (the turn asked, or could not ask).
       // T4c-2b-fix K3: nor one of a pet ARCHIVED in the backend (the turn's
       // lookup, or one started here: the capture waits for it in the
-      // background; a failed lookup writes nothing).
+      // background). T4c-2b-fix-2 M1: a failed lookup never drops the
+      // capture: it goes ahead as before (logged); only a found base holds.
       if (
         !this.petRecentlyForgotten(input.senderId, facts.name) &&
         this.petDiminutive(input.senderId, facts.name) === null
@@ -5148,7 +5185,12 @@ export class MinimalCatalogAgentService {
           ? this.archivedCheck(input.senderId, facts.name!)
           : null;
         void this.petsInBackground('capture', async () => {
-          if (check !== null && (await check).kind !== 'none') return;
+          const archived = check === null ? null : await check;
+          if (archived?.kind === 'base') return;
+          if (archived?.kind === 'failed')
+            this.logger.warn(
+              'customer pets archived pet names unknown: the capture goes ahead',
+            );
           await pets.capture(input.senderId, facts, legacy);
         });
       }

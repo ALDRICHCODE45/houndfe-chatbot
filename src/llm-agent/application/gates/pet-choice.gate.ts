@@ -10,6 +10,13 @@ export const MINIMAL_PET_CHOICE_TTL_MS = 15 * 60 * 1000;
 /** Longest original request kept with the question (payload cap 64 KiB). */
 export const PET_CHOICE_REQUEST_MAX_CHARS = 8000;
 
+/** Longest pet fact (and forget reason) a question keeps (contract: notes
+ *  ≤ 500). */
+export const PET_CHOICE_FACT_MAX_CHARS = 500;
+
+/** Longest pet name a question keeps (contract: name 1–60). */
+export const PET_CHOICE_NAME_MAX_CHARS = 60;
+
 /**
  * Why the bot asked which pet. T4c-2a: `request` (a product request that
  * named no pet). T4c-2b: `forget` (forgetPet named 2+ pets with that name:
@@ -102,7 +109,8 @@ const optionsSchema = z
   .min(1)
   .max(PET_CHOICE_OPTIONS_MAX);
 const requestSchema = z.string().min(1).max(PET_CHOICE_REQUEST_MAX_CHARS);
-const fact = z.string().min(1).max(500).optional();
+const fact = z.string().min(1).max(PET_CHOICE_FACT_MAX_CHARS).optional();
+const nameSchema = z.string().min(1).max(PET_CHOICE_NAME_MAX_CHARS);
 
 // `request` keeps the exact T4c-2a shape: rows written by 5ab9410/848cdf2
 // load unchanged.
@@ -115,8 +123,8 @@ const payloadSchema = z.discriminatedUnion('purpose', [
   z.strictObject({
     purpose: z.literal('forget'),
     options: optionsSchema,
-    name: z.string().min(1).max(60),
-    reason: z.string().min(1).max(500).optional(),
+    name: nameSchema,
+    reason: z.string().min(1).max(PET_CHOICE_FACT_MAX_CHARS).optional(),
   }),
   z.strictObject({
     purpose: z.literal('ambiguous'),
@@ -127,7 +135,7 @@ const payloadSchema = z.discriminatedUnion('purpose', [
   z.strictObject({
     purpose: z.literal('diminutive'),
     options: optionsSchema,
-    name: z.string().min(1).max(60),
+    name: nameSchema,
     facts: z.strictObject({
       name: fact,
       species: fact,
@@ -249,20 +257,20 @@ function copy(choice: PetChoice): PetChoice {
   }
 }
 
-/** Lowercase, no accents, letters/digits and single spaces only. */
-const foldAnswer = (text: string): string =>
+/** Lowercase, no accents, letters/digits and single spaces only (the one
+ *  text folder of the pet answers and pet references). */
+export const foldWords = (text: string): string =>
   text
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim();
 
 /** «es para el Max» → also «para el max», «el max», «max». */
 function answerForms(text: string): Set<string> {
   const forms = new Set<string>();
-  let rest = foldAnswer(text);
+  let rest = foldWords(text);
   forms.add(rest);
   for (const lead of [/^(?:es|son|seria)\s+/, /^para\s+/, /^(?:el|la|mi)\s+/]) {
     rest = rest.replace(lead, '');
@@ -289,8 +297,8 @@ export function matchPetChoiceAnswer(
     (option) =>
       option.ref !== otherRef &&
       option.matchable !== false &&
-      foldAnswer(option.text) !== '' &&
-      forms.has(foldAnswer(option.text)),
+      foldWords(option.text) !== '' &&
+      forms.has(foldWords(option.text)),
   );
   return matched.length === 1 ? matched[0] : null;
 }
@@ -319,7 +327,7 @@ const OTHER_PET_ANSWERS: ReadonlySet<string> = new Set([
  * behaviour); `matchPetChoiceAnswer` never answers `other`.
  */
 export function isOtherPetAnswer(text: string): boolean {
-  const folded = foldAnswer(text)
+  const folded = foldWords(text)
     .replace(/^no\s+/, '')
     .replace(/^(?:es|son|seria)\s+/, '');
   return OTHER_PET_ANSWERS.has(folded);

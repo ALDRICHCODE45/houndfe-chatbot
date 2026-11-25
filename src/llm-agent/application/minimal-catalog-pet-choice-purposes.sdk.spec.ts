@@ -23,6 +23,7 @@ import {
   PET_CHOICE_UNAVAILABLE_REPLY,
   PET_DIMINUTIVE_FORGOTTEN_REPLY,
   PET_DIMINUTIVE_NEW_REPLY,
+  PET_DIMINUTIVE_PENDING_REPLY,
   PET_DIMINUTIVE_SAME_REPLY,
   PET_FORGET_DONE_REPLY,
   PET_FORGET_PENDING_REPLY,
@@ -989,7 +990,7 @@ describe('T4c-2b-fix (S3, S10): pet questions only when they matter, typed «es 
       expect(w.backend.createPet).not.toHaveBeenCalled();
     });
 
-    it('the listing fails → no question, nothing written, logged; the model reply stands', async () => {
+    it('T4c-2b-fix-2 M1: the listing fails → no question, logged; the capture goes ahead as before (local entry; the I1 guard, whose listing fails too, holds the create)', async () => {
       const w = world({ current: customer([max()]) });
       w.backend.listPets.mockResolvedValue({ kind: 'FORBIDDEN' });
       const h = w.boot();
@@ -1000,7 +1001,9 @@ describe('T4c-2b-fix (S3, S10): pet questions only when they matter, typed «es 
       expect(decision.reply).toBe('¡Qué lindo Brunito!');
       expect(decision.interactive).toBeUndefined();
       expect(w.backend.createPet).not.toHaveBeenCalled();
-      await expect(w.local()).resolves.toEqual([]);
+      await expect(w.local()).resolves.toMatchObject([
+        { name: 'Brunito', species: 'perro' },
+      ]);
       await expect(gateRow(w)).resolves.toBeNull();
       expect(
         warn.mock.calls.some((args) =>
@@ -1190,6 +1193,327 @@ describe('T4c-2b-fix (S3, S10): pet questions only when they matter, typed «es 
       expect(w.backend.createPet).not.toHaveBeenCalled();
       expect(w.backend.patchPet).not.toHaveBeenCalled();
       await expect(gateRow(w)).resolves.toBeNull();
+    });
+  });
+});
+
+describe('T4c-2b-fix-2 (S3, S10): pet facts never dropped silently nor confirmed when not written', () => {
+  let warn: jest.SpiedFunction<Logger['warn']>;
+  beforeEach(() => {
+    warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const createEcho = (w: ReturnType<typeof world>, id: string) =>
+    w.backend.createPet.mockImplementation(
+      (_c: string, body: { name: string }) =>
+        Promise.resolve({
+          kind: 'ok',
+          created: true,
+          pet: pet({ id, ...body }),
+          warnings: [],
+        }),
+    );
+  const archivedNegra = () =>
+    pet({
+      id: 'f0000000-0000-4000-8000-000000000090',
+      name: 'Negra',
+      status: 'ARCHIVED',
+      archivedAt: '2026-11-20T10:00:00.000Z',
+      archivedReason: 'falleció',
+      version: 4,
+    });
+  const NEGRITA = 'mi perrita Negrita tiene 2 años';
+  const archivedLogged = () =>
+    warn.mock.calls.some((args) =>
+      String(args[0]).includes('archived pet names'),
+    );
+
+  describe('M1: a failed archived-name lookup never drops a capture', () => {
+    it('pin: «mi perrita Negrita tiene 2 años» with the listing failing → no question; the entry is created (I1 guard listing ok)', async () => {
+      const w = world({ current: customer([max()]) });
+      w.backend.listPets
+        .mockRejectedValueOnce(new TypeError('down'))
+        .mockResolvedValue({ kind: 'ok', pets: [max()] });
+      createEcho(w, 'c0000000-0000-4000-8000-000000000091');
+      const h = w.boot();
+      const decision = await h.turn(NEGRITA, [[say('¡Qué linda Negrita!')]]);
+      await flush();
+      expect(decision.reply).toBe('¡Qué linda Negrita!');
+      expect(decision.interactive).toBeUndefined();
+      await expect(gateRow(w)).resolves.toBeNull();
+      expect(w.backend.createPet).toHaveBeenCalledTimes(1);
+      expect(w.backend.createPet).toHaveBeenCalledWith(
+        CUSTOMER_ID,
+        expect.objectContaining({ name: 'Negrita', species: 'DOG' }),
+        expect.any(String),
+      );
+      expect(archivedLogged()).toBe(true);
+    });
+
+    it('pin: with Negra ARCHIVED found → «¿Negrita es Negra o es otra mascota?», nothing written', async () => {
+      const w = world({ current: customer([max()]) });
+      w.backend.listPets.mockResolvedValue({
+        kind: 'ok',
+        pets: [archivedNegra(), max()],
+      });
+      const h = w.boot();
+      const decision = await h.turn(NEGRITA, [[say('¡Qué linda Negrita!')]]);
+      await flush();
+      expect(decision.reply).toBe('¿Negrita es Negra o es otra mascota?');
+      expect(w.backend.createPet).not.toHaveBeenCalled();
+      await expect(w.local()).resolves.toEqual([]);
+    });
+
+    it('rememberPetDetails «Negrita» with the listing failing captures it (no pet_name_needs_confirmation)', async () => {
+      const w = world({ current: customer([max()]) });
+      w.backend.listPets.mockResolvedValue({ kind: 'FORBIDDEN' });
+      const h = w.boot();
+      await h.turn(NEGRITA, [
+        [
+          call('rememberPetDetails', {
+            name: 'Negrita',
+            species: 'perro',
+            ageText: '2 años',
+          }),
+          say('Anotado.'),
+        ],
+      ]);
+      await flush();
+      expect(h.toolOutputs).toEqual([{ ok: true, remembered: true }]);
+      await expect(w.local()).resolves.toMatchObject([{ name: 'Negrita' }]);
+      await expect(gateRow(w)).resolves.toBeNull();
+    });
+
+    it('still holding (K1 Q3): a diminutive of a known pet still asks before any write', async () => {
+      const w = world({ current: customer([pet(), max()]) });
+      const h = w.boot();
+      const decision = await h.turn('mi perrito Brunito tiene 3 años');
+      await flush();
+      expect(decision.reply).toBe('¿Brunito es Bruno o es otra mascota?');
+      expect(w.backend.patchPet).not.toHaveBeenCalled();
+      expect(w.backend.createPet).not.toHaveBeenCalled();
+    });
+  });
+
+  /** A diminutive row about Bruno (known, backend), with or without the
+   *  customer's stored message. */
+  const diminutiveRow = (w: ReturnType<typeof world>, request?: string) =>
+    w.gateStore.put({
+      senderId: SENDER,
+      kind: 'pet_choice',
+      payload: {
+        purpose: 'diminutive',
+        options: [
+          { ref: `backend:${BRUNO_ID}`, text: 'Bruno' },
+          { ref: 'other', text: 'Es otra mascota' },
+        ],
+        name: 'Brunito',
+        facts: { name: 'Brunito', species: 'perro', ageText: '3 años' },
+        ...(request === undefined ? {} : { request }),
+      },
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+
+  describe('M2: a failed or pending write is never confirmed', () => {
+    it('a failed PATCH (row without the message) → «no pude», never «Gracias, ya lo anoté.»', async () => {
+      const w = world({ current: customer([pet(), max()]) });
+      w.backend.patchPet.mockRejectedValue(new TypeError('down'));
+      await diminutiveRow(w);
+      const h = w.boot();
+      const decision = await h.turn(
+        'Bruno',
+        [],
+        `pet_pick:backend:${BRUNO_ID}`,
+      );
+      await flush();
+      expect(decision.reply).toBe(PET_CHOICE_UNAVAILABLE_REPLY);
+      expect(decision.reply).not.toBe(PET_DIMINUTIVE_SAME_REPLY);
+      expect(h.seen).toHaveLength(0);
+      expect(w.backend.patchPet).toHaveBeenCalledTimes(1);
+    });
+
+    it('a PATCH slower than 1500 ms → a reply that does not confirm it; it finishes in the background', async () => {
+      const w = world({ current: customer([pet(), max()]) });
+      let finish: (value: unknown) => void = () => undefined;
+      w.backend.patchPet.mockReturnValue(
+        new Promise((resolve) => (finish = resolve)),
+      );
+      await diminutiveRow(w);
+      const h = w.boot();
+      const decision = await h.turn(
+        'Bruno',
+        [],
+        `pet_pick:backend:${BRUNO_ID}`,
+      );
+      expect(decision.reply).toBe(PET_DIMINUTIVE_PENDING_REPLY);
+      expect(PET_DIMINUTIVE_PENDING_REPLY).toBe('Gracias por contarme.');
+      finish({ kind: 'ok', pet: pet({ version: 4 }), warnings: [] });
+      await flush();
+    });
+
+    it('a failed PATCH with the stored message → the message continues with no chosen-pet line, no second question; rememberPetDetails is told the name needs confirmation (M3)', async () => {
+      const w = world({ current: customer([pet(), max()]) });
+      w.backend.patchPet.mockRejectedValue(new TypeError('down'));
+      await diminutiveRow(
+        w,
+        'mi perrito Brunito tiene 3 años, ¿qué croquetas?',
+      );
+      const h = w.boot();
+      const decision = await h.turn(
+        'Bruno',
+        [
+          [
+            call('rememberPetDetails', { name: 'Brunito', ageText: '3 años' }),
+            say('Le recomiendo croquetas de adulto.'),
+          ],
+        ],
+        `pet_pick:backend:${BRUNO_ID}`,
+      );
+      await flush();
+      expect(decision.reply).toBe('Le recomiendo croquetas de adulto.');
+      expect(decision.interactive).toBeUndefined();
+      expect(h.toolOutputs).toEqual([
+        { ok: false, error: 'pet_name_needs_confirmation' },
+      ]);
+      expect(h.lastUser()).toBe(
+        'mi perrito Brunito tiene 3 años, ¿qué croquetas?',
+      );
+      expect(lineOf(h.system())).toBeUndefined();
+    });
+
+    it('still holding (Q3): tap «es Bruno» with a successful PATCH replies «Gracias, ya lo anoté.»', async () => {
+      const w = world({ current: customer([pet(), max()]) });
+      w.backend.patchPet.mockResolvedValue({
+        kind: 'ok',
+        pet: pet({ version: 4 }),
+        warnings: [],
+      });
+      await diminutiveRow(w);
+      const h = w.boot();
+      const decision = await h.turn(
+        'Bruno',
+        [],
+        `pet_pick:backend:${BRUNO_ID}`,
+      );
+      await flush();
+      expect(decision.reply).toBe(PET_DIMINUTIVE_SAME_REPLY);
+      expect(w.backend.patchPet).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('M3: an answer that wrote nothing does not block rememberPetDetails', () => {
+    it('pin: pets unavailable on a row with the message → the message continues and rememberPetDetails «Brunito» is recorded (not silenced)', async () => {
+      const lookup: Parameters<typeof world>[0] = {
+        current: customer([pet(), max()]),
+      };
+      const w = world(lookup);
+      const message = 'mi perrito Brunito tiene 3 años, ¿qué croquetas?';
+      await diminutiveRow(w, message);
+      lookup.mode = 'fail';
+      const h = w.boot();
+      const decision = await h.turn(
+        'Bruno',
+        [
+          [
+            call('rememberPetDetails', { name: 'Brunito', ageText: '3 años' }),
+            say('Le recomiendo croquetas de adulto.'),
+          ],
+        ],
+        `pet_pick:backend:${BRUNO_ID}`,
+      );
+      await flush();
+      expect(decision.reply).toBe('Le recomiendo croquetas de adulto.');
+      expect(h.lastUser()).toBe(message);
+      expect(h.toolOutputs).not.toContainEqual({
+        ok: true,
+        remembered: false,
+      });
+      expect(h.toolOutputs).toEqual([{ ok: true, remembered: true }]);
+    });
+
+    it('still holding (K4): after a successful «es Bruno» the continued turn does not write Brunito again', async () => {
+      const w = world({ current: customer([pet(), max()]) });
+      w.backend.patchPet.mockResolvedValue({
+        kind: 'ok',
+        pet: pet({ version: 4 }),
+        warnings: [],
+      });
+      await diminutiveRow(w, 'mi perrito Brunito tiene 3 años');
+      const h = w.boot();
+      await h.turn(
+        'Bruno',
+        [
+          [
+            call('rememberPetDetails', { name: 'Brunito', ageText: '3 años' }),
+            say('Anotado.'),
+          ],
+        ],
+        `pet_pick:backend:${BRUNO_ID}`,
+      );
+      await flush();
+      expect(h.toolOutputs).toEqual([{ ok: true, remembered: false }]);
+      expect(w.backend.patchPet).toHaveBeenCalledTimes(1);
+      expect(w.backend.createPet).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('M4: a failed resolveAmbiguous is not continued as resolved', () => {
+    const setup = async () => {
+      const w = world({ current: customer([pet(), bruno2(), max()]) });
+      await w.seedLocal([
+        {
+          id: LOCAL_ID,
+          name: 'Bruno',
+          species: 'perro',
+          breed: 'pug',
+          createdAt: '2026-11-20T10:00:00.000Z',
+          blocked: 'ambiguous',
+        },
+      ]);
+      return w;
+    };
+
+    it('pin: a failed PATCH → the message continues with no chosen-pet line, the entry stays blocked and is asked again next time', async () => {
+      const w = await setup();
+      const h = w.boot();
+      await h.turn('croquetas para Bruno');
+      w.backend.patchPet.mockRejectedValue(new TypeError('down'));
+      const decision = await h.turn(
+        'Bruno (Labrador, ad…',
+        [[say('Le recomiendo…')]],
+        `pet_pick:backend:${BRUNO2_ID}`,
+      );
+      expect(decision.reply).toBe('Le recomiendo…');
+      expect(h.lastUser()).toBe('croquetas para Bruno');
+      expect(lineOf(h.system())).toBeUndefined();
+      await expect(w.local()).resolves.toMatchObject([
+        { id: LOCAL_ID, blocked: 'ambiguous' },
+      ]);
+      // The 24 h suppression is not kept: the next mention asks again.
+      const again = await h.turn('arena para Bruno');
+      expect(again.reply).toBe('¿Bruno es alguno de estos?');
+    });
+
+    it('still holding (Q2): a candidate tap that resolves continues with that pet', async () => {
+      const w = await setup();
+      const h = w.boot();
+      await h.turn('croquetas para Bruno');
+      w.backend.patchPet.mockResolvedValue({
+        kind: 'ok',
+        pet: bruno2({ breed: 'Labrador', version: 4 }),
+        warnings: [],
+      });
+      await h.turn(
+        'Bruno (Labrador, ad…',
+        [[say('Para Bruno le recomiendo…')]],
+        `pet_pick:backend:${BRUNO2_ID}`,
+      );
+      expect(lineOf(h.system())).toContain('"Bruno"');
+      await expect(w.local()).resolves.toEqual([]);
     });
   });
 });
