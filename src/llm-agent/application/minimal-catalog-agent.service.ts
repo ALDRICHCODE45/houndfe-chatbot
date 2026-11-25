@@ -464,7 +464,7 @@ const priceKey = (productId: string, variantId?: string | null) =>
  * Only the application presents them (and arms their SÍ gate).
  */
 const IMITATED_CONFIRMATION =
-  /confirm[ae] (?:sus|tus) datos de entrega|resumen de (?:su|tu) pedido|respond[ae]\s*[«"“']?\s*s[ií]\b[^\n]{0,40}\b(?:crear el pedido|confirmar (?:estos|sus|tus) datos)/i;
+  /confirm[ae] (?:sus|tus) datos de entrega|resumen de (?:su|tu) pedido|respond[ae]\s*[«"“'*]?\s*s[ií](?![a-záéíóúñ])[^\n]{0,40}\b(?:crear el pedido|confirmar (?:estos|sus|tus) datos)/i;
 
 const toolError = (kind: string) => ({ ok: false as const, error: kind });
 

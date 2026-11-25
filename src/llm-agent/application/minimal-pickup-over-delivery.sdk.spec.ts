@@ -59,7 +59,7 @@ const freeQuote = (): ShippingQuoteResponse => ({
 });
 const DELIVERY_SUMMARY = /^Confirm[ae] (sus|tus) datos de entrega:/m;
 const ORDER_ENDING =
-  'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.';
+  '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
 
 async function setup() {
   const store = new InMemoryConversationStore();
@@ -268,7 +268,7 @@ describe('S2 (N17) store pickup dismisses a pending delivery-data confirmation',
       say(),
     ]);
     expect(pickup.reply).toContain('recoge su pedido en tienda');
-    expect(pickup.reply).toContain('Recoge en tienda (sin costo de envío)');
+    expect(pickup.reply).toContain('*Envío:* recoge en tienda — sin costo');
     expect(pickup.reply.endsWith(ORDER_ENDING)).toBe(true);
     expect(pickup.reply).not.toMatch(CONFIRMED_DELIVERY);
     return { h, pickup };
@@ -334,7 +334,7 @@ describe('S2 (N17) store pickup dismisses a pending delivery-data confirmation',
       buttonId(delivery.interactive, 'checkout_confirm:'),
     );
     expect(confirmed.reply).toMatch(
-      /^Gracias, sus datos de entrega quedaron confirmados\.\n\nResumen de su pedido:/,
+      /^Gracias, sus datos de entrega quedaron confirmados\.\n\n\*Resumen de su pedido\* 🧾\n/,
     );
     expect(confirmed.reply.endsWith(ORDER_ENDING)).toBe(true);
     expect(h.api.createCheckout).not.toHaveBeenCalled();

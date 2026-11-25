@@ -56,6 +56,7 @@ import {
 import {
   MINIMAL_ORDER_AMBIGUOUS_REPLY,
   MINIMAL_ORDER_DECLINED_REPLY,
+  MINIMAL_ORDER_SUMMARY_HEADING,
 } from '../domain/minimal-order-confirmation';
 import { MINIMAL_CHECKOUT_RESELECT_REPLY } from './minimal-checkout.service';
 
@@ -1180,9 +1181,9 @@ describe('minimal shipping order safety', () => {
     await shippingRecord(h);
     h.api.createCheckout.mockRejectedValueOnce(new Error('uncertain'));
     const offer = await offerOrder(h);
-    expect(offer.reply).toContain('Envío con Skydropx (Ground): $50.00 MXN');
+    expect(offer.reply).toContain('*Envío:* Skydropx Ground — $50.00');
     expect(offer.reply).toContain('Llega en aproximadamente 2 días hábiles.');
-    expect(offer.reply).toContain('Total a pagar: $80.00 MXN');
+    expect(offer.reply).toContain('*Total a pagar: $80.00*');
     await yes(h);
     const payload = (
       h.api.createCheckout.mock.calls[0] as unknown as [unknown]
@@ -1229,8 +1230,8 @@ describe('minimal shipping order safety', () => {
     h.setPrice(60000);
     await shippingRecord(h, { creditCents: 5000, customerChargeCents: 0 });
     const offer = await offerOrder(h);
-    expect(offer.reply).toContain('sin costo para usted');
-    expect(offer.reply).toContain('Total a pagar: $1200.00 MXN');
+    expect(offer.reply).toContain('*Envío:* Skydropx Ground — sin costo');
+    expect(offer.reply).toContain('*Total a pagar: $1,200.00*');
     expect(offer.reply).not.toContain('no está incluido');
     const result = await yes(h);
     const payload = (
@@ -1335,7 +1336,7 @@ describe('minimal shipping order safety', () => {
     });
     const result = await yes(h);
     expect(result?.reply).toContain(MINIMAL_ORDER_CHANGED_REPLY);
-    expect(result?.reply).toContain('Total a pagar: $90.00 MXN');
+    expect(result?.reply).toContain('*Total a pagar: $90.00*');
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     result?.onSent?.();
     await yes(h, 'wamid.o3');
@@ -1407,8 +1408,8 @@ describe('MinimalOrderService', () => {
     // The customer price changed the lines, so store pickup is re-chosen.
     await h.shipping.chooseStorePickup(SENDER);
     const offer = await offerOrder(h);
-    expect(offer.reply).toContain('2 × $8.00 MXN');
-    expect(offer.reply).toContain('Total de productos: $15.00 MXN');
+    expect(offer.reply).toContain('2 × $8.00 = ');
+    expect(offer.reply).toContain('*Total a pagar: $15.00*');
     const sale = {
       ...placedSale(),
       totalCents: 1500,
@@ -1516,7 +1517,7 @@ describe('MinimalOrderService', () => {
     for (const attempt of [1, 2]) {
       const offer = await offerOrder(h, `promo-offer-${attempt}`);
       expect(offer.reply).toContain(
-        `• Ibuprofeno: 2 × $15.00 MXN; importe $27.00 MXN (promoción: ${title}, ahorro $3.00 MXN)`,
+        `• Ibuprofeno\n   2 × $15.00 = *$27.00*\n   _Promoción ${title}: ahorra $3.00_`,
       );
       h.api.createCheckout.mockRejectedValueOnce(new Error('lost response'));
       await yes(h, `promo-yes-${attempt}`);
@@ -1542,8 +1543,8 @@ describe('MinimalOrderService', () => {
     await h.seedCart();
     await confirmSavedDelivery(h);
     const offer = await offerOrder(h);
-    expect(offer.reply).toContain('Resumen de su pedido:');
-    expect(offer.reply).toContain('Total de productos: $30.00 MXN');
+    expect(offer.reply).toContain(MINIMAL_ORDER_SUMMARY_HEADING);
+    expect(offer.reply).toContain('*Total a pagar: $30.00*');
     expect(h.api.createCheckout).not.toHaveBeenCalled();
 
     const placed = await yes(h);
@@ -1673,7 +1674,7 @@ describe('MinimalOrderService', () => {
     // shipping-required question.
     const result = await yes(h);
     expect(result?.reply.startsWith(MINIMAL_ORDER_CHANGED_REPLY)).toBe(true);
-    expect(result?.reply).toContain('Total de productos: $32.00 MXN');
+    expect(result?.reply).toContain('*Total a pagar: $32.00*');
     expect(result?.onSent).toEqual(expect.any(Function));
     expect(h.api.createCheckout).not.toHaveBeenCalled();
   });
@@ -1714,7 +1715,7 @@ describe('MinimalOrderService', () => {
     await confirmSavedDelivery(h);
     h.setPrice(1600);
     const offer = await offerOrder(h);
-    expect(offer.reply).toContain('Total de productos: $32.00 MXN');
+    expect(offer.reply).toContain('*Total a pagar: $32.00*');
     await yes(h);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(
@@ -1742,7 +1743,7 @@ describe('MinimalOrderService', () => {
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     // Not a dead end: asking again re-prices and the next SÍ places it.
     const offer = await offerOrder(h, 'wamid.again');
-    expect(offer.reply).toContain('Total de productos: $32.00 MXN');
+    expect(offer.reply).toContain('*Total a pagar: $32.00*');
     await yes(h, 'wamid.again-yes');
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(
@@ -1770,7 +1771,7 @@ describe('MinimalOrderService', () => {
     });
     const changed = await yes(h);
     expect(changed?.reply.startsWith(MINIMAL_ORDER_CHANGED_REPLY)).toBe(true);
-    expect(changed?.reply).toContain('Total a pagar: $82.00 MXN');
+    expect(changed?.reply).toContain('*Total a pagar: $82.00*');
     expect(h.quotes.calls).toHaveLength(1);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     changed?.onSent?.();
@@ -2058,7 +2059,7 @@ describe('MinimalOrderService', () => {
       });
       const requoted = await yes(h);
       expect(requoted?.reply).toContain(MINIMAL_ORDER_SHIPPING_REQUOTED_REPLY);
-      expect(requoted?.reply).toContain('Total a pagar: $100.00 MXN');
+      expect(requoted?.reply).toContain('*Total a pagar: $100.00*');
       expect(h.quotes.calls).toHaveLength(1);
       expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
       requoted?.onSent?.();
@@ -2313,9 +2314,9 @@ describe('minimal store pickup order (U4, S4)', () => {
       kind: 'pickup',
     });
     const offer = await offerOrder(h);
-    expect(offer.reply).toContain('Recoge en tienda (sin costo de envío)');
-    expect(offer.reply).toContain('Total de productos: $30.00 MXN');
-    expect(offer.reply).toContain('Total a pagar: $30.00 MXN');
+    expect(offer.reply).toContain('*Envío:* recoge en tienda — sin costo');
+    expect(offer.reply).not.toContain('Total de productos');
+    expect(offer.reply).toContain('*Total a pagar: $30.00*');
     const result = await yes(h);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     const payload = (
@@ -2374,8 +2375,8 @@ describe('minimal store pickup order (U4, S4)', () => {
       new Date().toISOString(),
     );
     const offer = await offerOrder(h);
-    expect(offer.reply).toContain('Recoge en tienda (sin costo de envío)');
-    expect(offer.reply).toContain('Total de productos: $30.00 MXN');
+    expect(offer.reply).toContain('*Envío:* recoge en tienda — sin costo');
+    expect(offer.reply).toContain('*Total a pagar: $30.00*');
   });
 
   it('[S4] a pickup pinned to other quantities does not back an order', async () => {
@@ -2478,8 +2479,8 @@ describe('store pickup without delivery data (C1)', () => {
     const h = setup();
     await h.seedCart();
     const offer = await offerOrder(h);
-    expect(offer.reply).toContain('Datos del cliente: Ana');
-    expect(offer.reply).toContain('Recoge en tienda (sin costo de envío)');
+    expect(offer.reply).toContain('*Datos del cliente*\nAna\n');
+    expect(offer.reply).toContain('*Envío:* recoge en tienda — sin costo');
     h.api.createCheckout.mockResolvedValueOnce(pickupCreated());
     await yes(h);
     const payload = payloadOf(h);
@@ -2506,7 +2507,7 @@ describe('store pickup without delivery data (C1)', () => {
     );
     await h.checkout.updateDetails(SENDER, nameOnly('Luis', 'Pérez'));
     const offer = await offerOrder(h, 'wamid.o3');
-    expect(offer.reply).toContain('Datos del cliente: Luis Pérez');
+    expect(offer.reply).toContain('*Datos del cliente*\nLuis Pérez\n');
     await yes(h, 'wamid.o4');
     const payload = payloadOf(h);
     expect(payload).not.toHaveProperty('deliveryAddress');
@@ -2641,7 +2642,7 @@ describe('checkout quote errors (C1)', () => {
     h.quotes.enqueue(newQuote);
     const requoted = await yes(h);
     expect(requoted?.reply).toContain(MINIMAL_ORDER_SHIPPING_REQUOTED_REPLY);
-    expect(requoted?.reply).toContain('Total a pagar: $100.00 MXN');
+    expect(requoted?.reply).toContain('*Total a pagar: $100.00*');
     expect(h.quotes.calls).toHaveLength(1);
     expect(await h.minimalCart()).toMatchObject({ idempotencyKey: '' });
   });
@@ -2792,7 +2793,7 @@ describe('checkout quote errors (C1)', () => {
       h.quotes.enqueue(newQuote);
       const reply = await yes(h);
       expect(reply?.reply.startsWith(MINIMAL_ORDER_CHANGED_REPLY)).toBe(true);
-      expect(reply?.reply).toContain('Total a pagar: $95.00 MXN');
+      expect(reply?.reply).toContain('*Total a pagar: $95.00*');
       expect(reply?.onSent).toBeDefined();
       expect(h.quotes.calls).toHaveLength(1);
       expect(await h.minimalCart()).toMatchObject({

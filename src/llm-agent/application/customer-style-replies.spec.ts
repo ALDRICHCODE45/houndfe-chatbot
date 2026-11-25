@@ -22,9 +22,11 @@ import {
 import {
   MINIMAL_ORDER_AMBIGUOUS_REPLY,
   MINIMAL_ORDER_DECLINED_REPLY,
+  MINIMAL_ORDER_SUMMARY_HEADING,
   renderMinimalOrderSummary,
   type MinimalOrderSnapshot,
 } from '../domain/minimal-order-confirmation';
+import { TITLE_EMOJI_LINE } from '../domain/whatsapp-format';
 import {
   CART_OPERATION_CLARIFICATION,
   CART_PRESENTATION_QUESTION,
@@ -650,15 +652,30 @@ describe('customer style over every fixed customer reply (S2)', () => {
   );
 
   it.each(Object.entries(REPLIES))(
-    '%s carries no emoji for a customer who uses none',
+    '%s carries no body emoji for a customer who uses none (message-formatting S3: title emojis kept)',
     (_name, reply) => {
       for (const register of ['usted', 'tu'] as const) {
+        const styled = applyCustomerStyle(reply, {
+          register,
+          emojis: false,
+          tone: 'formal',
+        });
+        const titleEmojis = styled
+          .split('\n')
+          .map((line) => TITLE_EMOJI_LINE.exec(line)?.[1])
+          .filter((emoji) => emoji !== undefined);
+        expect(titleEmojis).toEqual(
+          reply.startsWith(MINIMAL_ORDER_SUMMARY_HEADING) ? [' 🧾'] : [],
+        );
         expect(
-          applyCustomerStyle(reply, {
-            register,
-            emojis: false,
-            tone: 'formal',
-          }),
+          styled
+            .split('\n')
+            .map((line) =>
+              line.replace(TITLE_EMOJI_LINE, (_l, emoji: string) =>
+                line.slice(0, -emoji.length),
+              ),
+            )
+            .join('\n'),
         ).not.toMatch(/\p{Extended_Pictographic}/u);
       }
     },

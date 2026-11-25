@@ -439,8 +439,8 @@ describe('S2 reorder: accepting or declining', () => {
     );
     expect(delivery.reply).toContain('Confirme sus datos de entrega:');
     const summary = await h.turn('sí');
-    expect(summary.reply).toContain('Resumen de su pedido:');
-    expect(summary.reply).toContain('$2657.00 MXN');
+    expect(summary.reply).toContain('*Resumen de su pedido* 🧾');
+    expect(summary.reply).toContain('$2,657.00');
     const create = jest.spyOn(h.api, 'createCheckout');
     const placed = await h.turn('sí');
     expect(placed.reply).toMatch(/folio EV-0001/);

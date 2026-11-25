@@ -33,7 +33,7 @@ const QUESTION_TU =
   '¿Te lo enviamos a tu dirección o prefieres recogerlo en tienda?';
 const DELIVERY_SUMMARY = /^Confirm[ae] (sus|tus) datos de entrega:/m;
 const ORDER_ENDING =
-  'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.';
+  '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
 
 const step = (content: unknown[], finish = 'tool-calls') => ({
   content,
@@ -308,7 +308,7 @@ describe('S4 (N15) checkout start asks delivery or store pickup', () => {
     expect(pickup.reply).toMatch(
       /^Listo, usted recoge su pedido en tienda, sin costo de envío\./,
     );
-    expect(pickup.reply).toContain('Recoge en tienda (sin costo de envío)');
+    expect(pickup.reply).toContain('*Envío:* recoge en tienda — sin costo');
     expect(pickup.reply.endsWith(ORDER_ENDING)).toBe(true);
     expect(await h.cart.shippingMode(SENDER)).toBe('pickup');
     const confirm =
@@ -340,7 +340,7 @@ describe('S4 (N15) checkout start asks delivery or store pickup', () => {
         ? delivery.interactive.buttons[0].id
         : '',
     );
-    expect(confirmed.reply).toContain('Resumen de su pedido:');
+    expect(confirmed.reply).toContain('*Resumen de su pedido* 🧾');
   });
 
   it('a delivery/pickup button from a cart that changed re-presents the cart', async () => {

@@ -285,7 +285,10 @@ function describeInteractive(
 function gateLabel(reply: string, llmCalls: number): string | null {
   const labels: string[] = [];
   if (llmCalls === 0) labels.push('deterministic gate (no LLM call)');
-  if (/^Resumen de su pedido/m.test(reply)) labels.push('order summary');
+  // Message formatting F2b: the summary heading is bold («*Resumen de su
+  // pedido* 🧾») and tú customers read «tu pedido».
+  if (/^\*?Resumen de (?:su|tu) pedido/m.test(reply))
+    labels.push('order summary');
   if (/^Confirme sus datos de entrega/m.test(reply))
     labels.push('delivery confirmation');
   if (/folio/i.test(reply)) labels.push('order placed');

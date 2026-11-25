@@ -78,7 +78,7 @@ const details = (values: Partial<Record<string, string>>) => ({
 
 const DELIVERY_SUMMARY = /^Confirm[ae] (sus|tus) datos de entrega:/m;
 const ORDER_ENDING =
-  'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.';
+  '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
 
 async function setup() {
   const store = new InMemoryConversationStore();
@@ -271,13 +271,13 @@ describe('F1 checkout continues to the order summary by itself', () => {
     expect(summary).not.toContain('Su envío al código postal');
     expect(summary).not.toContain('no tiene costo.');
     expect(summary).toMatch(
-      /^Gracias, sus datos de entrega quedaron confirmados\.\n\nResumen de su pedido:/,
+      /^Gracias, sus datos de entrega quedaron confirmados\.\n\n\*Resumen de su pedido\* 🧾\n/,
     );
     expect(summary.match(/Llega en aproximadamente/g)).toHaveLength(1);
-    expect(summary).toContain('Envío: sin costo para usted');
-    expect(
-      summary.endsWith(`Total a pagar: $15.00 MXN\n\n${ORDER_ENDING}`),
-    ).toBe(true);
+    expect(summary).toMatch(/\n\*Envío:\* [^\n]*sin costo\n/);
+    expect(summary.endsWith(`*Total a pagar: $15.00*\n\n${ORDER_ENDING}`)).toBe(
+      true,
+    );
     expect(h.quotes.calls).toHaveLength(1);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
 
@@ -348,7 +348,7 @@ describe('F1 checkout continues to the order summary by itself', () => {
     ]);
     expect(chosen).toContain('recoge su pedido en tienda');
     expect(chosen).not.toContain('hacer pedido');
-    expect(chosen).toContain('Recoge en tienda (sin costo de envío)');
+    expect(chosen).toContain('*Envío:* recoge en tienda — sin costo');
     expect(chosen.endsWith(ORDER_ENDING)).toBe(true);
     expect(h.quotes.calls).toHaveLength(0);
 

@@ -106,7 +106,7 @@ const scenarioTurns = (id: string, withConditional = false): string[] => {
   });
 };
 
-const ORDER_ENDING = /Respond[ae] "SÍ" para crear el pedido/;
+const ORDER_ENDING = /Respond[ae] \*SÍ\* para crear el pedido/;
 const NO_CHANGE = /No modifiqué el carrito/;
 
 function harness(customer: 'new' | '03100' | '04000' = '03100') {

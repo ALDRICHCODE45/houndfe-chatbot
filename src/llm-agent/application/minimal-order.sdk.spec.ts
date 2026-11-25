@@ -349,7 +349,7 @@ describe('checkout next-step guidance through the SDK route', () => {
   const deliveryEnding =
     'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.';
   const orderEnding =
-    'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.';
+    '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
 
   it('lookup → select → prepareOrder presents delivery in the same turn, then needs two separate sent-summary consents for one sale', async () => {
     const h = setup();
@@ -535,7 +535,7 @@ describe('checkout next-step guidance through the SDK route', () => {
       );
       // F1: confirmed, unchanged delivery data are never re-presented.
       expect((result as { reply: string }).reply).toMatch(
-        /^Resumen de su pedido:/,
+        /^\*Resumen de su pedido\* 🧾\n/,
       );
       expect((result as { reply: string }).reply).not.toContain(
         'Revisión de compra',
@@ -553,7 +553,7 @@ describe('checkout next-step guidance through the SDK route', () => {
       EVENT('review-order'),
     );
     expect((result as { reply: string }).reply).toMatch(
-      /^Resumen de su pedido:/,
+      /^\*Resumen de su pedido\* 🧾\n/,
     );
     expect((result as { reply: string }).reply).not.toContain(
       'Revisión de compra',
@@ -629,7 +629,7 @@ describe('minimal order placement through the SDK route', () => {
       EVENT('wamid.checkout1'),
     );
     expect((offer as { reply: string }).reply).toContain(
-      'Total a pagar: $80.00 MXN',
+      '*Total a pagar: $80.00*',
     );
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     (offer as { onSent: () => void }).onSent();
@@ -690,7 +690,7 @@ describe('minimal order placement through the SDK route', () => {
     );
     expect(offer).toMatchObject({ kind: 'handled' });
     const reply = (offer as { reply: string }).reply;
-    expect(reply).toContain('Resumen de su pedido:');
+    expect(reply).toContain('*Resumen de su pedido* 🧾');
     expect(reply).not.toContain('Su pedido ya quedó creado.');
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     (offer as { onSent: () => void }).onSent();
@@ -907,7 +907,7 @@ describe('minimal order placement through the SDK route', () => {
     release();
     const offer = await running;
     expect((offer as { reply: string }).reply).toContain(
-      'Resumen de su pedido:',
+      '*Resumen de su pedido* 🧾',
     );
     (offer as { onSent?: () => void }).onSent?.();
     await h.turn('SÍ', [say('¿En qué le ayudo?')], EVENT('wamid.o2'));

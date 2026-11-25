@@ -398,8 +398,8 @@ describe('order summary vs previous order (S5)', () => {
         inboundEvent: EVENT('wamid.s1'),
       });
       // «Muéstrame» is a tú signal, so the reply is styled de tú.
-      expect(reply(decision)).toMatch(/Resumen de (?:su|tu) pedido:/);
-      expect(reply(decision)).toContain('Total a pagar: $30.00 MXN');
+      expect(reply(decision)).toMatch(/^\*Resumen de (?:su|tu) pedido\* 🧾$/m);
+      expect(reply(decision)).toContain('*Total a pagar: $30.00*');
       expect(
         interactiveOf(decision)?.buttons?.map((button) => button.id),
       ).toEqual([expect.stringMatching(/^order_confirm:/), 'order_change']);

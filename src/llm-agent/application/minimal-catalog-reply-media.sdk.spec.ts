@@ -308,7 +308,7 @@ describe('S5 cart change during checkout', () => {
       say(),
     ]);
     const summary = await h.turn('sí');
-    expect(summary.reply).toContain('Resumen de su pedido:');
+    expect(summary.reply).toContain('*Resumen de su pedido* 🧾');
     expect(summary.media).toBeUndefined();
     return summary;
   }
@@ -330,8 +330,8 @@ describe('S5 cart change during checkout', () => {
     ]);
     expect(changed.reply.startsWith('Listo, actualicé su carrito.')).toBe(true);
     expect(changed.reply).not.toContain('Su carrito:');
-    expect(changed.reply).toContain('Resumen de su pedido:');
-    expect(changed.reply).toContain(': 2 × $179.00 MXN');
+    expect(changed.reply).toContain('*Resumen de su pedido* 🧾');
+    expect(changed.reply).toContain('\n   2 × $179.00 = *$358.00*');
     expect(changed.media).toBeUndefined();
   });
 
@@ -350,7 +350,7 @@ describe('S5 cart change during checkout', () => {
     ]);
     expect(changed.reply.startsWith('Listo, actualicé su carrito.')).toBe(true);
     expect(changed.reply).not.toContain('Su carrito:');
-    expect(changed.reply).toContain('Resumen de su pedido:');
+    expect(changed.reply).toContain('*Resumen de su pedido* 🧾');
     expect(changed.media).toBeUndefined();
   });
 

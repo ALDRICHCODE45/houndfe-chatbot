@@ -139,17 +139,17 @@ describe('minimal shipping SDK public seam', () => {
     if (quoted.kind !== 'handled') throw new Error('reply');
     // S3: the summary that follows the quote carries the cost once; the quote
     // sentence is not repeated before it.
-    expect(quoted.reply.startsWith('Resumen de su pedido:')).toBe(true);
-    expect(quoted.reply).toContain(free ? 'Envío: sin costo para usted' : 'Envío con Carrier (Ground): $200.00 MXN');
+    expect(quoted.reply.startsWith('*Resumen de su pedido* 🧾')).toBe(true);
+    expect(quoted.reply).toContain(free ? '*Envío:* sin costo\n' : '*Envío:* Carrier Ground — $200.00');
     expect(quoted.reply).not.toContain(free ? 'Su envío al código postal 06000 no tiene costo.' : 'Usted paga $200.00 MXN');
-    expect(quoted.reply).toMatch(/Total a pagar: \$\d[\d,.]* MXN\n\nResponda/);
+    expect(quoted.reply).toMatch(/\*Total a pagar: \$\d[\d,.]*\*\n\n¿Está todo bien\? Responda/);
     expect(quoted.reply).not.toMatch(/aprobaci|999/);
     expect(h.quotes.calls).toHaveLength(1);
     expect(h.seen[0].tools).toHaveProperty('chooseStorePickup');
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     const offer = await h.turn('Prepare mi pedido', [call('prepareOrder'), say()]);
     if (offer.kind !== 'handled') throw new Error('offer');
-    expect(offer.reply).toContain(free ? 'sin costo para usted' : 'Envío con Carrier (Ground): $200.00 MXN');
+    expect(offer.reply).toContain(free ? '*Envío:* sin costo\n' : '*Envío:* Carrier Ground — $200.00');
     offer.onSent?.();
     await h.turn('SÍ', []);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
@@ -189,7 +189,7 @@ describe('minimal shipping SDK public seam', () => {
     // No trusted inbound identity: the summary cannot be presented.
     const result = await h.agent.tryHandle({ senderId: SENDER, text: 'Quiero envío a domicilio' });
     if (result.kind !== 'handled') throw new Error('reply');
-    expect(result.reply).not.toContain('Resumen de su pedido:');
+    expect(result.reply).not.toContain('*Resumen de su pedido* 🧾');
     expect(result.reply).toContain('Su envío al código postal 06000 no tiene costo.');
   });
   it('[S7] a STOCK_PENDING eta says the delivery date depends on restock', async () => {
@@ -330,7 +330,7 @@ describe('U4 customer shipping conversation', () => {
     expect(h.quotes.calls).toHaveLength(0);
     const offer = await h.turn('Pedido', [call('prepareOrder'), say()]);
     if (offer.kind !== 'handled') throw new Error('offer');
-    expect(offer.reply).toContain('Recoge en tienda (sin costo de envío)');
+    expect(offer.reply).toContain('*Envío:* recoge en tienda — sin costo');
     offer.onSent?.(); await h.turn('SÍ', []);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect((h.api.createCheckout.mock.calls[0]?.[0] as { sale?: unknown } | undefined)?.sale).toMatchObject({ shipping: { mode: 'pickup' }, expectedTotalCents: 3000 });

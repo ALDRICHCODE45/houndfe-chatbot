@@ -407,11 +407,11 @@ describe('restock backorder confirm through the customer turn', () => {
       interactiveReplyId: pickup!.id,
       inboundEvent: EVENT('wamid.s1'),
     });
-    expect(reply(summary)).toContain('Resumen de su pedido:');
+    expect(reply(summary)).toContain('*Resumen de su pedido* 🧾');
     expect(reply(summary)).toContain(
-      '• Croquetas Adulto 18 kg: 2 × $1099.00 MXN; importe $2198.00 MXN (pedido apartado BO-000012)',
+      '• Croquetas Adulto 18 kg (pedido apartado BO-000012)\n   2 × $1,099.00 = *$2,198.00*',
     );
-    expect(reply(summary)).toContain('Total a pagar: $2198.00 MXN');
+    expect(reply(summary)).toContain('*Total a pagar: $2,198.00*');
     (summary as { onSent: () => void }).onSent();
 
     await h.turn('SÍ', [], { inboundEvent: EVENT('wamid.s2') });

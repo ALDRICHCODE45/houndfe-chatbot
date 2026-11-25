@@ -287,7 +287,7 @@ describe('S4 order summary buttons', () => {
       [call('prepareOrder'), say()],
       'o1',
     );
-    expect(offer.reply).toContain('Resumen de su pedido:');
+    expect(offer.reply).toContain('*Resumen de su pedido* 🧾');
     expect(offer.interactive).toEqual({
       type: 'buttons',
       buttons: [
@@ -364,7 +364,7 @@ describe('S4 order summary buttons', () => {
     const stale = await h.turn('SÍ', [say('no')], 'o3', buttonIds(first)[0]);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     expect(stale.reply).toMatch(/^Ese botón ya no está vigente\./);
-    expect(stale.reply).toContain('Resumen de su pedido:');
+    expect(stale.reply).toContain('*Resumen de su pedido* 🧾');
     const current = buttonIds(stale)[0];
     expect(current).toMatch(/^order_confirm:/);
     expect([buttonIds(first)[0], buttonIds(second)[0]]).not.toContain(current);
