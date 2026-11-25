@@ -20,6 +20,7 @@ import {
   backendPetView,
   factsSpecies,
   foldPetName,
+  hasDiminutiveEnding,
   hasPetFacts,
   knownPetsPrompt,
   chosenPetPromptLine,
@@ -30,6 +31,7 @@ import {
   matchPetForFacts,
   mergeFactsIntoLocal,
   petAllergiesOverflow,
+  petNameDiminutiveOf,
   uploadBackoffMs,
   type LocalPet,
   type LocalPetStore,
@@ -137,6 +139,13 @@ export type SeparateAmbiguousOutcome =
 
 /** T4c-2b Q3: what `captureForRef` did. `none`: not a current known pet. */
 export type CaptureForRefOutcome = 'applied' | 'none' | 'unavailable';
+
+/** T4c-2b-fix K3: what `archivedPetNameBase` found. `failed`: the archived
+ *  pets could not be read (never a guess). */
+export type ArchivedNameBase =
+  | { kind: 'base'; name: string }
+  | { kind: 'none' }
+  | { kind: 'failed' };
 
 /** Upload key of a local pet (contract §4.1: 1–200 chars, per sucursal). */
 export const localPetUploadKey = (customerId: string, localId: string) =>
@@ -614,6 +623,48 @@ export class CustomerPetsService {
       }
     });
     return outcome;
+  }
+
+  /**
+   * T4c-2b-fix K3 (S10): the name of a pet ARCHIVED in the backend that
+   * `name` is a diminutive of («Brunito» → an archived «Bruno»), read from
+   * `?status=ALL` so it holds after the H1 window or a restart. Only a name
+   * with a diminutive ending is looked up (one listing per call). `none`
+   * for a prospect or a Customer without the pets scope (no backend pets to
+   * consult) and for a name with no such base; `failed` when the pets are
+   * not loaded or the listing fails (logged). Read only: not queued, never
+   * throws.
+   */
+  async archivedPetNameBase(
+    senderId: string,
+    name: string,
+  ): Promise<ArchivedNameBase> {
+    if (!hasDiminutiveEnding(name) || this.profiles.isForgotten(senderId))
+      return { kind: 'none' };
+    const state = this.cache.get(senderId);
+    if (state === undefined || state.scope.kind === 'unavailable')
+      return { kind: 'failed' };
+    if (state.scope.kind !== 'customer') return { kind: 'none' };
+    const listed = await this.listAllPets(state.scope.customerId);
+    if ('failed' in listed) {
+      this.logger.warn(
+        `customer pets archived pet names failed: ${listed.failed}`,
+      );
+      return { kind: 'failed' };
+    }
+    // An ACTIVE pet really named «Brunito» is that pet, not a diminutive.
+    const folded = foldPetName(name);
+    if (
+      listed.some(
+        (pet) => pet.status === 'ACTIVE' && foldPetName(pet.name) === folded,
+      )
+    )
+      return { kind: 'none' };
+    const base = petNameDiminutiveOf(
+      name,
+      listed.flatMap((pet) => (pet.status === 'ARCHIVED' ? [pet.name] : [])),
+    );
+    return base === null ? { kind: 'none' } : { kind: 'base', name: base };
   }
 
   /** The sender's pets when writes may go to them (a Customer with `pets`
@@ -1282,16 +1333,11 @@ export class CustomerPetsService {
     keys: ReadonlySet<string>,
     createdAt: string,
   ): Promise<'forgotten' | 'clear' | { failed: string }> {
-    let listed: ListPetsResult;
-    try {
-      listed = await this.client.listPets(customerId, 'ALL');
-    } catch (error) {
-      return { failed: errorStatus(error) };
-    }
-    if (listed.kind !== 'ok') return { failed: listed.kind };
+    const listed = await this.listAllPets(customerId);
+    if ('failed' in listed) return listed;
     const since = Date.parse(createdAt);
     let unknown = false;
-    for (const pet of listed.pets) {
+    for (const pet of listed) {
       if (
         pet.status !== 'ARCHIVED' ||
         !keys.has(twinKey(pet.name, pet.species))
@@ -1302,6 +1348,19 @@ export class CustomerPetsService {
       else if (at >= since) return 'forgotten';
     }
     return unknown ? { failed: 'archivedAt unreadable' } : 'clear';
+  }
+
+  /** I1 / K3: every pet of the Customer (`?status=ALL`), or why not. */
+  private async listAllPets(
+    customerId: string,
+  ): Promise<BackendPet[] | { failed: string }> {
+    let listed: ListPetsResult;
+    try {
+      listed = await this.client.listPets(customerId, 'ALL');
+    } catch (error) {
+      return { failed: errorStatus(error) };
+    }
+    return listed.kind === 'ok' ? listed.pets : { failed: listed.kind };
   }
 
   /** B1: true when a persisted next attempt time (if any) has passed. */

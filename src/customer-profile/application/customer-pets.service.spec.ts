@@ -3271,3 +3271,117 @@ describe('CustomerPetsService (T4c-2b)', () => {
     });
   });
 });
+
+describe('CustomerPetsService (T4c-2b-fix K3)', () => {
+  let warn: jest.SpiedFunction<Logger['warn']>;
+  beforeEach(() => {
+    warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const archivedBruno = backend({
+    status: 'ARCHIVED',
+    archivedAt: '2026-11-20T10:00:00.000Z',
+    version: 4,
+  });
+
+  it('a diminutive of an ARCHIVED pet name → that base, from one ?status=ALL listing', async () => {
+    const h = harness(found([]));
+    h.client.listPets.mockResolvedValue({ kind: 'ok', pets: [archivedBruno] });
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'base', name: 'Bruno' });
+    expect(h.client.listPets.mock.calls).toEqual([[CUSTOMER_ID, 'ALL']]);
+  });
+
+  it('after a restart (nothing in memory) it still finds the archived base', async () => {
+    const h = harness(found([]));
+    h.client.listPets.mockResolvedValue({ kind: 'ok', pets: [archivedBruno] });
+    const restarted = h.restart();
+    await restarted.prepare(SENDER);
+    await expect(
+      restarted.archivedPetNameBase(SENDER, 'brunito'),
+    ).resolves.toEqual({ kind: 'base', name: 'Bruno' });
+  });
+
+  it('no archived base (only ACTIVE pets, or other names) → none', async () => {
+    const h = harness(found([]));
+    h.client.listPets.mockResolvedValue({
+      kind: 'ok',
+      pets: [
+        backend(),
+        backend({
+          id: uuid(70),
+          name: 'Max',
+          status: 'ARCHIVED',
+          archivedAt: '2026-11-20T10:00:00.000Z',
+        }),
+      ],
+    });
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'none' });
+  });
+
+  it('an ACTIVE pet really named Brunito next to an archived Bruno → none', async () => {
+    const h = harness(found([]));
+    h.client.listPets.mockResolvedValue({
+      kind: 'ok',
+      pets: [archivedBruno, backend({ id: uuid(71), name: 'Brunito' })],
+    });
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'none' });
+  });
+
+  it('a name without a diminutive ending → none, no listing', async () => {
+    const h = harness(found([]));
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Michi'),
+    ).resolves.toEqual({ kind: 'none' });
+    expect(h.client.listPets).not.toHaveBeenCalled();
+  });
+
+  it('a prospect (no backend Customer) → none, no listing', async () => {
+    const h = harness(notFound);
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'none' });
+    expect(h.client.listPets).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an error answer', () => Promise.resolve({ kind: 'FORBIDDEN' })],
+    ['a thrown error', () => Promise.reject(new Error('down'))],
+  ])('the listing fails (%s) → failed, logged', async (_label, answer) => {
+    const h = harness(found([]));
+    h.client.listPets.mockImplementation(
+      answer as () => Promise<ListPetsResult>,
+    );
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'failed' });
+    expect(
+      warn.mock.calls.some((args) =>
+        String(args[0]).includes('archived pet names'),
+      ),
+    ).toBe(true);
+  });
+
+  it('pets not loaded (lookup unavailable) → failed (never a guess)', async () => {
+    const h = harness(new Error('lookup down'));
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'failed' });
+    expect(h.client.listPets).not.toHaveBeenCalled();
+  });
+});
