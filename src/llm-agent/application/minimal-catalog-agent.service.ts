@@ -4807,7 +4807,7 @@ export class MinimalCatalogAgentService {
     );
     if (archived === 'over_budget') {
       this.logger.warn(
-        `customer pets archived pet names over budget (${PET_PREPARE_BUDGET_MS} ms): no pet name question; the capture goes ahead`,
+        `customer pets archived pet names over budget (${PET_PREPARE_BUDGET_MS} ms): no pet name question; the capture goes ahead unless the lookup later finds an archived pet`,
       );
       return null;
     }
@@ -5186,7 +5186,14 @@ export class MinimalCatalogAgentService {
           : null;
         void this.petsInBackground('capture', async () => {
           const archived = check === null ? null : await check;
-          if (archived?.kind === 'base') return;
+          if (archived?.kind === 'base') {
+            // Found after the reply (lookup over the budget): no question
+            // can be asked any more and S10 forbids an unconfirmed write.
+            this.logger.warn(
+              'customer pets capture dropped: the name is a diminutive of an archived pet found after the reply',
+            );
+            return;
+          }
           if (archived?.kind === 'failed')
             this.logger.warn(
               'customer pets archived pet names unknown: the capture goes ahead',
