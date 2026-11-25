@@ -1748,6 +1748,55 @@ describe('T4c-1: allergies, forget one pet, forget my data (S5, S7)', () => {
         },
       );
 
+      it('two parallel forgetPet calls for one name: a fast failure never cancels the window of the one that archives', async () => {
+        jest.useFakeTimers({
+          now: Date.parse('2026-11-24T12:00:00.000Z'),
+          doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'],
+        });
+        let settle: (outcome: ForgetPetOutcome) => void = () => undefined;
+        const outcomes: Array<() => Promise<ForgetPetOutcome>> = [
+          () => Promise.resolve('failed'),
+          () => new Promise((resolve) => (settle = resolve)),
+        ];
+        const stub = stubPets(() => outcomes.shift()!());
+        const h = harness(new InMemoryCustomerProfileStore(), undefined, stub);
+        const turn = h.turn('olvida a Bruno', [
+          [
+            step([
+              {
+                type: 'tool-call',
+                toolCallId: 'forget-1',
+                toolName: 'forgetPet',
+                input: JSON.stringify({ name: 'Bruno' }),
+              },
+              {
+                type: 'tool-call',
+                toolCallId: 'forget-2',
+                toolName: 'forgetPet',
+                input: JSON.stringify({ name: 'Bruno' }),
+              },
+            ]),
+            say('Lo siento mucho.'),
+          ],
+        ]);
+        for (let i = 0; i < 10; i += 1)
+          await new Promise((resolve) => setImmediate(resolve));
+        settle('archived');
+        await turn;
+        expect(stub.forgetPet).toHaveBeenCalledTimes(2);
+        await h.turn('es mi perro Bruno', [
+          [
+            call('rememberPetDetails', { name: 'Bruno', species: 'perro' }),
+            say('Entiendo.'),
+          ],
+        ]);
+        expect(h.toolOutputs.at(-1)).toEqual({
+          ok: false,
+          error: 'pet_recently_forgotten',
+        });
+        expect(stub.capture).not.toHaveBeenCalled();
+      });
+
       it('a thrown forgetPet does not start the window either', async () => {
         const stub = stubPets(() => Promise.reject(new TypeError('down')));
         const h = harness(new InMemoryCustomerProfileStore(), undefined, stub);

@@ -1048,7 +1048,12 @@ export class MinimalCatalogAgentService {
   private readonly petsOverBudget = new Set<string>();
   // T4c-1-fix H1: per sender, the folded names given to forgetPet and when
   // their PET_FORGOTTEN_WINDOW_MS ends.
-  private readonly forgottenPets = new Map<string, Map<string, number>>();
+  // I3: one mark per forgetPet call (its own expiry); a failed call drops
+  // only its own mark, so a parallel call that archived keeps the window.
+  private readonly forgottenPets = new Map<
+    string,
+    Map<string, Array<{ until: number; failed: boolean }>>
+  >();
   // T4c-1-fix N1: senders whose current turn called forgetPet; that turn's
   // deterministic pet capture is skipped (the message describes the pet
   // being forgotten, never the one that remains).
@@ -4082,41 +4087,45 @@ export class MinimalCatalogAgentService {
   }
 
   /** T4c-1-fix H1: starts (or renews) the window of a forgotten name;
-   *  expired windows of every sender are dropped on the way. I3: returns
-   *  the undo that puts back the name's previous window (if this one is
-   *  still the current one). */
+   *  expired or failed marks of every sender are dropped on the way. I3:
+   *  returns the undo that drops this call's own mark only (another call's
+   *  mark for the same name, earlier or parallel, keeps the window). */
   private markPetForgotten(senderId: string, name: string): () => void {
     const now = Date.now();
     for (const [sender, names] of this.forgottenPets) {
-      for (const [folded, until] of names)
-        if (until <= now) names.delete(folded);
+      for (const [folded, marks] of names) {
+        const live = marks.filter((mark) => !mark.failed && mark.until > now);
+        if (live.length === 0) names.delete(folded);
+        else names.set(folded, live);
+      }
       if (names.size === 0) this.forgottenPets.delete(sender);
     }
-    const names = this.forgottenPets.get(senderId) ?? new Map<string, number>();
+    const names =
+      this.forgottenPets.get(senderId) ??
+      new Map<string, Array<{ until: number; failed: boolean }>>();
     const folded = foldPetName(name);
-    const previous = names.get(folded);
-    const until = now + PET_FORGOTTEN_WINDOW_MS;
-    names.set(folded, until);
+    const mark = { until: now + PET_FORGOTTEN_WINDOW_MS, failed: false };
+    names.set(folded, [...(names.get(folded) ?? []), mark]);
     this.forgottenPets.set(senderId, names);
     this.petForgetTurns.add(senderId);
     return () => {
-      const current = this.forgottenPets.get(senderId);
-      if (current?.get(folded) !== until) return;
-      if (previous !== undefined && previous > Date.now())
-        current.set(folded, previous);
-      else current.delete(folded);
-      if (current.size === 0) this.forgottenPets.delete(senderId);
+      mark.failed = true;
     };
   }
 
-  /** T4c-1-fix H1: true while `name` is inside its forgotten window. */
+  /** T4c-1-fix H1: true while `name` has a live (not failed) mark. */
   private petRecentlyForgotten(
     senderId: string,
     name: string | undefined,
   ): boolean {
     if (name === undefined) return false;
-    const until = this.forgottenPets.get(senderId)?.get(foldPetName(name));
-    return until !== undefined && until > Date.now();
+    const now = Date.now();
+    return (
+      this.forgottenPets
+        .get(senderId)
+        ?.get(foldPetName(name))
+        ?.some((mark) => !mark.failed && mark.until > now) ?? false
+    );
   }
 
   /** S1: "olvida mis datos" — delete the profile and confirm. */
