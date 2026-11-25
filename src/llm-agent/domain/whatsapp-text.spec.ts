@@ -51,9 +51,24 @@ describe('toWhatsAppText', () => {
     ['normalizes asterisk and plus bullets', '* uno\n+ dos', '• uno\n• dos'],
     ['normalizes "1)" lists to "1."', '1) uno\n2) dos', '1. uno\n2. dos'],
     [
-      'trims nested indentation to two spaces',
+      'caps nested indentation at three spaces',
       '1. Pro Plan\n   - Precio: $649.00\n      - Marca: Purina',
-      '1. Pro Plan\n  • Precio: $649.00\n  • Marca: Purina',
+      '1. Pro Plan\n   • Precio: $649.00\n   • Marca: Purina',
+    ],
+    [
+      'keeps a 3-space detail line under a bullet (F4, system layout)',
+      '- **Croquetas Nupec Adulto** — $1,250.00\n   1 × $1,250.00 = **$1,250.00**',
+      '• *Croquetas Nupec Adulto* — $1,250.00\n   1 × $1,250.00 = *$1,250.00*',
+    ],
+    [
+      'keeps a 2-space detail line as written',
+      '• *Pro Plan*\n  Precio: $649.00',
+      '• *Pro Plan*\n  Precio: $649.00',
+    ],
+    [
+      'a tab counts as two spaces',
+      '• *Pro Plan*\n\tPrecio: $649.00',
+      '• *Pro Plan*\n  Precio: $649.00',
     ],
     [
       'drops Markdown hard-break trailing spaces',

@@ -4,6 +4,7 @@ import { MockLanguageModelV4 } from 'ai/test';
 import { EvalFakeApi } from '../../../scripts/eval/fixtures/fake-api';
 import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
 import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
+import { WHATSAPP_FORMAT_GUIDANCE } from '../domain/system-prompt';
 import { CostGuardService } from './cost-guard.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
 
@@ -95,5 +96,25 @@ describe('H1 WhatsApp formatting of model text', () => {
     expect(system).toMatch(/WhatsApp/);
     expect(system).toMatch(/un solo asterisco/);
     expect(system).toMatch(/sin im[aá]genes ni enlaces Markdown/);
+    // F4: one formatting block (in SYSTEM_PROMPT); the catalog instructions
+    // no longer carry a second, diverging «Escribe para WhatsApp» line.
+    expect(system).toContain(WHATSAPP_FORMAT_GUIDANCE);
+    expect(system.split('Formato WhatsApp').length - 1).toBe(1);
+    expect(system).not.toContain('Escribe para WhatsApp');
+    expect(system).not.toContain('listas cortas');
+  });
+
+  it('keeps a 3-space detail line under a model bullet (system layout)', async () => {
+    const h = harness(
+      'Le comparto:\n- **Pro Plan 3 kg** — $649.00\n   Sabor pollo',
+    );
+    const decision = await h.agent.tryHandle({
+      senderId: SENDER,
+      text: 'hola',
+    });
+    expect(decision).toMatchObject({
+      kind: 'handled',
+      reply: 'Le comparto:\n• *Pro Plan 3 kg* — $649.00\n   Sabor pollo',
+    });
   });
 });

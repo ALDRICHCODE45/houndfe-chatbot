@@ -328,14 +328,13 @@ const INSTRUCTIONS =
   'producto, precio ni stock: los ejemplos son condicionales, no respuestas forzadas. ' +
   'Estilo (solo si aplica): si su mensaje abre con saludo, empieza con un saludo recíproco ' +
   '(usa "¡Hola!" si es neutro; no inventes la hora); identidad de servicio cálida en el registro del cliente, ' +
-  'sin personificar a una persona. Un producto en un párrafo breve y natural, no una lista ' +
-  'anidada, y sin "¿en qué puedo ayudarle?" si ya pidió un producto. Ejemplos solo de estilo, ' +
+  'sin personificar a una persona. Da formato según el bloque de formato WhatsApp, ' +
+  'y sin "¿en qué puedo ayudarle?" si ya pidió un producto. Ejemplos solo de estilo, ' +
   'sustituye únicamente datos verificados por herramienta: "¡Hola! Encontré {nombre} en ' +
   'nuestro catálogo. ¿Buscaba esa presentación?" (de tú: "¿Buscabas esa presentación?"); tras out_of_stock verificado: "Por ahora, ' +
   '{nombre} está agotado." Sin cierre automático ("Si necesita...", "No dude...", ' +
   '"estoy aquí..."), sin upsell ni aviso forzado, sin emoji al informar agotado, sin saludar ' +
-  'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha. ' +
-  'Escribe para WhatsApp: negritas con un solo asterisco (*así*) y solo si ayudan, sin imágenes ni enlaces Markdown (las fotos se envían aparte), sin encabezados y con listas cortas.';
+  'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
 
 /** S3: the structured customer reply (text + optional media) of one turn. */
 export type MinimalCatalogAgentDecision = CustomerReply & {
