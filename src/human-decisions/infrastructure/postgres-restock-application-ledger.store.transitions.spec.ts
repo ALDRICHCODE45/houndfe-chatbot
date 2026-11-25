@@ -1,4 +1,3 @@
-import type { Pool } from 'pg';
 import { deriveRestockAttemptId } from '../domain/restock-attempt-identity';
 import { PostgresRestockApplicationLedgerStore } from './postgres-restock-application-ledger.store';
 
@@ -53,7 +52,7 @@ function harness(reply: unknown) {
   });
   const store = new PostgresRestockApplicationLedgerStore({
     query,
-  } as unknown as Pool);
+  });
   const transition = (input: unknown) =>
     store.transitionPending(
       input as Parameters<typeof store.transitionPending>[0],
