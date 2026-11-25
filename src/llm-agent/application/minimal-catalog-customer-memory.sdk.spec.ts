@@ -63,14 +63,16 @@ const say = (text = 'Texto del modelo.') =>
   step([{ type: 'text', text }], 'stop');
 
 /** T4c-1: the exact pet-memory guidance every conversation with a profile
- *  store gets (pinned; changed deliberately from the T4b-fix A4 text). */
+ *  store gets (pinned; changed deliberately from the T4b-fix A4 text;
+ *  T4c-1-fix H5 adds the forgetPet `pending` sentence). */
 const PET_MEMORY_INSTRUCTIONS_T4C1 =
   'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad, alergias), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
   'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación. ' +
   'Si hay una sola línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte. ' +
   'Si hay varias, siga la indicación que las acompaña. ' +
   'Si el cliente dice que una mascota ya no está (murió, se perdió, la regaló) o pide olvidarla, llame forgetPet con su nombre y el motivo que él dio; responda con tacto y calidez, en pocas palabras, sin ofrecer productos para esa mascota. ' +
-  'Si forgetPet responde ok false, no se guardó nada: dígalo con amabilidad y pregunte de cuál mascota se trata.';
+  'Si forgetPet responde ok false, no se guardó nada: dígalo con amabilidad y pregunte de cuál mascota se trata. ' +
+  'Si forgetPet responde pending true, todavía se está guardando: no diga que ya la olvidó; responda con tacto sin confirmarlo.';
 
 /** T4c-1: the exact tool descriptions (pinned). */
 const REMEMBER_PET_DESCRIPTION =
@@ -78,7 +80,8 @@ const REMEMBER_PET_DESCRIPTION =
   'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, alergias, notas); omita lo demás. Nunca invente ni deduzca.';
 const FORGET_PET_DESCRIPTION =
   'Deja de recordar una mascota del cliente que ya no está o que pidió olvidar («Bruno ya no está», «olvida a Bruno»): la archiva, sin borrar sus pedidos. ' +
-  'name: el nombre que dio el cliente. reason: el motivo en sus palabras, solo si lo dijo. Si responde ok false, no se guardó nada.';
+  'name: el nombre que dio el cliente. reason: el motivo en sus palabras, solo si lo dijo. Si responde ok false, no se guardó nada. ' +
+  'Si responde pending true, todavía se está guardando: no diga que ya la olvidó; responda con tacto sin confirmarlo.';
 
 /** T4b: the multi-pet store wired with a fake backend (by-phone + pets). */
 interface PetsWiring {
@@ -1429,5 +1432,202 @@ describe('T4c-1: allergies, forget one pet, forget my data (S5, S7)', () => {
     ).map((c) => String(c[0]));
     expect(warned).toContain('customer pets forget failed: TypeError');
     expect(warned.join('\n')).not.toContain(SENDER);
+  });
+
+  describe('T4c-1-fix H1: a forgotten pet is never re-created in the same turn (S7)', () => {
+    const FORGET_TEXT = 'mi perrito Bruno ya no está, se murió';
+    const archived = () =>
+      pet({ status: 'ARCHIVED', archivedReason: 'se murió', version: 4 });
+    const localPets = (profileStore: InMemoryCustomerProfileStore) =>
+      new InMemoryLocalPetStore(profileStore).read(SENDER);
+
+    it('backend pet: archived, then the deterministic capture of the same text sends no create or PATCH', async () => {
+      const pets = client();
+      pets.archivePet.mockResolvedValue({
+        kind: 'ok',
+        pet: archived(),
+        warnings: [],
+      });
+      const profileStore = new InMemoryCustomerProfileStore();
+      const h = harness(profileStore, {
+        lookup: customer([pet({}), maxPet()]),
+        client: pets,
+      });
+      const result = await h.turn(FORGET_TEXT, [
+        [
+          call('forgetPet', { name: 'Bruno', reason: 'se murió' }),
+          say('Lo siento mucho por Bruno.'),
+        ],
+      ]);
+      await flush();
+      expect(result.reply).toBe('Lo siento mucho por Bruno.');
+      expect(h.toolOutputs).toEqual([{ ok: true, forgotten: true }]);
+      expect(pets.archivePet.mock.calls).toEqual([
+        [CUSTOMER_ID, BRUNO_ID, { version: 3, reason: 'se murió' }],
+      ]);
+      expect(pets.createPet).not.toHaveBeenCalled();
+      expect(pets.patchPet).not.toHaveBeenCalled();
+      await expect(localPets(profileStore)).resolves.toEqual([]);
+      expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
+      // Next turn inside the window: still not re-created.
+      await h.turn('mi perrito Bruno era muy bueno', [[say('Lo sé.')]]);
+      await flush();
+      expect(pets.createPet).not.toHaveBeenCalled();
+      expect(pets.patchPet).not.toHaveBeenCalled();
+      await expect(localPets(profileStore)).resolves.toEqual([]);
+      const lines = h
+        .system()
+        .split('\n')
+        .filter((line) => line.startsWith('Mascota conocida:'));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('"Max"');
+    });
+
+    it('rememberPetDetails for the pet forgotten earlier in the run returns pet_recently_forgotten and writes nothing', async () => {
+      const pets = client();
+      pets.archivePet.mockResolvedValue({
+        kind: 'ok',
+        pet: archived(),
+        warnings: [],
+      });
+      const profileStore = new InMemoryCustomerProfileStore();
+      const h = harness(profileStore, {
+        lookup: customer([pet({})]),
+        client: pets,
+      });
+      await h.turn('Bruno ya no está', [
+        [
+          call('forgetPet', { name: 'Bruno' }),
+          call('rememberPetDetails', { name: 'bruno', species: 'perro' }),
+          say('Lo siento mucho.'),
+        ],
+      ]);
+      await flush();
+      expect(h.toolOutputs).toEqual([
+        { ok: true, forgotten: true },
+        { ok: false, error: 'pet_recently_forgotten' },
+      ]);
+      expect(pets.createPet).not.toHaveBeenCalled();
+      expect(pets.patchPet).not.toHaveBeenCalled();
+      await expect(localPets(profileStore)).resolves.toEqual([]);
+    });
+
+    it('prospect: the local entry is removed and the same text does not add it back', async () => {
+      const pets = client();
+      const profileStore = new InMemoryCustomerProfileStore();
+      await new InMemoryLocalPetStore(profileStore).write(
+        SENDER,
+        [
+          {
+            id: 'b1f0c7a2-0000-4000-8000-000000000099',
+            name: 'Bruno',
+            species: 'perro',
+            createdAt: NOW.toISOString(),
+          },
+        ],
+        NOW,
+      );
+      const h = harness(profileStore, {
+        lookup: { found: false, customer: null },
+        client: pets,
+      });
+      await h.turn(FORGET_TEXT, [
+        [call('forgetPet', { name: 'Bruno' }), say('Lo siento mucho.')],
+      ]);
+      await flush();
+      expect(h.toolOutputs).toEqual([{ ok: true, forgotten: true }]);
+      await expect(localPets(profileStore)).resolves.toEqual([]);
+      expect(pets.createPet).not.toHaveBeenCalled();
+    });
+
+    it('an unknown name: forgetPet says so and the same text still creates nothing', async () => {
+      const pets = client();
+      const profileStore = new InMemoryCustomerProfileStore();
+      const h = harness(profileStore, {
+        lookup: { found: false, customer: null },
+        client: pets,
+      });
+      await h.turn(FORGET_TEXT, [
+        [call('forgetPet', { name: 'Bruno' }), say('Lo siento mucho.')],
+      ]);
+      await flush();
+      expect(h.toolOutputs).toEqual([
+        { ok: false, error: 'no_pet_with_that_name' },
+      ]);
+      await expect(localPets(profileStore)).resolves.toEqual([]);
+      expect(pets.createPet).not.toHaveBeenCalled();
+    });
+
+    it('without the pet store: the legacy pet stays cleared (no deterministic patch, no rememberPetDetails)', async () => {
+      const profileStore = new InMemoryCustomerProfileStore();
+      await profileStore.upsert(
+        SENDER,
+        { preferredName: 'Ana', pet: { name: 'Bruno', species: 'perro' } },
+        NOW,
+      );
+      const h = harness(profileStore);
+      await h.turn(FORGET_TEXT, [
+        [
+          call('forgetPet', { name: 'Bruno' }),
+          call('rememberPetDetails', { name: 'Bruno', species: 'perro' }),
+          say('Lo siento mucho.'),
+        ],
+      ]);
+      expect(h.toolOutputs).toEqual([
+        { ok: true, forgotten: true },
+        { ok: false, error: 'pet_recently_forgotten' },
+      ]);
+      const stored = await profileStore.read(SENDER);
+      expect(stored?.pet).toBeUndefined();
+      expect(stored?.preferredName).toBe('Ana');
+      await h.turn('mi perrito Bruno era muy bueno', [[say('Lo sé.')]]);
+      expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
+    });
+
+    it('another pet named in the same window is still captured', async () => {
+      const pets = client();
+      pets.archivePet.mockResolvedValue({
+        kind: 'ok',
+        pet: archived(),
+        warnings: [],
+      });
+      const profileStore = new InMemoryCustomerProfileStore();
+      const h = harness(profileStore, {
+        lookup: { found: false, customer: null },
+        client: pets,
+      });
+      await h.turn(FORGET_TEXT, [
+        [call('forgetPet', { name: 'Bruno' }), say('Lo siento mucho.')],
+      ]);
+      await h.turn('ahora tengo una perrita que se llama Kira', [
+        [say('¡Qué linda!')],
+      ]);
+      await flush();
+      await expect(localPets(profileStore)).resolves.toMatchObject([
+        { name: 'Kira', species: 'perro' },
+      ]);
+    });
+
+    it('after the window the name is captured again', async () => {
+      const realNow = Date.now.bind(Date);
+      let offset = 0;
+      jest.spyOn(Date, 'now').mockImplementation(() => realNow() + offset);
+      const pets = client();
+      const profileStore = new InMemoryCustomerProfileStore();
+      const h = harness(profileStore, {
+        lookup: { found: false, customer: null },
+        client: pets,
+      });
+      await h.turn(FORGET_TEXT, [
+        [call('forgetPet', { name: 'Bruno' }), say('Lo siento mucho.')],
+      ]);
+      await flush();
+      offset = 5 * 60_000 + 1;
+      await h.turn('mi perrito Bruno es chihuahua', [[say('¡Qué lindo!')]]);
+      await flush();
+      await expect(localPets(profileStore)).resolves.toMatchObject([
+        { name: 'Bruno', species: 'perro' },
+      ]);
+    });
   });
 });

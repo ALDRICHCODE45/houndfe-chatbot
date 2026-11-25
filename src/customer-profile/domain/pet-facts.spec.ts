@@ -197,6 +197,51 @@ describe('extractPetAllergy (T4c-1 G1)', () => {
     expect(extractPetAllergy(text)).toEqual(expected);
   });
 
+  // T4c-1-fix H2: questions, other people and clause joiners.
+  it.each<[string, { name: string; allergies: string } | null]>([
+    ['¿Max es alérgico al pollo?', null],
+    ['oye, ¿y si Max es alérgico al pollo?', null],
+    ['Max es alérgico al pollo?', null],
+    ['mi esposo Max es alérgico al pollo', null],
+    ['mi hija Luna es alérgica a la res', null],
+    ['mi mamá Rosa es alérgica al gluten', null],
+    ['mi amigo Toby es alérgico a los mariscos', null],
+    [
+      'Max es alérgico al pollo pero le gusta el pescado',
+      { name: 'Max', allergies: 'pollo' },
+    ],
+    [
+      'Max es alérgico al pollo y quiero unas croquetas',
+      { name: 'Max', allergies: 'pollo' },
+    ],
+    [
+      'Luna es alérgica a la res y le doy pavo',
+      { name: 'Luna', allergies: 'res' },
+    ],
+    [
+      'Kira es alérgica al pollo porque le da comezón',
+      { name: 'Kira', allergies: 'pollo' },
+    ],
+    [
+      'Bruno es alérgico al trigo y necesito algo sin granos',
+      { name: 'Bruno', allergies: 'trigo' },
+    ],
+    // Kept whole: an allergy list joined by «y al».
+    [
+      'Max es alérgico al pollo y al pescado',
+      { name: 'Max', allergies: 'pollo y al pescado' },
+    ],
+    // A question elsewhere in the message does not hide a statement.
+    [
+      'Max es alérgico al pollo. ¿Qué croquetas tienen?',
+      { name: 'Max', allergies: 'pollo' },
+    ],
+    // A pet word before the name is still the pet.
+    ['mi perro Max es alérgico al pollo', { name: 'Max', allergies: 'pollo' }],
+  ])('H2: %s', (text, expected) => {
+    expect(extractPetAllergy(text)).toEqual(expected);
+  });
+
   it('bounds the allergy text', () => {
     const allergy = extractPetAllergy(`Max es alérgico al ${'a'.repeat(300)}`);
     expect(allergy?.allergies.length).toBeLessThanOrEqual(120);

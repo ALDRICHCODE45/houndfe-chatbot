@@ -2052,6 +2052,37 @@ describe('CustomerPetsService (T4c-1)', () => {
       expect(h.client.patchPet).not.toHaveBeenCalled();
     });
 
+    it.each([
+      ['fresas', 'res', 'fresas; res'],
+      ['No es alérgico a pollo', 'pollo', 'No es alérgico a pollo; pollo'],
+      ['Sin pollo, res', 'pollo', 'Sin pollo, res; pollo'],
+    ])(
+      'H3: stored %j + stated %j is not a duplicate (whole words; a «no»/«sin» segment never counts) → PATCH %j',
+      async (stored, stated, sent) => {
+        const h = harness(found([max({ allergies: stored })]));
+        patched(h, max({ allergies: sent, version: 4 }));
+        await h.service.prepare(SENDER);
+        await h.service.capture(SENDER, { name: 'Max', allergies: stated });
+        expect(h.client.patchPet.mock.calls).toEqual([
+          [CUSTOMER_ID, uuid(50), { version: 3, allergies: sent }],
+        ]);
+      },
+    );
+
+    it.each([
+      ['Pollo', 'pollo'],
+      ['Res; Pollo de granja', 'pollo de granja'],
+      ['lácteos.\ntrigo', 'Trigo'],
+    ])(
+      'H3: stored %j already says %j (whole words, accents and case ignored) → no PATCH',
+      async (stored, stated) => {
+        const h = harness(found([max({ allergies: stored })]));
+        await h.service.prepare(SENDER);
+        await h.service.capture(SENDER, { name: 'Max', allergies: stated });
+        expect(h.client.patchPet).not.toHaveBeenCalled();
+      },
+    );
+
     it('an append past the 500-character limit is not sent (staff value kept) and is logged', async () => {
       const h = harness(found([max({ allergies: 'x'.repeat(495) })]));
       await h.service.prepare(SENDER);
@@ -2405,6 +2436,179 @@ describe('CustomerPetsService (T4c-1)', () => {
       );
       expect(h.client.archivePet).not.toHaveBeenCalled();
     });
+
+    describe('T4c-1-fix H6: a conflict reread that fails is not reported as archived', () => {
+      const conflict = {
+        kind: 'PET_VERSION_CONFLICT' as const,
+        currentVersion: 4,
+      };
+
+      it.each<[string, () => Promise<unknown>]>([
+        [
+          'the list answers FORBIDDEN',
+          () => Promise.resolve({ kind: 'FORBIDDEN' }),
+        ],
+        ['the list throws', () => Promise.reject(new TypeError('down'))],
+      ])(
+        '%s → failed, logged; the pet, its local twin and its legacy twin stay',
+        async (_label, list) => {
+          const h = harness(found([]));
+          h.client.createPet.mockRejectedValue(
+            Object.assign(new Error('x'), { statusCode: 500 }),
+          );
+          await h.say('mi perrito Bruno es un pug');
+          await h.profiles.record(SENDER, {
+            pet: { name: 'Bruno', species: 'perro' },
+          });
+          h.setLookup(found([backend()]));
+          h.advance(2 * MINUTE);
+          h.client.patchPet.mockRejectedValue(new TypeError('down'));
+          await h.service.prepare(SENDER, true);
+          h.client.archivePet.mockResolvedValue(conflict);
+          h.client.listPets.mockImplementation(list as never);
+          await expect(h.service.forgetPet(SENDER, 'Bruno')).resolves.toBe(
+            'failed',
+          );
+          expect(h.client.archivePet).toHaveBeenCalledTimes(1);
+          expect(h.client.listPets.mock.calls).toEqual([[CUSTOMER_ID, 'ALL']]);
+          expect(JSON.stringify(warn.mock.calls)).toContain(
+            'pet archive not done: reread failed',
+          );
+          expect(h.service.promptLines(SENDER)).toContain('"Bruno"');
+          expect(h.service.knownPets(SENDER).map((pet) => pet.source)).toEqual([
+            'backend',
+          ]);
+          await expect(h.local()).resolves.toMatchObject([{ name: 'Bruno' }]);
+          expect(h.profiles.cached(SENDER)?.pet).toEqual({
+            name: 'Bruno',
+            species: 'perro',
+          });
+        },
+      );
+
+      it('a reread that lists no such pet (deleted) is still done: archived, dropped from the prompt', async () => {
+        const h = harness(found([backend(), max()]));
+        h.client.archivePet.mockResolvedValue(conflict);
+        h.client.listPets.mockResolvedValue({ kind: 'ok', pets: [max()] });
+        await h.service.prepare(SENDER);
+        await expect(h.service.forgetPet(SENDER, 'Bruno')).resolves.toBe(
+          'archived',
+        );
+        expect(h.client.archivePet).toHaveBeenCalledTimes(1);
+        expect(h.service.knownPets(SENDER).map((pet) => pet.name)).toEqual([
+          'Max',
+        ]);
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('reread failed');
+      });
+
+      it('the patch path keeps its behaviour: a failed conflict reread drops the pet from the cache and fails the PATCH', async () => {
+        const h = harness(found([backend()]));
+        h.client.patchPet.mockResolvedValue(conflict);
+        h.client.listPets.mockResolvedValue({ kind: 'FORBIDDEN' });
+        await h.say('mi perrito Bruno es un pug');
+        expect(h.client.patchPet).toHaveBeenCalledTimes(1);
+        expect(h.service.promptLines(SENDER)).toBeNull();
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('reread failed');
+      });
+    });
+
+    describe('T4c-1-fix H7: a twin removal that fails after an archive is reported and retried', () => {
+      /** A local Bruno twin that stayed pending (failed create, then a
+       *  failed merge into the backend Bruno that appeared). */
+      const withLocalTwin = async () => {
+        const h = harness(found([]));
+        h.client.createPet.mockRejectedValueOnce(
+          Object.assign(new Error('x'), { statusCode: 500 }),
+        );
+        await h.say('mi perrito Bruno es un pug');
+        h.setLookup(found([backend()]));
+        h.advance(2 * MINUTE);
+        h.client.patchPet.mockRejectedValue(new TypeError('down'));
+        await h.service.prepare(SENDER, true);
+        expect(await h.local()).toHaveLength(1);
+        h.client.createPet.mockClear();
+        h.client.archivePet.mockResolvedValue(archived(backend()));
+        return h;
+      };
+
+      it('the write fails → logged; the entry is never uploaded and is removed on the next prepare', async () => {
+        const h = await withLocalTwin();
+        jest
+          .spyOn(h.localStore, 'write')
+          .mockRejectedValueOnce(new TypeError('store down'));
+        await expect(h.service.forgetPet(SENDER, 'Bruno')).resolves.toBe(
+          'archived',
+        );
+        expect(JSON.stringify(warn.mock.calls)).toContain(
+          'pet archive: twin entry not removed, kept from upload',
+        );
+        await expect(h.local()).resolves.toMatchObject([{ name: 'Bruno' }]);
+        // The backend pet is archived (not ACTIVE any more); hours later the
+        // next prepare would create it again: it removes the entry instead.
+        h.setLookup(found([]));
+        h.advance(3 * 60 * MINUTE);
+        await h.service.prepare(SENDER, true);
+        expect(h.client.createPet).not.toHaveBeenCalled();
+        expect(h.client.patchPet).toHaveBeenCalledTimes(1);
+        await expect(h.local()).resolves.toEqual([]);
+        // Removed: a Bruno stated later is a new pet again (uploaded).
+        await h.say('mi perrito Bruno es un pug');
+        expect(h.client.createPet).toHaveBeenCalledTimes(1);
+      });
+
+      it('a removal that fails again in upload keeps the entry from upload until it lands', async () => {
+        const h = await withLocalTwin();
+        const write = jest
+          .spyOn(h.localStore, 'write')
+          .mockRejectedValueOnce(new TypeError('store down'));
+        await h.service.forgetPet(SENDER, 'Bruno');
+        h.setLookup(found([]));
+        h.advance(3 * 60 * MINUTE);
+        write.mockRejectedValueOnce(new TypeError('store down'));
+        await h.service.prepare(SENDER, true);
+        expect(h.client.createPet).not.toHaveBeenCalled();
+        await expect(h.local()).resolves.toHaveLength(1);
+        h.advance(2 * MINUTE);
+        await h.service.prepare(SENDER, true);
+        expect(h.client.createPet).not.toHaveBeenCalled();
+        await expect(h.local()).resolves.toEqual([]);
+      });
+
+      it('the write lands (previous behaviour): removed, nothing logged', async () => {
+        const h = await withLocalTwin();
+        await expect(h.service.forgetPet(SENDER, 'Bruno')).resolves.toBe(
+          'archived',
+        );
+        await expect(h.local()).resolves.toEqual([]);
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('twin');
+      });
+
+      it('no twin entry and no legacy twin: nothing logged', async () => {
+        const h = harness(found([backend(), max()]));
+        h.client.archivePet.mockResolvedValue(archived(backend()));
+        await h.service.prepare(SENDER);
+        await expect(h.service.forgetPet(SENDER, 'Bruno')).resolves.toBe(
+          'archived',
+        );
+        expect(JSON.stringify(warn.mock.calls)).not.toContain('twin');
+      });
+
+      it('a legacy twin that cannot be cleared is logged (the archive stays done)', async () => {
+        const h = harness(found([backend(), max()]));
+        await h.profiles.record(SENDER, {
+          pet: { name: 'Bruno', species: 'perro' },
+        });
+        jest.spyOn(h.profiles, 'clearPet').mockResolvedValue(false);
+        h.client.archivePet.mockResolvedValue(archived(backend()));
+        await h.service.prepare(SENDER);
+        await expect(h.service.forgetPet(SENDER, 'Bruno')).resolves.toBe(
+          'archived',
+        );
+        expect(JSON.stringify(warn.mock.calls)).toContain(
+          'pet archive: legacy twin not cleared',
+        );
+      });
+    });
   });
 
   describe('G3: «olvida mis datos» deletes every backend pet', () => {
@@ -2490,6 +2694,19 @@ describe('CustomerPetsService (T4c-1)', () => {
       await h.service.forgetAll(SENDER);
       expect(h.client.listPets).not.toHaveBeenCalled();
       expect(h.client.deletePet).not.toHaveBeenCalled();
+      // H4: nothing new logged for a prospect.
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('erase');
+    });
+
+    it('H4: a lookup that fails skips the erase with a distinct warning', async () => {
+      const h = harness(new Error('down'));
+      await expect(h.service.forgetAll(SENDER)).resolves.toBeUndefined();
+      expect(h.getCustomerByPhone).toHaveBeenCalledTimes(1);
+      expect(h.client.listPets).not.toHaveBeenCalled();
+      expect(h.client.deletePet).not.toHaveBeenCalled();
+      expect(JSON.stringify(warn.mock.calls)).toContain(
+        'customer pets erase skipped: lookup unavailable',
+      );
     });
 
     it('a failing list or lookup never throws', async () => {

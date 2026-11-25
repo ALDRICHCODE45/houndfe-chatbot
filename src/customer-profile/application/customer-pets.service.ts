@@ -222,6 +222,9 @@ export class CustomerPetsService {
    *  sender (even one left in flight by a timed-out task) and is computed
    *  from the list the previous write left. */
   private readonly localIo = new Map<string, Promise<void>>();
+  /** H7: per sender, twin keys of archived pets whose local twin entry
+   *  could not be removed: kept from upload until a removal lands. */
+  private readonly archivedTwins = new Map<string, Set<string>>();
   private readonly now: () => Date;
   private readonly newId: () => string;
 
@@ -886,6 +889,9 @@ export class CustomerPetsService {
     // The Customer already has a pet with this name (staff created it, or an
     // earlier uncertain create did): merge by PATCH, never a duplicate.
     const key = twinKey(current.name, current.species);
+    // H7: the twin of a pet archived by forgetPet whose removal did not
+    // land: never created again, removed instead.
+    if (await this.keptFromUpload(senderId, fence, key)) return;
     const same = scope.pets.filter(
       (candidate) => twinKey(candidate.name, candidate.species) === key,
     );
@@ -1140,18 +1146,31 @@ export class CustomerPetsService {
     return { failed: 'PET_VERSION_CONFLICT' };
   }
 
+  /** The pet as the backend lists it now; `null` when not listed or when
+   *  the list failed (the PATCH path treats both alike). */
   private async reread(
     customerId: string,
     petId: string,
   ): Promise<BackendPet | null> {
+    const found = await this.rereadState(customerId, petId);
+    return found.kind === 'found' ? found.pet : null;
+  }
+
+  /** H6: the reread telling «not listed» (`gone`) from «list failed». */
+  private async rereadState(
+    customerId: string,
+    petId: string,
+  ): Promise<
+    { kind: 'found'; pet: BackendPet } | { kind: 'gone' } | { kind: 'failed' }
+  > {
     try {
       const listed = await this.client.listPets(customerId, 'ALL');
-      return listed.kind === 'ok'
-        ? (listed.pets.find((pet) => pet.id === petId) ?? null)
-        : null;
+      if (listed.kind !== 'ok') return { kind: 'failed' };
+      const pet = listed.pets.find((candidate) => candidate.id === petId);
+      return pet === undefined ? { kind: 'gone' } : { kind: 'found', pet };
     } catch (error) {
       this.warn('pet reread', error);
-      return null;
+      return { kind: 'failed' };
     }
   }
 
@@ -1243,16 +1262,22 @@ export class CustomerPetsService {
         this.logger.warn(`pet archive not done: ${result.kind}`);
         return 'failed';
       }
-      const fresh = await this.reread(customerId, target.id);
-      if (fresh === null || fresh.status !== 'ACTIVE') {
+      const reread = await this.rereadState(customerId, target.id);
+      // H6: an unknown state is not reported as archived (nothing dropped).
+      if (reread.kind === 'failed') {
+        this.logger.warn('pet archive not done: reread failed');
+        return 'failed';
+      }
+      if (reread.kind === 'gone' || reread.pet.status !== 'ACTIVE') {
         // Already archived (or deleted) by someone else: forgotten.
-        if (fresh === null) this.dropBackend(senderId, fence, target.id);
-        else this.upsertBackend(senderId, fence, fresh);
+        if (reread.kind === 'gone')
+          this.dropBackend(senderId, fence, target.id);
+        else this.upsertBackend(senderId, fence, reread.pet);
         await this.forgetTwinEntries(senderId, fence, target);
         return 'archived';
       }
-      this.upsertBackend(senderId, fence, fresh);
-      target = fresh;
+      this.upsertBackend(senderId, fence, reread.pet);
+      target = reread.pet;
     }
     return 'failed';
   }
@@ -1260,7 +1285,9 @@ export class CustomerPetsService {
   /** G2: a local entry with the archived pet's name and species (pending,
    *  hidden by B6) is that pet: removed so it is never uploaded later. The
    *  legacy pet it shadowed (B3 rule) is that pet too: cleared, so it does
-   *  not resurface once the archived pet leaves the list. */
+   *  not resurface once the archived pet leaves the list. H7: a removal
+   *  that does not land (or cannot be checked) is logged and its key kept
+   *  from upload until a later removal lands. */
   private async forgetTwinEntries(
     senderId: string,
     fence: Fence,
@@ -1272,18 +1299,58 @@ export class CustomerPetsService {
     if (
       legacy?.name !== undefined &&
       foldPetName(legacy.name) === foldPetName(pet.name) &&
-      (legacySpecies === undefined || legacySpecies === backendSpecies(pet))
+      (legacySpecies === undefined || legacySpecies === backendSpecies(pet)) &&
+      !(await this.profiles.clearPet(senderId))
     )
-      await this.profiles.clearPet(senderId);
+      this.logger.warn('pet archive: legacy twin not cleared');
     const key = twinKey(pet.name, pet.species);
-    await this.writeLocal(senderId, fence, (current) => {
+    if ((await this.removeTwinEntries(senderId, fence, key)) !== 'failed')
+      return;
+    if (this.profiles.isForgotten(senderId)) return;
+    this.logger.warn('pet archive: twin entry not removed, kept from upload');
+    const keys = this.archivedTwins.get(senderId) ?? new Set<string>();
+    keys.add(key);
+    this.archivedTwins.set(senderId, keys);
+  }
+
+  /** H7: removes the (non-ambiguous) local entries with this twin key.
+   *  `failed`: they exist (or the list could not be checked) and are still
+   *  stored. */
+  private async removeTwinEntries(
+    senderId: string,
+    fence: Fence,
+    key: string,
+  ): Promise<'removed' | 'none' | 'failed'> {
+    let checked = false;
+    let existed = false;
+    const wrote = await this.writeLocal(senderId, fence, (current) => {
+      checked = true;
       const next = current.filter((entry) => {
         if (entry.blocked === 'ambiguous') return true;
         const body = localCreateBody(entry);
         return body === null || twinKey(body.name, body.species) !== key;
       });
-      return next.length === current.length ? null : next;
+      existed = next.length !== current.length;
+      return existed ? next : null;
     });
+    if (wrote) return 'removed';
+    return checked && !existed ? 'none' : 'failed';
+  }
+
+  /** H7: true when `key` belongs to an archived pet whose local twin is
+   *  still stored; tries the removal again (the key goes once it lands). */
+  private async keptFromUpload(
+    senderId: string,
+    fence: Fence,
+    key: string,
+  ): Promise<boolean> {
+    const keys = this.archivedTwins.get(senderId);
+    if (keys === undefined || !keys.has(key)) return false;
+    if ((await this.removeTwinEntries(senderId, fence, key)) !== 'failed') {
+      keys.delete(key);
+      if (keys.size === 0) this.archivedTwins.delete(senderId);
+    }
+    return true;
   }
 
   /** G3: the Customer's pets, every page of `?status=ALL`, deleted. */
@@ -1297,8 +1364,12 @@ export class CustomerPetsService {
       cached?.kind === 'customer' || cached?.kind === 'customer_pets_unknown'
         ? cached
         : await this.resolveScope(senderId);
-    if (scope.kind !== 'customer' && scope.kind !== 'customer_pets_unknown')
+    if (scope.kind !== 'customer' && scope.kind !== 'customer_pets_unknown') {
+      // H4: a failed lookup is not the same as a prospect (no Customer).
+      if (scope.kind === 'unavailable')
+        this.logger.warn('customer pets erase skipped: lookup unavailable');
       return;
+    }
     const { customerId } = scope;
     let deleted = 0;
     let failed = 0;

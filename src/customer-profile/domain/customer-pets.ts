@@ -273,8 +273,10 @@ function normalizeFacts(facts: PetFacts): NormalizedFacts {
 /**
  * G1 (T4c-1): a stated allergy added to a stored one, never replacing it
  * (losing an allergy is worse than a longer note). `unchanged` when the
- * stored text already says it (case and accents ignored); `too_long` when
- * the result would pass the 500-character limit (nothing is cut).
+ * stored text already says it (H3: as whole words inside one `;` `,` `.`
+ * or line segment, case and accents ignored; a segment with «no» or «sin»
+ * never counts); `too_long` when the result would pass the 500-character
+ * limit (nothing is cut).
  */
 export function appendAllergy(
   stored: string | null | undefined,
@@ -282,9 +284,25 @@ export function appendAllergy(
 ): { text: string } | 'unchanged' | 'too_long' {
   if (stored === null || stored === undefined || stored.trim() === '')
     return { text: added };
-  if (foldPetName(stored).includes(foldPetName(added))) return 'unchanged';
+  if (allergyAlreadyStated(stored, added)) return 'unchanged';
   const text = `${stored}; ${added}`;
   return Array.from(text).length > PET_ALLERGIES_MAX ? 'too_long' : { text };
+}
+
+const allergyWords = (text: string): string[] =>
+  foldPetName(text).match(/[\p{L}\p{N}]+/gu) ?? [];
+
+/** H3: one stored segment holds the added words, in order, as whole words. */
+function allergyAlreadyStated(stored: string, added: string): boolean {
+  const wanted = allergyWords(added);
+  if (wanted.length === 0) return true;
+  return stored.split(/[;,.\n]/).some((segment) => {
+    const words = allergyWords(segment);
+    if (words.includes('no') || words.includes('sin')) return false;
+    for (let i = 0; i + wanted.length <= words.length; i += 1)
+      if (wanted.every((word, j) => words[i + j] === word)) return true;
+    return false;
+  });
 }
 
 /** G1: true when the facts' allergy cannot be appended to `stored` (over

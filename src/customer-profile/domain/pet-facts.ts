@@ -289,6 +289,12 @@ const ALLERGY = new RegExp(
   'iu',
 );
 const PET_WORD_ONLY = new RegExp(`^(?:${PET_WORD})$`, 'iu');
+/** H2: a person word right before the name (folded): «mi esposo Max». */
+const PERSON_BEFORE =
+  /(?:^|[^\p{L}])(?:espos[oa]|marido|mujer|hij[oa]|mama|papa|herman[oa]|novi[oa]|abuel[oa]|ti[oa]|prim[oa]|amig[oa]|suegr[oa]|sobrin[oa]|bebe)s?\s+$/u;
+/** H2: where the allergy clause ends («… pero …», «… y quiero …»). */
+const CLAUSE_JOINER =
+  /\s(?:pero|porque|y\s+(?:quiero|le|me|necesito|busco|quisiera))(?!\p{L})/iu;
 
 /**
  * G1 (T4c-1): «<Nombre> es alérgic[oa] a(l) X» from the customer's own text,
@@ -298,10 +304,23 @@ const PET_WORD_ONLY = new RegExp(`^(?:${PET_WORD})$`, 'iu');
 export function extractPetAllergy(
   text: string,
 ): { name: string; allergies: string } | null {
-  const match = ALLERGY.exec(customerOwnText(text));
+  const own = customerOwnText(text);
+  const match = ALLERGY.exec(own);
   if (match === null) return null;
-  const [, word, rest] = match;
+  const [, word, matched] = match;
   if (!acceptableName(word) || PET_WORD_ONLY.test(word)) return null;
+  // H2: a question («¿Max es alérgico…?») states nothing.
+  const before = own.slice(0, match.index);
+  const sentence = before.slice(
+    Math.max(...['.', '!', '?', '\n'].map((mark) => before.lastIndexOf(mark))) +
+      1,
+  );
+  if (sentence.includes('¿')) return null;
+  if (/^\s*\?/.test(own.slice(match.index + match[0].length))) return null;
+  // H2: «mi esposo Max» is a person, not a pet.
+  if (PERSON_BEFORE.test(fold(before))) return null;
+  const joiner = CLAUSE_JOINER.exec(matched);
+  const rest = joiner === null ? matched : matched.slice(0, joiner.index);
   const allergies = Array.from(rest.replace(/\s+/g, ' ').trim())
     .slice(0, ALLERGY_TEXT_MAX)
     .join('')

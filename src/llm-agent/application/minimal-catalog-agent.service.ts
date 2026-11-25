@@ -336,7 +336,8 @@ const PET_MEMORY_INSTRUCTIONS =
   'Si hay una sola línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte. ' +
   'Si hay varias, siga la indicación que las acompaña. ' +
   'Si el cliente dice que una mascota ya no está (murió, se perdió, la regaló) o pide olvidarla, llame forgetPet con su nombre y el motivo que él dio; responda con tacto y calidez, en pocas palabras, sin ofrecer productos para esa mascota. ' +
-  'Si forgetPet responde ok false, no se guardó nada: dígalo con amabilidad y pregunte de cuál mascota se trata.';
+  'Si forgetPet responde ok false, no se guardó nada: dígalo con amabilidad y pregunte de cuál mascota se trata. ' +
+  'Si forgetPet responde pending true, todavía se está guardando: no diga que ya la olvidó; responda con tacto sin confirmarlo.';
 
 const REMEMBER_PET_DESCRIPTION =
   'Guarda datos que el cliente dijo explícitamente sobre SU mascota para recordarlos en otras conversaciones. ' +
@@ -345,7 +346,13 @@ const REMEMBER_PET_DESCRIPTION =
 // T4c-1 G2: «Bruno ya no está» / «olvida a Bruno» (archive, never delete).
 const FORGET_PET_DESCRIPTION =
   'Deja de recordar una mascota del cliente que ya no está o que pidió olvidar («Bruno ya no está», «olvida a Bruno»): la archiva, sin borrar sus pedidos. ' +
-  'name: el nombre que dio el cliente. reason: el motivo en sus palabras, solo si lo dijo. Si responde ok false, no se guardó nada.';
+  'name: el nombre que dio el cliente. reason: el motivo en sus palabras, solo si lo dijo. Si responde ok false, no se guardó nada. ' +
+  'Si responde pending true, todavía se está guardando: no diga que ya la olvidó; responda con tacto sin confirmarlo.';
+
+// T4c-1-fix H1: after forgetPet names a pet, no capture (deterministic or
+// rememberPetDetails) writes a pet with that name for this long, so the
+// message that forgets it («mi perrito Bruno ya no está») never re-creates it.
+export const PET_FORGOTTEN_WINDOW_MS = 5 * 60_000;
 
 /** Generous input cap; the profile store bounds each field again. */
 const PET_FACT = z.string().min(1).max(500).optional();
@@ -1039,6 +1046,9 @@ export class MinimalCatalogAgentService {
   // T4b-fix A2: senders whose pet prepare ran past its budget this turn; the
   // turn writes no pets (the prepare finishes in the background).
   private readonly petsOverBudget = new Set<string>();
+  // T4c-1-fix H1: per sender, the folded names given to forgetPet and when
+  // their PET_FORGOTTEN_WINDOW_MS ends.
+  private readonly forgottenPets = new Map<string, Map<string, number>>();
   // T4b-fix-2 D2: the pet prepare started by the dispatcher warm-up, still
   // in flight; the next turn of the sender joins it instead of paying a
   // second budget.
@@ -3872,6 +3882,9 @@ export class MinimalCatalogAgentService {
           notes: PET_FACT,
         }),
         execute: async (pet) => {
+          // T4c-1-fix H1: never brings back a pet forgotten moments ago.
+          if (this.petRecentlyForgotten(senderId, pet.name))
+            return toolError('pet_recently_forgotten');
           // T4b: the matched pet of the pet store (never mixes two pets).
           if (this.pets !== undefined) {
             // T4b-fix A2: the pets of this turn are not loaded; no writes.
@@ -3913,6 +3926,9 @@ export class MinimalCatalogAgentService {
           reason: z.string().min(1).max(500).optional(),
         }),
         execute: async ({ name, reason }) => {
+          // T4c-1-fix H1: whatever the outcome (even an unknown name), the
+          // same turn's captures never (re)create a pet with this name.
+          this.markPetForgotten(senderId, name);
           const pets = this.pets;
           // Without the pet store only the legacy single pet exists.
           if (pets === undefined) {
@@ -3988,7 +4004,8 @@ export class MinimalCatalogAgentService {
       if (
         this.pets === undefined &&
         Object.keys(pet).length > 0 &&
-        !petFactsConflict(profiles.cached(input.senderId)?.pet, pet)
+        !petFactsConflict(profiles.cached(input.senderId)?.pet, pet) &&
+        !this.petRecentlyForgotten(input.senderId, pet.name)
       )
         patch.pet = pet;
     }
@@ -4012,14 +4029,45 @@ export class MinimalCatalogAgentService {
         facts.name !== undefined &&
         foldPetName(facts.name) === foldPetName(allergy.name);
       if (joined) facts.allergies = allergy.allergies;
-      void this.petsInBackground('capture', () =>
-        pets.capture(input.senderId, facts, legacy),
-      );
-      if (allergy !== null && !joined)
+      // T4c-1-fix H1: a pet forgotten earlier in the turn (or the window)
+      // is never captured again (with the same name, the allergy neither).
+      if (!this.petRecentlyForgotten(input.senderId, facts.name))
+        void this.petsInBackground('capture', () =>
+          pets.capture(input.senderId, facts, legacy),
+        );
+      if (
+        allergy !== null &&
+        !joined &&
+        !this.petRecentlyForgotten(input.senderId, allergy.name)
+      )
         void this.petsInBackground('capture', () =>
           pets.captureAllergy(input.senderId, allergy, legacy),
         );
     }
+  }
+
+  /** T4c-1-fix H1: starts (or renews) the window of a forgotten name;
+   *  expired windows of every sender are dropped on the way. */
+  private markPetForgotten(senderId: string, name: string): void {
+    const now = Date.now();
+    for (const [sender, names] of this.forgottenPets) {
+      for (const [folded, until] of names)
+        if (until <= now) names.delete(folded);
+      if (names.size === 0) this.forgottenPets.delete(sender);
+    }
+    const names = this.forgottenPets.get(senderId) ?? new Map<string, number>();
+    names.set(foldPetName(name), now + PET_FORGOTTEN_WINDOW_MS);
+    this.forgottenPets.set(senderId, names);
+  }
+
+  /** T4c-1-fix H1: true while `name` is inside its forgotten window. */
+  private petRecentlyForgotten(
+    senderId: string,
+    name: string | undefined,
+  ): boolean {
+    if (name === undefined) return false;
+    const until = this.forgottenPets.get(senderId)?.get(foldPetName(name));
+    return until !== undefined && until > Date.now();
   }
 
   /** S1: "olvida mis datos" — delete the profile and confirm. */
