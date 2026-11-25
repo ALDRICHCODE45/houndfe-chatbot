@@ -1441,6 +1441,62 @@ describe('T4c-1: allergies, forget one pet, forget my data (S5, S7)', () => {
     const localPets = (profileStore: InMemoryCustomerProfileStore) =>
       new InMemoryLocalPetStore(profileStore).read(SENDER);
 
+    it('N1: a nameless description in the forgetting message never lands on the pet that remains', async () => {
+      const pets = client();
+      pets.archivePet.mockResolvedValue({
+        kind: 'ok',
+        pet: archived(),
+        warnings: [],
+      });
+      const profileStore = new InMemoryCustomerProfileStore();
+      const h = harness(profileStore, {
+        lookup: customer([pet({}), maxPet()]),
+        client: pets,
+      });
+      await h.turn('ya no está mi perrito, era un chihuahua de 10 años', [
+        [
+          call('forgetPet', { name: 'Bruno', reason: 'ya no está' }),
+          say('Lo siento mucho.'),
+        ],
+      ]);
+      await flush();
+      expect(h.toolOutputs).toEqual([{ ok: true, forgotten: true }]);
+      expect(pets.archivePet).toHaveBeenCalledTimes(1);
+      expect(pets.patchPet).not.toHaveBeenCalled();
+      expect(pets.createPet).not.toHaveBeenCalled();
+      await expect(localPets(profileStore)).resolves.toEqual([]);
+      // The next turn captures again: a nameless fact goes to Max.
+      pets.patchPet.mockResolvedValue({
+        kind: 'ok',
+        pet: maxPet({ version: 4 }),
+        warnings: [],
+      });
+      await h.turn('mi perro tiene 5 años', [[say('¡Qué bien!')]]);
+      await flush();
+      expect(
+        (pets.patchPet.mock.calls as unknown[][]).map((c) => c[1]),
+      ).toEqual([MAX_ID]);
+    });
+
+    it('N2: in the forgetting message a diminutive of the forgotten name is not created either', async () => {
+      const pets = client();
+      pets.archivePet.mockResolvedValue({
+        kind: 'ok',
+        pet: archived(),
+        warnings: [],
+      });
+      const h = harness(new InMemoryCustomerProfileStore(), {
+        lookup: customer([pet({}), maxPet()]),
+        client: pets,
+      });
+      await h.turn('mi perrito Brunito ya no está', [
+        [call('forgetPet', { name: 'Bruno' }), say('Lo siento mucho.')],
+      ]);
+      await flush();
+      expect(pets.createPet).not.toHaveBeenCalled();
+      expect(pets.patchPet).not.toHaveBeenCalled();
+    });
+
     it('backend pet: archived, then the deterministic capture of the same text sends no create or PATCH', async () => {
       const pets = client();
       pets.archivePet.mockResolvedValue({

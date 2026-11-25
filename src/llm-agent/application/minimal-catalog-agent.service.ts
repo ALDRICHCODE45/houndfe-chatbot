@@ -1049,6 +1049,10 @@ export class MinimalCatalogAgentService {
   // T4c-1-fix H1: per sender, the folded names given to forgetPet and when
   // their PET_FORGOTTEN_WINDOW_MS ends.
   private readonly forgottenPets = new Map<string, Map<string, number>>();
+  // T4c-1-fix N1: senders whose current turn called forgetPet; that turn's
+  // deterministic pet capture is skipped (the message describes the pet
+  // being forgotten, never the one that remains).
+  private readonly petForgetTurns = new Set<string>();
   // T4b-fix-2 D2: the pet prepare started by the dispatcher warm-up, still
   // in flight; the next turn of the sender joins it instead of paying a
   // second budget.
@@ -1169,6 +1173,7 @@ export class MinimalCatalogAgentService {
       // S4: restore the sender's durable gates (pending summaries,
       // references, RESTOCK question) before any route reads them.
       await this.gates?.begin(input.senderId);
+      this.petForgetTurns.delete(input.senderId);
       await this.prepareCustomer(input.senderId);
       const decision = this.withConfirmationButtons(
         input.senderId,
@@ -3984,6 +3989,8 @@ export class MinimalCatalogAgentService {
     profileName?: string;
   }): Promise<void> {
     const profiles = this.profiles;
+    // T4c-1-fix N1: a turn that forgot a pet captures no pet facts.
+    const forgotPet = this.petForgetTurns.delete(input.senderId);
     if (profiles === undefined) return;
     const patch: CustomerProfilePatch = {};
     if (input.profileName !== undefined) patch.displayName = input.profileName;
@@ -4003,6 +4010,7 @@ export class MinimalCatalogAgentService {
       const pet = extractPetFacts(input.text);
       if (
         this.pets === undefined &&
+        !forgotPet &&
         Object.keys(pet).length > 0 &&
         !petFactsConflict(profiles.cached(input.senderId)?.pet, pet) &&
         !this.petRecentlyForgotten(input.senderId, pet.name)
@@ -4016,6 +4024,7 @@ export class MinimalCatalogAgentService {
     if (
       pets !== undefined &&
       input.interactiveReplyId === undefined &&
+      !forgotPet &&
       !this.petsOverBudget.has(input.senderId)
     ) {
       const facts: PetFacts = extractPetFacts(input.text);
@@ -4058,6 +4067,7 @@ export class MinimalCatalogAgentService {
     const names = this.forgottenPets.get(senderId) ?? new Map<string, number>();
     names.set(foldPetName(name), now + PET_FORGOTTEN_WINDOW_MS);
     this.forgottenPets.set(senderId, names);
+    this.petForgetTurns.add(senderId);
   }
 
   /** T4c-1-fix H1: true while `name` is inside its forgotten window. */
