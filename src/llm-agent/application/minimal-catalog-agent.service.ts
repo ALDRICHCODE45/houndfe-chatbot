@@ -88,7 +88,10 @@ import {
   isSendableProductImageUrl,
   orderConfirmationButtons,
   ORDER_BUTTONS_PROMPT,
+  INTERACTIVE_LIMITS,
   parseInteractiveReplyId,
+  PET_CHOICE_OTHER_REF,
+  petChoicePick,
   productImageCaption,
   reorderConfirmationButtons,
   cartNextStepButtons,
@@ -171,6 +174,12 @@ import {
 } from './minimal-cart.service';
 import { ConversationGates } from '../../conversation-gates/application/conversation-gates';
 import { DurablePaymentOffer } from './gates/payment-offer.gate';
+import {
+  DurablePetChoice,
+  matchPetChoiceAnswer,
+  PET_CHOICE_REQUEST_MAX_CHARS,
+  type PetChoice,
+} from './gates/pet-choice.gate';
 import { statedPurchaseCount } from './backorder-quantity';
 import { MinimalBackorderManageService } from './minimal-backorder-manage.service';
 import { MinimalBackorderConfirmService } from './minimal-backorder-confirm.service';
@@ -329,12 +338,13 @@ export const FORGET_MY_DATA_REPLY =
 export const PET_PREPARE_BUDGET_MS = 1500;
 
 // S1: guidance for the customer-memory tools (pet facts; T4c-1: allergies,
-// forgetPet and the tact instruction).
+// forgetPet and the tact instruction; T4c-2a: the chosen pet's line).
 const PET_MEMORY_INSTRUCTIONS =
   'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad, alergias), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
   'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación. ' +
   'Si hay una sola línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte. ' +
   'Si hay varias, siga la indicación que las acompaña. ' +
+  'Si hay una línea "Mascota de este pedido", la solicitud es para esa mascota: búsquela directo con sus datos y no pregunte para cuál es. ' +
   'Si el cliente dice que una mascota ya no está (murió, se perdió, la regaló) o pide olvidarla, llame forgetPet con su nombre y el motivo que él dio; responda con tacto y calidez, en pocas palabras, sin ofrecer productos para esa mascota. ' +
   'Si forgetPet responde ok false, no se guardó nada: dígalo con amabilidad y pregunte de cuál mascota se trata. ' +
   'Si forgetPet responde pending true, todavía se está guardando: no diga que ya la olvidó; responda con tacto sin confirmarlo.';
@@ -348,6 +358,17 @@ const FORGET_PET_DESCRIPTION =
   'Deja de recordar una mascota del cliente que ya no está o que pidió olvidar («Bruno ya no está», «olvida a Bruno»): la archiva, sin borrar sus pedidos. ' +
   'name: el nombre que dio el cliente. reason: el motivo en sus palabras, solo si lo dijo. Si responde ok false, no se guardó nada. ' +
   'Si responde pending true, todavía se está guardando: no diga que ya la olvidó; responda con tacto sin confirmarlo.';
+
+// T4c-2a P2 (S3): the which-pet question the application sends with one
+// button / list row per pet, and the reply to the «Otra mascota» row (S12).
+export const PET_CHOICE_QUESTION = '¿Para quién es?';
+export const PET_CHOICE_NAME_REPLY =
+  '¿Cómo se llama? Escríbame el nombre de su mascota.';
+
+const ASK_WHICH_PET_DESCRIPTION =
+  'Pregunta al cliente para cuál de sus mascotas es lo que pide, cuando tiene varias y su mensaje no nombra a ninguna (ni por nombre ni por especie). ' +
+  'La aplicación envía «¿Para quién es?» con un botón por mascota y, cuando el cliente elige, continúa su solicitud para esa mascota. ' +
+  'Llámela antes de buscar, sin argumentos; no escriba usted la pregunta.';
 
 // T4c-1-fix H1: after forgetPet names a pet, no capture (deterministic or
 // rememberPetDetails) writes a pet with that name for this long, so the
@@ -585,6 +606,14 @@ type RestockRun = {
 
 type ExpirationReply = { attempted: boolean; value: string | null };
 type PaymentRun = { attempted: boolean; value: MinimalPaymentReply | null };
+// T4c-2a P2: one which-pet question per run; the application presents it.
+type PetChoiceRun = {
+  attempted: boolean;
+  value: {
+    interactive: CustomerReplyInteractive;
+    choice: PetChoice;
+  } | null;
+};
 
 /** Style only the short body used when the text exceeds Meta's limit. */
 function styleInteractivePrompt(
@@ -1064,6 +1093,8 @@ export class MinimalCatalogAgentService {
   private readonly petWarmUps = new Map<string, Promise<void>>();
   /** Durable copy of the payment offer; `undefined` without gates. */
   private readonly paymentOffers?: DurablePaymentOffer;
+  /** T4c-2a: durable which-pet question; `undefined` without gates. */
+  private readonly petChoices?: DurablePetChoice;
 
   constructor(
     @Inject(CHATBOT_API_CLIENT) private readonly chatbotApi: ChatbotApiClient,
@@ -1127,6 +1158,8 @@ export class MinimalCatalogAgentService {
     // The payment offer outlives the in-memory session through the gates.
     this.paymentOffers =
       gates === undefined ? undefined : new DurablePaymentOffer(gates);
+    this.petChoices =
+      gates === undefined ? undefined : new DurablePetChoice(gates);
     this.model = llm.model;
     this.maxSteps = llm.maxSteps;
     this.historyTurns = llm.historyTurns;
@@ -1247,6 +1280,13 @@ export class MinimalCatalogAgentService {
         if ('decision' in tapped) return tapped.decision;
         input = tapped.input;
         pick = tapped.pick;
+      }
+      // T4c-2a P3: the bare name of one offered pet («para Max», «Max»)
+      // answers the which-pet question; anything else goes on as a new
+      // message (and its recorded turn clears the question).
+      if (input.interactiveReplyId === undefined) {
+        const answered = await this.answerPetChoiceText(input);
+        if (answered !== null) return answered;
       }
       // S2: the reply right after a reorder offer answers it first.
       if (input.interactiveReplyId === undefined) {
@@ -1900,6 +1940,8 @@ export class MinimalCatalogAgentService {
       case 'backorder_wait':
         // Reached only without the backorder services: nothing to answer.
         return answer({ reply: STALE_BUTTON_FALLBACK });
+      case 'pet_pick':
+        return { decision: await this.answerPetChoiceTap(input, intent.ref) };
       case 'pick': {
         const option = this.sessionStore
           .read(senderId)
@@ -2818,6 +2860,8 @@ export class MinimalCatalogAgentService {
       llmAdmitted?: true;
     },
     pick?: InteractivePick,
+    /** T4c-2a P4: «Mascota de este pedido» line of the chosen pet. */
+    chosenPet?: string,
   ): Promise<CustomerReply & { onSent?: () => void; silent?: true }> {
     // S2/S5 (cost protection): budget + per-number limit, one store call
     // (skipped when the photo turn was admitted before its vision call).
@@ -2955,6 +2999,12 @@ export class MinimalCatalogAgentService {
       placed !== null && placed.paid !== true
         ? { attempted: false, value: null }
         : null;
+    // T4c-2a P2: asked only with 2+ known pets, pets loaded this turn, and
+    // no pet already chosen for this request.
+    const petChoiceRun: PetChoiceRun | null =
+      chosenPet === undefined && this.petChoiceAvailable(input.senderId)
+        ? { attempted: false, value: null }
+        : null;
     const checkoutRun: CheckoutRun | null =
       this.cart && this.checkoutAvailable()
         ? { attempted: false, value: null }
@@ -3082,6 +3132,7 @@ export class MinimalCatalogAgentService {
         (paidOrder ? PAID_ORDER_INSTRUCTIONS_FRAGMENT : '') +
         (paidOrderNewCart ? PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT : '') +
         this.memoryInstructions(input.senderId) +
+        (chosenPet === undefined ? '' : `\n${chosenPet}`) +
         restockOfferContext +
         '\n\n' +
         customerStyleDirective(style),
@@ -3105,6 +3156,7 @@ export class MinimalCatalogAgentService {
           catalogRun,
         ),
         ...this.memoryTools(input.senderId),
+        ...this.petChoiceTools(input, petChoiceRun, styled, traceId),
         ...this.askTeamTools(input, askTeamRun, traceId),
         ...this.paymentTools(input, paymentRun, traceId),
       },
@@ -3215,6 +3267,25 @@ export class MinimalCatalogAgentService {
         persistedImages(),
       );
       return { reply };
+    }
+    const petChoice = petChoiceRun?.value ?? null;
+    if (petChoice !== null) {
+      // T4c-2a P2: the application asks which pet (buttons or list); the
+      // model's own text is dropped. The question and the original request
+      // are kept in the durable pet_choice gate.
+      const reply = styled(PET_CHOICE_QUESTION);
+      this.recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+        persistedImages(),
+        { petChoice: petChoice.choice },
+      );
+      return { reply, interactive: petChoice.interactive };
     }
     const reorder = reorderRun?.value ?? null;
     if (reorder !== null) {
@@ -3875,6 +3946,176 @@ export class MinimalCatalogAgentService {
     };
   }
 
+  /**
+   * T4c-2a P2: the which-pet question is offered only with the gates and the
+   * pet store, 2+ known pets and the pets loaded this turn (never on an
+   * over-budget turn).
+   */
+  private petChoiceAvailable(senderId: string): boolean {
+    return (
+      this.petChoices !== undefined &&
+      this.pets !== undefined &&
+      !this.petsOverBudget.has(senderId) &&
+      this.pets.knownPets(senderId).length >= 2
+    );
+  }
+
+  /** T4c-2a P2: «¿Para quién es?» with one button / row per pet (S3, S12). */
+  private petChoiceTools(
+    input: { senderId: string; text: string },
+    run: PetChoiceRun | null,
+    styled: (text: string) => string,
+    traceId: string,
+  ): ToolSet {
+    const pets = this.pets;
+    if (pets === undefined || run === null) return {};
+    return {
+      askWhichPet: tool({
+        description: ASK_WHICH_PET_DESCRIPTION,
+        inputSchema: z.strictObject({}),
+        execute: (): Promise<
+          | { ok: false; error: string }
+          | { ok: true; presentedByApplication: true }
+        > => {
+          if (run.attempted)
+            return Promise.resolve(toolError('pet_choice_settled'));
+          run.attempted = true;
+          const known = pets.knownPets(input.senderId);
+          // S12: past the list cap, the most recent pets are shown.
+          const shown =
+            known.length > INTERACTIVE_LIMITS.rows
+              ? pets.knownPetsByRecency(input.senderId)
+              : known;
+          const pick = petChoicePick(shown, styled(PET_CHOICE_QUESTION));
+          const request = input.text.slice(0, PET_CHOICE_REQUEST_MAX_CHARS);
+          if (pick === null || request.trim() === '')
+            return Promise.resolve(toolError('fewer_than_two_pets'));
+          run.value = {
+            interactive: pick.interactive,
+            choice: { purpose: 'request', options: pick.options, request },
+          };
+          traceLog(
+            this.logger,
+            `minimal_catalog tool askWhichPet options=${pick.options.length} trace=${traceId}`,
+          );
+          return Promise.resolve({
+            ok: true as const,
+            presentedByApplication: true as const,
+          });
+        },
+      }),
+    };
+  }
+
+  /**
+   * T4c-2a P3: a tapped pet of the which-pet question. Honoured only while
+   * the question is live, offered that ref and the pet is still known (else
+   * the stale-button reply); «Otra mascota» asks the name; a pet continues
+   * the original request with it as the turn's pet context.
+   */
+  private async answerPetChoiceTap(
+    input: {
+      senderId: string;
+      text: string;
+      inboundEvent?: unknown;
+      inboundAt?: string;
+    },
+    ref: string,
+  ): Promise<MinimalCatalogAgentDecision> {
+    const { senderId } = input;
+    const style = this.customerStyle(senderId, input.text);
+    const reply = (text: string, petChoice?: PetChoice) => {
+      const styledText = applyCustomerStyle(text, style);
+      this.recordTurn(
+        senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: styledText },
+        ],
+        [],
+        undefined,
+        undefined,
+        petChoice === undefined ? {} : { petChoice },
+      );
+      return this.decision({ reply: styledText });
+    };
+    const live = this.petChoices?.read(senderId) ?? null;
+    if (live === null || !live.options.some((option) => option.ref === ref))
+      return reply(STALE_BUTTON_FALLBACK);
+    if (ref === PET_CHOICE_OTHER_REF) {
+      // S12: the name is typed next; every known pet's name answers it.
+      const options = (this.pets?.knownPets(senderId) ?? [])
+        .filter((pet) => pet.name !== undefined)
+        .slice(0, 50)
+        .map((pet) => ({ ref: pet.ref, text: pet.name! }));
+      return options.length === 0
+        ? reply(STALE_BUTTON_FALLBACK)
+        : reply(PET_CHOICE_NAME_REPLY, { ...live, options });
+    }
+    const line = this.pets?.chosenPetPromptLine(senderId, ref) ?? null;
+    if (line === null) return reply(STALE_BUTTON_FALLBACK);
+    return this.continuePetChoice(input, live.request, line);
+  }
+
+  /** T4c-2a P3: the typed name of one offered pet, else `null`. */
+  private async answerPetChoiceText(input: {
+    senderId: string;
+    text: string;
+    inboundEvent?: unknown;
+    inboundAt?: string;
+    llmAdmitted?: true;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    const live = this.petChoices?.read(input.senderId) ?? null;
+    if (live === null) return null;
+    const option = matchPetChoiceAnswer(
+      input.text,
+      live.options,
+      PET_CHOICE_OTHER_REF,
+    );
+    if (option === null) return null;
+    const line =
+      this.pets?.chosenPetPromptLine(input.senderId, option.ref) ?? null;
+    if (line === null) return null;
+    return this.continuePetChoice(input, live.request, line);
+  }
+
+  /**
+   * T4c-2a P4: the original request continues with the chosen pet as the
+   * turn's pet context. Like any other turn it spends a pending order
+   * summary; its recorded turn clears the question.
+   */
+  private async continuePetChoice(
+    input: {
+      senderId: string;
+      inboundEvent?: unknown;
+      inboundAt?: string;
+      llmAdmitted?: true;
+    },
+    request: string,
+    line: string,
+  ): Promise<MinimalCatalogAgentDecision> {
+    this.order?.dismiss(input.senderId);
+    return this.decision(
+      await this.runTurn(
+        {
+          senderId: input.senderId,
+          text: request,
+          ...(input.inboundEvent === undefined
+            ? {}
+            : { inboundEvent: input.inboundEvent }),
+          ...(input.inboundAt === undefined
+            ? {}
+            : { inboundAt: input.inboundAt }),
+          ...(input.llmAdmitted === undefined
+            ? {}
+            : { llmAdmitted: input.llmAdmitted }),
+        },
+        undefined,
+        line,
+      ),
+    );
+  }
+
   private memoryTools(senderId: string): ToolSet {
     const profiles = this.profiles;
     if (profiles === undefined) return {};
@@ -4144,6 +4385,11 @@ export class MinimalCatalogAgentService {
       );
     await this.profiles!.forget(input.senderId);
     this.order?.dismiss(input.senderId);
+    // T4c-2a P5: the which-pet question holds pet names: its row goes too.
+    if (this.petChoices !== undefined) {
+      this.petChoices.clear(input.senderId);
+      this.gates?.touch(input.senderId);
+    }
     const reply = applyCustomerStyle(FORGET_MY_DATA_REPLY, style);
     this.recordTurn(
       input.senderId,
@@ -4205,8 +4451,18 @@ export class MinimalCatalogAgentService {
       reorderOffer?: ReorderOfferContext;
       paymentOffer?: { saleId: string };
       catalogRestockOffer?: CatalogRestockOffer & { acceptsYes: boolean };
+      petChoice?: PetChoice;
     } = {},
   ): void {
+    // T4c-2a: the which-pet question answers only the next message too.
+    if (this.petChoices !== undefined) {
+      const had = this.petChoices.read(senderId) !== null;
+      if (interactive.petChoice !== undefined)
+        this.petChoices.ask(senderId, interactive.petChoice);
+      else this.petChoices.clear(senderId);
+      if (had || interactive.petChoice !== undefined)
+        this.gates?.touch(senderId);
+    }
     // The offer answers only the next message: any other turn spends it.
     if (this.paymentOffers !== undefined) {
       const had = this.paymentOffers.read(senderId) !== null;

@@ -22,6 +22,7 @@ import {
   foldPetName,
   hasPetFacts,
   knownPetsPrompt,
+  chosenPetPromptLine,
   localCreateBody,
   localPetFacts,
   localPetFromFacts,
@@ -180,6 +181,8 @@ interface KnownEntry {
   ref: string;
   source: KnownPet['source'];
   view: PetPromptView;
+  /** T4c-2a S12: when the pet was added (backend/local; none for legacy). */
+  createdAt?: string;
 }
 
 /** G3: one pet delete's outcome; `stop` = no scope or customer gone. */
@@ -379,6 +382,37 @@ export class CustomerPetsService {
     return this.knownEntries(senderId, this.profiles.cached(senderId)?.pet).map(
       knownPet,
     );
+  }
+
+  /**
+   * T4c-2a (S12): the same pets as `knownPets`, newest first (backend and
+   * local `createdAt`); the legacy pet, which has no date, goes last.
+   */
+  knownPetsByRecency(senderId: string): KnownPet[] {
+    if (this.profiles.isForgotten(senderId)) return [];
+    const time = (entry: KnownEntry) => {
+      const at =
+        entry.createdAt === undefined ? NaN : Date.parse(entry.createdAt);
+      return Number.isNaN(at) ? -Infinity : at;
+    };
+    return this.knownEntries(senderId, this.profiles.cached(senderId)?.pet)
+      .map((entry, index) => ({ entry, index }))
+      .sort((a, b) => time(b.entry) - time(a.entry) || a.index - b.index)
+      .map(({ entry }) => knownPet(entry));
+  }
+
+  /**
+   * T4c-2a (P4): the «Mascota de este pedido» system line for the known pet
+   * `ref` (its prompt facts and search), or `null` when it is not a current
+   * known pet (or the profile is forgotten).
+   */
+  chosenPetPromptLine(senderId: string, ref: string): string | null {
+    if (this.profiles.isForgotten(senderId)) return null;
+    const entry = this.knownEntries(
+      senderId,
+      this.profiles.cached(senderId)?.pet,
+    ).find((candidate) => candidate.ref === ref);
+    return entry === undefined ? null : chosenPetPromptLine(entry.view);
   }
 
   /** G4 (T4c-1): local entries blocked as ambiguous (C2) with the backend
@@ -636,6 +670,7 @@ export class CustomerPetsService {
           ref: `backend:${pet.id}`,
           source: 'backend',
           view: backendPetView(pet),
+          createdAt: pet.createdAt,
         });
     const now = this.now();
     for (const pet of state === undefined ? [] : this.visibleLocal(state))
@@ -643,6 +678,7 @@ export class CustomerPetsService {
         ref: `local:${pet.id}`,
         source: 'local',
         view: localPetView(pet, now),
+        createdAt: pet.createdAt,
       });
     if (legacy !== undefined && Object.keys(legacy).length > 0) {
       const name = legacy.name;

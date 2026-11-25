@@ -88,6 +88,10 @@ const BACKORDER_RESCHEDULE = 'backorder_reschedule';
 const BACKORDER_RESCHEDULE_DECLINE = 'backorder_reschedule_decline';
 // Restock backorder S7: «Seguir esperando» under the ETA notices.
 const BACKORDER_WAIT = 'backorder_wait';
+// T4c-2a: the which-pet question; the tail is the pet ref.
+const PET_PICK = 'pet_pick';
+/** `backend:<id>`, `local:<id>`, `legacy` or `other` («Otra mascota»). */
+const PET_PICK_REF = /^(?:legacy|other|(?:backend|local):[A-Za-z0-9-]{1,64})$/;
 const BACKORDER_REFERENCE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -166,7 +170,13 @@ export type InteractiveReplyIntent =
    * (eta_updated / eta_unavailable); the reference is the BACKORDER id,
    * re-verified against the customer's own active backorders.
    */
-  | { kind: 'backorder_wait'; reference: string };
+  | { kind: 'backorder_wait'; reference: string }
+  /**
+   * T4c-2a: a pet of the which-pet question (`backend:<id>`, `local:<id>`,
+   * `legacy`) or `other` («Otra mascota»); re-checked against the live
+   * question and the customer's current pets.
+   */
+  | { kind: 'pet_pick'; ref: string };
 
 /** Parse a reply id the bot issued; anything else (unknown, forged) is `null`. */
 export function parseInteractiveReplyId(
@@ -250,6 +260,10 @@ export function parseInteractiveReplyId(
         ? null
         : { kind: 'payment_method', method, reference: tail.slice(split + 1) };
     }
+    case PET_PICK:
+      return tail !== null && PET_PICK_REF.test(tail)
+        ? { kind: 'pet_pick', ref: tail }
+        : null;
     case PICK_VARIANT:
     case PICK_PRODUCT:
       return tail === null
@@ -445,6 +459,112 @@ export function backorderCancelPick(
       ),
     })),
     prompt,
+  };
+}
+
+/** T4c-2a: the pet ref of the «Otra mascota» row (S12). */
+export const PET_CHOICE_OTHER_REF = 'other';
+export const PET_CHOICE_OTHER_TEXT = 'Otra mascota';
+const PET_CHOICE_OTHER_DESCRIPTION = 'Escríbame su nombre';
+
+/** One known pet as the which-pet question shows it. */
+export type PetChoicePet = {
+  ref: string;
+  name?: string;
+  species?: string;
+  breed?: string;
+  ageLabel?: string;
+  stage?: string;
+};
+
+/** «labrador, adulto»: the breed (else the species) and the life stage
+ *  (else the age label). */
+function petChoiceDetail(pet: PetChoicePet): string {
+  return [pet.breed ?? pet.species, pet.stage ?? pet.ageLabel]
+    .filter((part): part is string => part !== undefined && part.trim() !== '')
+    .join(', ');
+}
+
+/** The pet's name, or its kind when it has none. */
+function petChoiceName(pet: PetChoicePet): string {
+  const name = pet.name?.trim() ?? '';
+  if (name !== '') return name;
+  const kind = (pet.breed ?? pet.species ?? '').trim();
+  return kind === '' ? 'Mascota' : kind[0].toUpperCase() + kind.slice(1);
+}
+
+/**
+ * T4c-2a (S3, S12): «¿Para quién es?» with one answer per pet. Two or three
+ * pets are reply buttons «Max (labrador, adulto)» (cut to Meta's 20 chars);
+ * four to ten are a list (name as title, breed and age as description); more
+ * than ten show the first nine given (the caller orders them by recency) and
+ * the row «Otra mascota», which asks to write the name. `options` is what the
+ * gate stores (ref + name). `null` below two pets.
+ */
+export function petChoicePick(
+  pets: readonly PetChoicePet[],
+  prompt: string,
+): {
+  interactive: CustomerReplyInteractive;
+  options: Array<{ ref: string; text: string }>;
+} | null {
+  const usable = pets.filter(
+    (pet) =>
+      PET_PICK_REF.test(pet.ref) &&
+      pet.ref !== PET_CHOICE_OTHER_REF &&
+      `${PET_PICK}:${pet.ref}`.length <= INTERACTIVE_LIMITS.id,
+  );
+  if (usable.length < 2) return null;
+  const more = usable.length > INTERACTIVE_LIMITS.rows;
+  const shown = more ? usable.slice(0, INTERACTIVE_LIMITS.rows - 1) : usable;
+  const options = shown.map((pet) => ({
+    ref: pet.ref,
+    text: petChoiceName(pet),
+  }));
+  if (shown.length <= INTERACTIVE_LIMITS.buttons)
+    return {
+      interactive: {
+        type: 'buttons',
+        buttons: shown.map((pet) => {
+          const detail = petChoiceDetail(pet);
+          const name = petChoiceName(pet);
+          return {
+            id: `${PET_PICK}:${pet.ref}`,
+            title: fitInteractiveText(
+              detail === '' ? name : `${name} (${detail})`,
+              INTERACTIVE_LIMITS.buttonTitle,
+            ),
+          };
+        }),
+        prompt,
+      },
+      options,
+    };
+  const rows: CustomerReplyListRow[] = shown.map((pet) => {
+    const detail = fitInteractiveText(
+      petChoiceDetail(pet),
+      INTERACTIVE_LIMITS.rowDescription,
+    );
+    return {
+      id: `${PET_PICK}:${pet.ref}`,
+      title: fitInteractiveText(
+        petChoiceName(pet),
+        INTERACTIVE_LIMITS.rowTitle,
+      ),
+      ...(detail === '' ? {} : { description: detail }),
+    };
+  });
+  if (more) {
+    rows.push({
+      id: `${PET_PICK}:${PET_CHOICE_OTHER_REF}`,
+      title: PET_CHOICE_OTHER_TEXT,
+      description: PET_CHOICE_OTHER_DESCRIPTION,
+    });
+    options.push({ ref: PET_CHOICE_OTHER_REF, text: PET_CHOICE_OTHER_TEXT });
+  }
+  return {
+    interactive: { type: 'list', buttonText: 'Ver mascotas', rows, prompt },
+    options,
   };
 }
 

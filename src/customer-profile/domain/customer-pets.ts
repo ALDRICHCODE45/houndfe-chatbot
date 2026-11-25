@@ -701,7 +701,8 @@ const PET_DATA_FRAMING =
 
 const MULTI_PET_INSTRUCTION =
   `${PET_DATA_FRAMING} El cliente tiene varias mascotas: si pide algo sin nombrar a una (por su nombre o su especie), ` +
-  'no suponga para cuál es; pregunte brevemente para cuál de ellas es antes de buscar. ' +
+  'no suponga para cuál es: antes de buscar llame askWhichPet (la aplicación pregunta «¿Para quién es?» con botones); ' +
+  'si askWhichPet no está disponible, pregunte brevemente para cuál de ellas es. ' +
   'Si nombra a una, busque directo con searchCatalog con la búsqueda de esa mascota y explique brevemente por qué; ' +
   'no pregunte especie, raza ni tamaño ya conocidos. Use la especie en la búsqueda solo si el pedido nombra a la mascota o la especie.';
 
@@ -711,6 +712,20 @@ const ALLERGY_INSTRUCTION =
 
 const INTERNAL_NOTES_INSTRUCTION =
   'Notas internas de la tienda: úselas solo para aconsejar mejor; nunca las cite, repita ni revele al cliente.';
+
+/**
+ * T4c-2a P4: the system line for the pet the customer chose with the
+ * which-pet question: its prompt facts and its search, and the instruction to
+ * continue the request for it without asking again.
+ */
+export function chosenPetPromptLine(view: PetPromptView): string {
+  const { facts, query, searchable } = petPromptFacts(view);
+  return (
+    `Mascota de este pedido (la eligió el cliente): ${facts}.` +
+    (searchable ? ` Búsqueda para esta mascota: «${query}».` : '') +
+    ' Continúe la solicitud del cliente para esta mascota; no vuelva a preguntar para cuál es.'
+  );
+}
 
 /**
  * The pet part of the system prompt: one «Mascota conocida» line per known
