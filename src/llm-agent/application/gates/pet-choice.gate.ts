@@ -12,10 +12,18 @@ export const PET_CHOICE_REQUEST_MAX_CHARS = 8000;
 
 /**
  * Why the bot asked which pet. T4c-2a: `request` (a product request that
- * named no pet). T4c-2b adds its purposes here (forget, ambiguous,
- * diminutive).
+ * named no pet). T4c-2b: `forget` (forgetPet named 2+ pets with that name:
+ * the tap archives that pet), `ambiguous` (a local entry blocked as
+ * ambiguous: which backend pet it is, or another pet), `diminutive` (a
+ * captured name like «Brunito» of a known or just-forgotten «Bruno»: the
+ * same pet or another one).
  */
-export const PET_CHOICE_PURPOSES = ['request'] as const;
+export const PET_CHOICE_PURPOSES = [
+  'request',
+  'forget',
+  'ambiguous',
+  'diminutive',
+] as const;
 export type PetChoicePurpose = (typeof PET_CHOICE_PURPOSES)[number];
 
 /** Most options one question keeps (the «Otra mascota» follow-up offers
@@ -23,12 +31,13 @@ export type PetChoicePurpose = (typeof PET_CHOICE_PURPOSES)[number];
 export const PET_CHOICE_OPTIONS_MAX = 50;
 
 /**
- * One offered answer: a pet ref (`backend:<id>`, `local:<id>`, `legacy`) or
- * `other` («Otra mascota»), and its display text: the pet's name, or the
- * kind (breed/species) of a nameless pet. A typed answer is matched against
- * the text unless `matchable` is `false` (a nameless pet: its breed is never
- * an answer). Rows written before the flag carry no `matchable` and keep
- * matching by text.
+ * One offered answer: a pet ref (`backend:<id>`, `local:<id>`, `legacy`),
+ * `other` («Otra mascota» / «Es otra mascota») or `forgotten` (T4c-2b: the
+ * just-forgotten pet a diminutive may name), and its display text: the
+ * pet's name, or the kind (breed/species) of a nameless pet. A typed answer
+ * is matched against the text unless `matchable` is `false` (a nameless
+ * pet: its breed is never an answer). Rows written before the flag carry no
+ * `matchable` and keep matching by text.
  */
 export type PetChoiceOption = {
   readonly ref: string;
@@ -36,27 +45,97 @@ export type PetChoiceOption = {
   readonly matchable?: false;
 };
 
-export type PetChoice = {
-  readonly purpose: PetChoicePurpose;
-  readonly options: readonly PetChoiceOption[];
-  /** The customer's original request, continued once a pet is chosen. */
-  readonly request: string;
+/** T4c-2b Q3: the facts of the statement that named the diminutive. */
+export type PetChoiceFacts = {
+  readonly name?: string;
+  readonly species?: string;
+  readonly breed?: string;
+  readonly size?: string;
+  readonly ageText?: string;
+  readonly allergies?: string;
+  readonly notes?: string;
 };
 
-const payloadSchema = z.strictObject({
-  purpose: z.enum(PET_CHOICE_PURPOSES),
-  options: z
-    .array(
-      z.strictObject({
-        ref: z.string().min(1).max(190),
-        text: z.string().min(1).max(200),
-        matchable: z.literal(false).optional(),
-      }),
-    )
-    .min(1)
-    .max(PET_CHOICE_OPTIONS_MAX),
-  request: z.string().min(1).max(PET_CHOICE_REQUEST_MAX_CHARS),
-});
+export type PetChoice =
+  | {
+      readonly purpose: 'request';
+      readonly options: readonly PetChoiceOption[];
+      /** The customer's original request, continued once a pet is chosen. */
+      readonly request: string;
+    }
+  | {
+      readonly purpose: 'forget';
+      readonly options: readonly PetChoiceOption[];
+      /** The name forgetPet was given. */
+      readonly name: string;
+      /** The customer's reason, sent with the archive. */
+      readonly reason?: string;
+    }
+  | {
+      readonly purpose: 'ambiguous';
+      readonly options: readonly PetChoiceOption[];
+      /** The blocked local entry the question is about. */
+      readonly localId: string;
+      /** The customer's message, continued once answered. */
+      readonly request: string;
+    }
+  | {
+      readonly purpose: 'diminutive';
+      readonly options: readonly PetChoiceOption[];
+      /** The captured name («Brunito»). */
+      readonly name: string;
+      /** What the statement said, written only once answered. */
+      readonly facts: PetChoiceFacts;
+    };
+
+const optionsSchema = z
+  .array(
+    z.strictObject({
+      ref: z.string().min(1).max(190),
+      text: z.string().min(1).max(200),
+      matchable: z.literal(false).optional(),
+    }),
+  )
+  .min(1)
+  .max(PET_CHOICE_OPTIONS_MAX);
+const requestSchema = z.string().min(1).max(PET_CHOICE_REQUEST_MAX_CHARS);
+const fact = z.string().min(1).max(500).optional();
+
+// `request` keeps the exact T4c-2a shape: rows written by 5ab9410/848cdf2
+// load unchanged.
+const payloadSchema = z.discriminatedUnion('purpose', [
+  z.strictObject({
+    purpose: z.literal('request'),
+    options: optionsSchema,
+    request: requestSchema,
+  }),
+  z.strictObject({
+    purpose: z.literal('forget'),
+    options: optionsSchema,
+    name: z.string().min(1).max(60),
+    reason: z.string().min(1).max(500).optional(),
+  }),
+  z.strictObject({
+    purpose: z.literal('ambiguous'),
+    options: optionsSchema,
+    localId: z.string().min(1).max(64),
+    request: requestSchema,
+  }),
+  z.strictObject({
+    purpose: z.literal('diminutive'),
+    options: optionsSchema,
+    name: z.string().min(1).max(60),
+    facts: z.strictObject({
+      name: fact,
+      species: fact,
+      breed: fact,
+      size: fact,
+      ageText: fact,
+      allergies: fact,
+      notes: fact,
+    }),
+  }),
+]);
 
 /**
  * T4c-2a durable `pet_choice` gate: the «¿Para quién es?» question the bot
@@ -129,15 +208,40 @@ export class DurablePetChoice {
 }
 
 function copy(choice: PetChoice): PetChoice {
-  return {
-    purpose: choice.purpose,
-    options: choice.options.map(({ ref, text, matchable }) => ({
-      ref,
-      text,
-      ...(matchable === false ? { matchable } : {}),
-    })),
-    request: choice.request,
-  };
+  const options = choice.options.map(({ ref, text, matchable }) => ({
+    ref,
+    text,
+    ...(matchable === false ? { matchable } : {}),
+  }));
+  switch (choice.purpose) {
+    case 'request':
+      return { purpose: 'request', options, request: choice.request };
+    case 'forget':
+      return {
+        purpose: 'forget',
+        options,
+        name: choice.name,
+        ...(choice.reason === undefined ? {} : { reason: choice.reason }),
+      };
+    case 'ambiguous':
+      return {
+        purpose: 'ambiguous',
+        options,
+        localId: choice.localId,
+        request: choice.request,
+      };
+    case 'diminutive':
+      return {
+        purpose: 'diminutive',
+        options,
+        name: choice.name,
+        facts: Object.fromEntries(
+          Object.entries(choice.facts).filter(
+            ([, value]) => typeof value === 'string',
+          ),
+        ),
+      };
+  }
 }
 
 /** Lowercase, no accents, letters/digits and single spaces only. */

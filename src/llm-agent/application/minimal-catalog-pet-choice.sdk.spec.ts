@@ -121,6 +121,8 @@ type PetsStub = Pick<
   | 'knownPets'
   | 'knownPetsByRecency'
   | 'chosenPetPromptLine'
+  // T4c-2b Q2: read before the model on every free-text turn.
+  | 'ambiguousEntries'
 >;
 
 /** One process: shared durable stores survive `boot()` (a restart). */
@@ -492,6 +494,7 @@ describe('T4c-2a which-pet question (S3, S12, S13)', () => {
       knownPets: () => known,
       knownPetsByRecency: () => known,
       chosenPetPromptLine: () => null,
+      ambiguousEntries: () => [],
     };
     const w = world({ current: customer([]) });
     const h = w.boot(stub);
@@ -610,6 +613,7 @@ describe('T4c-2a-fix which-pet hardening (J1, J4)', () => {
     knownPets,
     knownPetsByRecency: knownPets,
     chosenPetPromptLine: () => null,
+    ambiguousEntries: () => [],
   });
   const two: KnownPet[] = [
     { ref: `backend:${BRUNO_ID}`, name: 'Bruno', source: 'backend' },

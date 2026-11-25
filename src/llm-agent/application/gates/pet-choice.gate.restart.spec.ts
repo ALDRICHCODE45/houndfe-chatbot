@@ -213,3 +213,78 @@ describe('pet choice options (T4c-2a-fix J4)', () => {
     }
   });
 });
+
+describe('pet choice purposes (T4c-2b Q1-Q3)', () => {
+  const FORGET: PetChoice = {
+    purpose: 'forget',
+    options: [
+      { ref: BRUNO, text: 'Bruno' },
+      { ref: 'local:b2', text: 'Bruno' },
+    ],
+    name: 'Bruno',
+    reason: 'falleció',
+  };
+  const AMBIGUOUS: PetChoice = {
+    purpose: 'ambiguous',
+    options: [
+      { ref: BRUNO, text: 'Bruno' },
+      { ref: 'backend:b0000000-0000-4000-8000-000000000060', text: 'Bruno' },
+      { ref: 'other', text: 'Es otra mascota' },
+    ],
+    localId: 'b1f0c7a2-0000-4000-8000-000000000001',
+    request: 'croquetas para Bruno',
+  };
+  const DIMINUTIVE: PetChoice = {
+    purpose: 'diminutive',
+    options: [
+      { ref: 'forgotten', text: 'Bruno' },
+      { ref: 'other', text: 'Es otra mascota' },
+    ],
+    name: 'Brunito',
+    facts: { name: 'Brunito', species: 'perro', ageText: '3 años' },
+  };
+
+  it.each([
+    ['forget', FORGET],
+    ['ambiguous', AMBIGUOUS],
+    ['diminutive', DIMINUTIVE],
+    ['forget without a reason', { ...FORGET, reason: undefined }],
+  ])(
+    'a %s question survives a restart with its own data',
+    async (_label, choice) => {
+      const w = world();
+      const first = w.boot();
+      const clean = JSON.parse(JSON.stringify(choice)) as PetChoice;
+      first.choices.ask(SENDER, clean);
+      first.gates.touch(SENDER);
+      await first.gates.settle(SENDER);
+      await expect(w.store.get(SENDER, 'pet_choice')).resolves.toMatchObject({
+        payload: clean,
+      });
+      const restarted = w.boot();
+      await restarted.gates.begin(SENDER);
+      expect(restarted.choices.read(SENDER)).toEqual(clean);
+    },
+  );
+
+  it.each([
+    { ...FORGET, name: '' },
+    { ...FORGET, request: 'x' },
+    { ...AMBIGUOUS, localId: '' },
+    { ...AMBIGUOUS, request: undefined },
+    { ...DIMINUTIVE, facts: { name: 'Brunito', extra: 'x' } },
+    { ...DIMINUTIVE, facts: undefined },
+    { ...DIMINUTIVE, request: 'x' },
+  ])('treats the malformed purpose payload %j as absent', async (p) => {
+    const w = world();
+    await w.store.put({
+      senderId: SENDER,
+      kind: 'pet_choice',
+      payload: JSON.parse(JSON.stringify(p)) as Record<string, unknown>,
+      expiresAt: new Date(T0 + 60_000),
+    });
+    const restarted = w.boot();
+    await restarted.gates.begin(SENDER);
+    expect(restarted.choices.read(SENDER)).toBeNull();
+  });
+});

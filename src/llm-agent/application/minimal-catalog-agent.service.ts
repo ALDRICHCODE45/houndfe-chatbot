@@ -56,10 +56,13 @@ import { CustomerProfileService } from '../../customer-profile/application/custo
 import {
   CustomerPetsService,
   type ForgetPetOutcome,
+  type KnownPet,
 } from '../../customer-profile/application/customer-pets.service';
 import {
   chosenPetOptionPromptLine,
   foldPetName,
+  hasDiminutiveEnding,
+  petNameDiminutiveOf,
   type PetFacts,
 } from '../../customer-profile/domain/customer-pets';
 import {
@@ -91,9 +94,12 @@ import {
   ORDER_BUTTONS_PROMPT,
   INTERACTIVE_LIMITS,
   parseInteractiveReplyId,
+  PET_CHOICE_FORGOTTEN_REF,
   PET_CHOICE_OTHER_REF,
+  PET_CHOICE_SEPARATE_TEXT,
   petChoiceOptions,
   petChoicePick,
+  type PetChoicePet,
   productImageCaption,
   reorderConfirmationButtons,
   cartNextStepButtons,
@@ -182,6 +188,7 @@ import {
   PET_CHOICE_OPTIONS_MAX,
   PET_CHOICE_REQUEST_MAX_CHARS,
   type PetChoice,
+  type PetChoiceFacts,
   type PetChoiceOption,
 } from './gates/pet-choice.gate';
 import { statedPurchaseCount } from './backorder-quantity';
@@ -369,6 +376,37 @@ export const PET_CHOICE_QUESTION = '¿Para quién es?';
 export const PET_CHOICE_NAME_REPLY =
   '¿Cómo se llama? Escríbame el nombre de su mascota.';
 
+// T4c-2b Q1 (S7, S11): forgetPet named 2+ pets with that name: the
+// application asks which one; the tap archives it (the tap is the
+// confirmation) and answers with tact, without the model.
+export const petForgetQuestion = (name: string) => `¿De cuál ${name} se trata?`;
+export const PET_FORGET_DONE_REPLY =
+  'Lo siento mucho. Ya no la tendré presente en sus pedidos; aquí estoy para lo que necesite.';
+/** The archive is still running (over the pet budget): never confirmed. */
+export const PET_FORGET_PENDING_REPLY =
+  'Lo siento mucho. Aquí estoy para lo que necesite.';
+/** A pet answer whose write cannot be done safely now (pets not loaded):
+ *  nothing is written, nothing is kept. */
+export const PET_CHOICE_UNAVAILABLE_REPLY =
+  'Disculpe, en este momento no pude actualizar los datos de sus mascotas. ¿Me lo puede pedir de nuevo en un momento?';
+// T4c-2b Q2 (S3): which backend pet a local entry blocked as ambiguous is.
+export const petAmbiguousQuestion = (name: string) =>
+  `¿${name} es alguno de estos?`;
+/** Q2: asked at most once per entry in this window (a day: the entry is
+ *  harmless while blocked; asking on every mention would nag). */
+export const PET_AMBIGUOUS_ASK_INTERVAL_MS = 24 * 60 * 60_000;
+// T4c-2b Q3 (S10, I4): a captured diminutive of a known or just-forgotten
+// pet's name is confirmed before any write.
+export const petDiminutiveQuestion = (name: string, base: string) =>
+  `¿${name} es ${base} o es otra mascota?`;
+export const PET_DIMINUTIVE_SAME_REPLY = 'Gracias, ya lo anoté.';
+export const PET_DIMINUTIVE_FORGOTTEN_REPLY = 'Entiendo, gracias por contarme.';
+export const PET_DIMINUTIVE_NEW_REPLY =
+  'Gracias, ya la anoté como otra mascota.';
+/** Q2/Q3 text fallback: «¿Brunito es Bruno o es otra mascota?». */
+const petSameOrOtherFallback = (name: string, labels: readonly string[]) =>
+  `¿${name} es ${labels.join(', ')} o es otra mascota?`;
+
 const ASK_WHICH_PET_DESCRIPTION =
   'Pregunta al cliente para cuál de sus mascotas es lo que pide, cuando tiene varias y su mensaje no nombra a ninguna (ni por nombre ni por especie). ' +
   'La aplicación envía «¿Para quién es?» con un botón por mascota y, cuando el cliente elige, continúa su solicitud para esa mascota. ' +
@@ -428,6 +466,58 @@ const forgetPetResult = (outcome: ForgetPetOutcome) =>
       : outcome === 'ambiguous'
         ? toolError('several_pets_with_that_name')
         : toolError('pet_memory_unavailable');
+
+/**
+ * T4c-1 G1 / T4c-2b: one statement's pet facts (deterministic) with its
+ * «<Nombre> es alérgico a X» joined when it names the same pet.
+ */
+function statementPetFacts(text: string): {
+  facts: PetFacts;
+  allergy: ReturnType<typeof extractPetAllergy>;
+  joined: boolean;
+} {
+  const facts: PetFacts = extractPetFacts(text);
+  const allergy = extractPetAllergy(text);
+  const joined =
+    allergy !== null &&
+    facts.name !== undefined &&
+    foldPetName(facts.name) === foldPetName(allergy.name);
+  if (joined) facts.allergies = allergy.allergies;
+  return { facts, allergy, joined };
+}
+
+/** T4c-2b Q3: the facts the diminutive question keeps (non-empty strings,
+ *  ≤ 500 characters each, as the gate payload allows). */
+function choiceFacts(facts: PetFacts): PetChoiceFacts {
+  const keys = [
+    'name',
+    'species',
+    'breed',
+    'size',
+    'ageText',
+    'allergies',
+    'notes',
+  ] as const;
+  const out: Record<string, string> = {};
+  for (const key of keys) {
+    const value = facts[key]?.trim();
+    if (value !== undefined && value !== '') out[key] = value.slice(0, 500);
+  }
+  return out;
+}
+
+/** T4c-2b Q2: the message names the pet (whole words, accent/case-blind). */
+function mentionsPetName(text: string, name: string): boolean {
+  const fold = (value: string) =>
+    value
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .trim();
+  const wanted = fold(name);
+  return wanted !== '' && ` ${fold(text)} `.includes(` ${wanted} `);
+}
 
 // The read-only prompt denies a registration tool; when `prepareRestock` or
 // `prepareExpiration` is present these clauses are reworded and the matching
@@ -611,9 +701,12 @@ type RestockRun = {
 type ExpirationReply = { attempted: boolean; value: string | null };
 type PaymentRun = { attempted: boolean; value: MinimalPaymentReply | null };
 // T4c-2a P2: one which-pet question per run; the application presents it.
+// T4c-2b: also the forget and diminutive questions (`reply` is the
+// unstyled question text).
 type PetChoiceRun = {
   attempted: boolean;
   value: {
+    reply: string;
     interactive: CustomerReplyInteractive;
     choice: PetChoice;
   } | null;
@@ -1083,10 +1176,14 @@ export class MinimalCatalogAgentService {
   // their PET_FORGOTTEN_WINDOW_MS ends.
   // I3: one mark per forgetPet call (its own expiry); a failed call drops
   // only its own mark, so a parallel call that archived keeps the window.
+  // T4c-2b Q3: each mark keeps the name as given (the diminutive question
+  // names it).
   private readonly forgottenPets = new Map<
     string,
-    Map<string, Array<{ until: number; failed: boolean }>>
+    Map<string, Array<{ until: number; failed: boolean; name: string }>>
   >();
+  // T4c-2b Q2: per sender, when each ambiguous local entry was last asked.
+  private readonly petAmbiguousAsked = new Map<string, Map<string, number>>();
   // T4c-1-fix N1: senders whose current turn called forgetPet; that turn's
   // deterministic pet capture is skipped (the message describes the pet
   // being forgotten, never the one that remains).
@@ -1470,6 +1567,12 @@ export class MinimalCatalogAgentService {
       ) {
         const answered = await this.answerBackorderConfirm(input);
         if (answered !== null) return answered;
+      }
+      // T4c-2b Q2: a message naming a local pet blocked as ambiguous asks
+      // which backend pet it is first (see askAmbiguousPet).
+      if (pick === undefined && input.interactiveReplyId === undefined) {
+        const asked = await this.askAmbiguousPet(input);
+        if (asked !== null) return asked;
       }
       return this.decision(await this.runTurn(input, pick));
     }
@@ -2862,6 +2965,7 @@ export class MinimalCatalogAgentService {
       inboundEvent?: unknown;
       inboundAt?: string;
       llmAdmitted?: true;
+      interactiveReplyId?: string;
     },
     pick?: InteractivePick,
     /** T4c-2a P4: «Mascota de este pedido» line of the chosen pet. */
@@ -3009,6 +3113,9 @@ export class MinimalCatalogAgentService {
       chosenPet === undefined && this.petChoiceAvailable(input.senderId)
         ? { attempted: false, value: null }
         : null;
+    // T4c-2b Q1/Q3: the forget / diminutive question of this run (at most
+    // one pet question per turn, shared with askWhichPet).
+    const memoryRun: PetChoiceRun = { attempted: false, value: null };
     const checkoutRun: CheckoutRun | null =
       this.cart && this.checkoutAvailable()
         ? { attempted: false, value: null }
@@ -3159,8 +3266,8 @@ export class MinimalCatalogAgentService {
           reorderRun,
           catalogRun,
         ),
-        ...this.memoryTools(input.senderId),
-        ...this.petChoiceTools(input, petChoiceRun, styled, traceId),
+        ...this.memoryTools(input.senderId, memoryRun, petChoiceRun, styled),
+        ...this.petChoiceTools(input, petChoiceRun, memoryRun, styled, traceId),
         ...this.askTeamTools(input, askTeamRun, traceId),
         ...this.paymentTools(input, paymentRun, traceId),
       },
@@ -3272,12 +3379,33 @@ export class MinimalCatalogAgentService {
       );
       return { reply };
     }
-    const petChoice = petChoiceRun?.value ?? null;
+    // T4c-2b Q3: a statement naming a diminutive («mi perrito Brunito…»)
+    // of a known or just-forgotten pet asks before any write; never on a
+    // turn that forgot a pet (N1), a tap, or a continued request.
+    if (
+      petChoiceRun?.value == null &&
+      memoryRun.value === null &&
+      chosenPet === undefined &&
+      pick === undefined &&
+      input.interactiveReplyId === undefined &&
+      !this.petForgetTurns.has(input.senderId)
+    ) {
+      const { facts } = statementPetFacts(input.text);
+      if (facts.name !== undefined)
+        memoryRun.value = this.diminutiveQuestion(
+          input.senderId,
+          facts.name,
+          facts,
+          styled,
+        );
+    }
+    const petChoice = petChoiceRun?.value ?? memoryRun.value ?? null;
     if (petChoice !== null) {
       // T4c-2a P2: the application asks which pet (buttons or list); the
       // model's own text is dropped. The question and the original request
-      // are kept in the durable pet_choice gate.
-      const reply = styled(PET_CHOICE_QUESTION);
+      // are kept in the durable pet_choice gate (T4c-2b: or the forget /
+      // diminutive question and its data).
+      const reply = styled(petChoice.reply);
       this.recordTurn(
         input.senderId,
         [
@@ -3968,6 +4096,7 @@ export class MinimalCatalogAgentService {
   private petChoiceTools(
     input: { senderId: string; text: string },
     run: PetChoiceRun | null,
+    memoryRun: PetChoiceRun,
     styled: (text: string) => string,
     traceId: string,
   ): ToolSet {
@@ -3981,7 +4110,7 @@ export class MinimalCatalogAgentService {
           | { ok: false; error: string }
           | { ok: true; presentedByApplication: true }
         > => {
-          if (run.attempted)
+          if (run.attempted || memoryRun.value !== null)
             return Promise.resolve(toolError('pet_choice_settled'));
           run.attempted = true;
           const known = pets.knownPets(input.senderId);
@@ -4000,6 +4129,7 @@ export class MinimalCatalogAgentService {
           if (pick === null)
             return Promise.resolve(toolError('no_valid_options'));
           run.value = {
+            reply: PET_CHOICE_QUESTION,
             interactive: pick.interactive,
             choice: { purpose: 'request', options: pick.options, request },
           };
@@ -4050,7 +4180,8 @@ export class MinimalCatalogAgentService {
    * the question is live and offered that ref; a loaded pet list without
    * that pet makes it stale (J1: with the list unknown it is answered from
    * the offered option). «Otra mascota» asks the name; a pet continues the
-   * original request with it as the turn's pet context.
+   * original request with it as the turn's pet context. T4c-2b: the forget,
+   * ambiguous and diminutive questions have their own answers.
    */
   private async answerPetChoiceTap(
     input: {
@@ -4062,26 +4193,13 @@ export class MinimalCatalogAgentService {
     ref: string,
   ): Promise<MinimalCatalogAgentDecision> {
     const { senderId } = input;
-    const style = this.customerStyle(senderId, input.text);
-    const reply = (text: string, petChoice?: PetChoice) => {
-      const styledText = applyCustomerStyle(text, style);
-      this.recordTurn(
-        senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: styledText },
-        ],
-        [],
-        undefined,
-        undefined,
-        petChoice === undefined ? {} : { petChoice },
-      );
-      return this.decision({ reply: styledText });
-    };
+    const reply = this.petChoiceReply(input);
     const live = this.petChoices?.read(senderId) ?? null;
     const option = live?.options.find((candidate) => candidate.ref === ref);
     if (live === null || option === undefined)
       return reply(STALE_BUTTON_FALLBACK);
+    if (live.purpose !== 'request')
+      return this.answerPetPurpose(input, live, option);
     if (ref === PET_CHOICE_OTHER_REF) {
       // S12: the name is typed next; every known pet's name answers it (J4:
       // same option builder; J1: with the list unknown, the pets the
@@ -4106,6 +4224,28 @@ export class MinimalCatalogAgentService {
     return this.continuePetChoice(input, live.request, line);
   }
 
+  /** The recorded reply of a pet answer turn (no model): the text styled,
+   *  and the gate replaced by `petChoice` or cleared. */
+  private petChoiceReply(input: { senderId: string; text: string }) {
+    const { senderId } = input;
+    const style = this.customerStyle(senderId, input.text);
+    return (text: string, petChoice?: PetChoice) => {
+      const styledText = applyCustomerStyle(text, style);
+      this.recordTurn(
+        senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: styledText },
+        ],
+        [],
+        undefined,
+        undefined,
+        petChoice === undefined ? {} : { petChoice },
+      );
+      return this.decision({ reply: styledText });
+    };
+  }
+
   /** T4c-2a P3: the typed name of one offered pet, else `null`. */
   private async answerPetChoiceText(input: {
     senderId: string;
@@ -4122,15 +4262,199 @@ export class MinimalCatalogAgentService {
       PET_CHOICE_OTHER_REF,
     );
     if (option === null) return null;
+    if (live.purpose !== 'request')
+      return this.answerPetPurpose(input, live, option);
     const line = this.chosenPetLine(input.senderId, option);
     if (line === null) return null;
     return this.continuePetChoice(input, live.request, line);
   }
 
+  /** T4c-2b: the answer to a forget, ambiguous or diminutive question. */
+  private answerPetPurpose(
+    input: {
+      senderId: string;
+      text: string;
+      inboundEvent?: unknown;
+      inboundAt?: string;
+      llmAdmitted?: true;
+    },
+    live: Exclude<PetChoice, { purpose: 'request' }>,
+    option: PetChoiceOption,
+  ): Promise<MinimalCatalogAgentDecision> {
+    switch (live.purpose) {
+      case 'forget':
+        return this.answerForgetChoice(input, live, option);
+      case 'ambiguous':
+        return this.answerAmbiguousChoice(input, live, option);
+      case 'diminutive':
+        return this.answerDiminutiveChoice(input, live, option);
+    }
+  }
+
+  /**
+   * T4c-2b Q1 (S7, S11): the tapped pet of the forget question is archived
+   * (or removed / cleared) by ref: the tap is the confirmation. Pets not
+   * loaded: nothing is archived (never a guess on that write); a pet no
+   * longer in the loaded list is stale. Same budget and pending handling as
+   * the forgetPet tool; the H1 window opens for the name (kept only when
+   * forgotten or pending).
+   */
+  private async answerForgetChoice(
+    input: { senderId: string; text: string },
+    live: Extract<PetChoice, { purpose: 'forget' }>,
+    option: PetChoiceOption,
+  ): Promise<MinimalCatalogAgentDecision> {
+    const { senderId } = input;
+    const reply = this.petChoiceReply(input);
+    const pets = this.pets;
+    if (pets === undefined || !this.petListLoaded(senderId))
+      return reply(PET_CHOICE_UNAVAILABLE_REPLY);
+    if (!pets.knownPets(senderId).some((pet) => pet.ref === option.ref))
+      return reply(STALE_BUTTON_FALLBACK);
+    const undo = this.markPetForgotten(senderId, live.name);
+    let keep = false;
+    try {
+      const forget = (async () =>
+        pets.forgetPetByRef(senderId, option.ref, live.reason))();
+      const outcome = await this.withinPetBudget(forget);
+      if (outcome === 'over_budget') {
+        this.logger.warn(
+          `customer pets forget pet over budget (${PET_PREPARE_BUDGET_MS} ms): continuing in the background`,
+        );
+        void this.petsInBackground('forget pet', () => forget);
+        keep = true;
+        return reply(PET_FORGET_PENDING_REPLY);
+      }
+      if (
+        outcome === 'archived' ||
+        outcome === 'removed' ||
+        outcome === 'cleared'
+      ) {
+        keep = true;
+        return reply(PET_FORGET_DONE_REPLY);
+      }
+      return reply(
+        outcome === 'none'
+          ? STALE_BUTTON_FALLBACK
+          : PET_CHOICE_UNAVAILABLE_REPLY,
+      );
+    } finally {
+      if (!keep) undo();
+    }
+  }
+
+  /**
+   * T4c-2b Q2 (S3): a candidate resolves the blocked entry into that
+   * backend pet (its facts PATCH it, the entry goes) and the customer's
+   * message continues with that pet; «Es otra mascota» uploads the entry as
+   * a new pet and the message continues. With the pets not loaded nothing
+   * is written (the entry stays blocked) and the message still continues.
+   */
+  private async answerAmbiguousChoice(
+    input: {
+      senderId: string;
+      text: string;
+      inboundEvent?: unknown;
+      inboundAt?: string;
+      llmAdmitted?: true;
+    },
+    live: Extract<PetChoice, { purpose: 'ambiguous' }>,
+    option: PetChoiceOption,
+  ): Promise<MinimalCatalogAgentDecision> {
+    const { senderId } = input;
+    const pets = this.pets;
+    const loaded = pets !== undefined && this.petListLoaded(senderId);
+    if (option.ref === PET_CHOICE_OTHER_REF) {
+      if (loaded)
+        await this.petWriteWithinBudget('separate ambiguous', () =>
+          pets.separateAmbiguous(senderId, live.localId),
+        );
+      return this.continuePetChoice(input, live.request);
+    }
+    if (!loaded)
+      return this.continuePetChoice(
+        input,
+        live.request,
+        chosenPetOptionPromptLine(option.text),
+      );
+    const id = option.ref.startsWith('backend:')
+      ? option.ref.slice('backend:'.length)
+      : null;
+    const outcome =
+      id === null
+        ? 'not_found'
+        : await this.petWriteWithinBudget('resolve ambiguous', () =>
+            pets.resolveAmbiguous(senderId, live.localId, id),
+          );
+    const line =
+      outcome === 'not_found' ? null : this.chosenPetLine(senderId, option);
+    if (line === null) return this.petChoiceReply(input)(STALE_BUTTON_FALLBACK);
+    return this.continuePetChoice(input, live.request, line);
+  }
+
+  /**
+   * T4c-2b Q3 (S10): «es Bruno» sends the statement's facts to that known
+   * pet (never renaming it); the just-forgotten Bruno writes nothing (the
+   * forget stands); «Es otra mascota» writes the facts as a new pet. No
+   * write on a turn whose pets are not loaded.
+   */
+  private async answerDiminutiveChoice(
+    input: { senderId: string; text: string },
+    live: Extract<PetChoice, { purpose: 'diminutive' }>,
+    option: PetChoiceOption,
+  ): Promise<MinimalCatalogAgentDecision> {
+    const { senderId } = input;
+    const reply = this.petChoiceReply(input);
+    if (option.ref === PET_CHOICE_FORGOTTEN_REF)
+      return reply(PET_DIMINUTIVE_FORGOTTEN_REPLY);
+    const pets = this.pets;
+    if (pets === undefined || !this.petListLoaded(senderId))
+      return reply(PET_CHOICE_UNAVAILABLE_REPLY);
+    const facts: PetFacts = { ...live.facts };
+    const legacy = this.profiles?.cached(senderId)?.pet;
+    if (option.ref === PET_CHOICE_OTHER_REF) {
+      await this.petWriteWithinBudget('capture', () =>
+        pets.capture(senderId, facts, legacy),
+      );
+      return reply(PET_DIMINUTIVE_NEW_REPLY);
+    }
+    // The pet keeps its own name (never renamed to the diminutive).
+    const rest: PetFacts = { ...facts };
+    delete rest.name;
+    const outcome = await this.petWriteWithinBudget('capture', () =>
+      pets.captureForRef(senderId, option.ref, rest, legacy),
+    );
+    return reply(
+      outcome === 'none'
+        ? STALE_BUTTON_FALLBACK
+        : outcome === 'unavailable'
+          ? PET_CHOICE_UNAVAILABLE_REPLY
+          : PET_DIMINUTIVE_SAME_REPLY,
+    );
+  }
+
+  /** T4c-2b: a pet store write waited at most PET_PREPARE_BUDGET_MS; past
+   *  it the write goes on in the background (`over_budget`). */
+  private async petWriteWithinBudget<T>(
+    operation: string,
+    start: () => Promise<T>,
+  ): Promise<T | 'over_budget'> {
+    const work = (async () => start())();
+    const outcome = await this.withinPetBudget(work);
+    if (outcome === 'over_budget') {
+      this.logger.warn(
+        `customer pets ${operation} over budget (${PET_PREPARE_BUDGET_MS} ms): continuing in the background`,
+      );
+      void this.petsInBackground(operation, () => work);
+    }
+    return outcome;
+  }
+
   /**
    * T4c-2a P4: the original request continues with the chosen pet as the
    * turn's pet context. Like any other turn it spends a pending order
-   * summary; its recorded turn clears the question.
+   * summary; its recorded turn clears the question. T4c-2b: without
+   * `line` it continues with no chosen pet.
    */
   private async continuePetChoice(
     input: {
@@ -4140,7 +4464,7 @@ export class MinimalCatalogAgentService {
       llmAdmitted?: true;
     },
     request: string,
-    line: string,
+    line?: string,
   ): Promise<MinimalCatalogAgentDecision> {
     this.order?.dismiss(input.senderId);
     return this.decision(
@@ -4164,9 +4488,229 @@ export class MinimalCatalogAgentService {
     );
   }
 
-  private memoryTools(senderId: string): ToolSet {
+  /**
+   * T4c-2b Q2 (S3): a free-text message that names a local entry blocked as
+   * ambiguous asks «¿Bruno es alguno de estos?» with its candidate backend
+   * pets and «Es otra mascota», and keeps the message to continue it once
+   * answered. Triggered here (right before the model, after every gate
+   * route declined the message) only when: the pets are loaded, no pet
+   * question is live, nothing else is pending (no summary, offer, list,
+   * pending cart request or purchase in progress), the message names the
+   * entry (so the answer matters to this very request and an unrelated
+   * message is never hijacked), and the entry was not asked in the last
+   * PET_AMBIGUOUS_ASK_INTERVAL_MS. One question per turn: the model does
+   * not run. `null` lets the turn go on.
+   */
+  private async askAmbiguousPet(input: {
+    senderId: string;
+    text: string;
+  }): Promise<MinimalCatalogAgentDecision | null> {
+    const { senderId } = input;
+    const pets = this.pets;
+    const choices = this.petChoices;
+    if (pets === undefined || choices === undefined) return null;
+    const entries = pets.ambiguousEntries(senderId);
+    if (
+      entries.length === 0 ||
+      !this.petListLoaded(senderId) ||
+      choices.read(senderId) !== null
+    )
+      return null;
+    const now = Date.now();
+    const asked = this.petAmbiguousAsked.get(senderId);
+    const entry = entries.find(
+      (candidate) =>
+        now - (asked?.get(candidate.localId) ?? -Infinity) >=
+          PET_AMBIGUOUS_ASK_INTERVAL_MS &&
+        mentionsPetName(input.text, candidate.name),
+    );
+    if (entry === undefined) return null;
+    if (
+      this.answerPending(senderId) ||
+      (await this.purchaseInProgress(senderId))
+    )
+      return null;
+    const style = this.customerStyle(senderId, input.text);
+    const prompt = applyCustomerStyle(petAmbiguousQuestion(entry.name), style);
+    const pick = petChoicePick(entry.candidates, prompt, {
+      extra: { ref: PET_CHOICE_OTHER_REF, text: PET_CHOICE_SEPARATE_TEXT },
+      textFallback: (labels) => petSameOrOtherFallback(entry.name, labels),
+    });
+    if (pick === null) return null;
+    for (const [sender, entries] of this.petAmbiguousAsked) {
+      for (const [localId, at] of entries)
+        if (now - at >= PET_AMBIGUOUS_ASK_INTERVAL_MS) entries.delete(localId);
+      if (entries.size === 0) this.petAmbiguousAsked.delete(sender);
+    }
+    const marks =
+      this.petAmbiguousAsked.get(senderId) ?? new Map<string, number>();
+    marks.set(entry.localId, now);
+    this.petAmbiguousAsked.set(senderId, marks);
+    this.recordTurn(
+      senderId,
+      [
+        { role: 'user', content: input.text },
+        { role: 'assistant', content: prompt },
+      ],
+      [],
+      undefined,
+      undefined,
+      {
+        petChoice: {
+          purpose: 'ambiguous',
+          options: pick.options,
+          localId: entry.localId,
+          request: input.text.slice(0, PET_CHOICE_REQUEST_MAX_CHARS),
+        },
+      },
+    );
+    return this.decision({ reply: prompt, interactive: pick.interactive });
+  }
+
+  /** T4c-2b Q2: something the bot asked or offered awaits an answer (the
+   *  structured states of S6's closing check). */
+  private answerPending(senderId: string): boolean {
+    const last = this.sessionStore.read(senderId).at(-1);
+    return (
+      last?.reorderOffer !== undefined ||
+      last?.paymentOffer !== undefined ||
+      last?.catalogRestockOffer !== undefined ||
+      last?.interactiveChoice !== undefined ||
+      (last?.cartContext?.pending ?? null) !== null ||
+      (this.order?.offerStatus(senderId) ?? null) !== null ||
+      (this.checkoutAvailable() &&
+        this.checkout!.confirmationStatus(senderId)?.stage === 'pending')
+    );
+  }
+
+  /**
+   * T4c-2b Q3 (S10): «Brunito» is a diminutive of a known pet's name (or,
+   * else, of a name forgotten in the H1 window) and is not itself a known
+   * pet: the pets it may be (`pets` empty for the forgotten name). `null`
+   * otherwise, or without the pet store.
+   */
+  private petDiminutive(
+    senderId: string,
+    name: string | undefined,
+  ): { base: string; pets: KnownPet[] } | null {
+    if (
+      name === undefined ||
+      this.pets === undefined ||
+      !hasDiminutiveEnding(name)
+    )
+      return null;
+    const known = this.pets.knownPets(senderId);
+    const names = known.flatMap((pet) =>
+      pet.name === undefined ? [] : [pet.name],
+    );
+    if (names.some((known) => foldPetName(known) === foldPetName(name)))
+      return null;
+    const base = petNameDiminutiveOf(name, names);
+    if (base !== null)
+      return {
+        base,
+        pets: known.filter(
+          (pet) =>
+            pet.name !== undefined &&
+            foldPetName(pet.name) === foldPetName(base),
+        ),
+      };
+    const forgotten = petNameDiminutiveOf(
+      name,
+      this.recentlyForgottenNames(senderId),
+    );
+    return forgotten === null ? null : { base: forgotten, pets: [] };
+  }
+
+  /**
+   * T4c-2b Q3: «¿Brunito es Bruno o es otra mascota?» with the matched
+   * pet(s) (or the forgotten name) and «Es otra mascota»; the statement's
+   * facts stay in the gate until answered. `null` when the name is not
+   * such a diminutive or the question cannot be asked (no gates, too long).
+   */
+  private diminutiveQuestion(
+    senderId: string,
+    name: string,
+    facts: PetFacts,
+    styled: (text: string) => string,
+  ): PetChoiceRun['value'] {
+    if (this.petChoices === undefined || this.petsOverBudget.has(senderId))
+      return null;
+    const target = this.petDiminutive(senderId, name);
+    if (target === null || name.trim().length > 60) return null;
+    const shown: PetChoicePet[] =
+      target.pets.length > 0
+        ? target.pets
+        : [{ ref: PET_CHOICE_FORGOTTEN_REF, name: target.base }];
+    const question = petDiminutiveQuestion(name.trim(), target.base);
+    const pick = petChoicePick(shown, styled(question), {
+      extra: { ref: PET_CHOICE_OTHER_REF, text: PET_CHOICE_SEPARATE_TEXT },
+      textFallback: (labels) => petSameOrOtherFallback(name.trim(), labels),
+    });
+    if (pick === null) return null;
+    return {
+      reply: question,
+      interactive: pick.interactive,
+      choice: {
+        purpose: 'diminutive',
+        options: pick.options,
+        name: name.trim(),
+        facts: choiceFacts(facts),
+      },
+    };
+  }
+
+  /**
+   * T4c-2b Q1 (S7, S11): forgetPet found 2+ pets with that name: «¿De cuál
+   * Bruno se trata?» with one button / row per pet (their detail tells them
+   * apart); the tap archives that pet. `null` when it cannot be asked (no
+   * gates, another pet question this turn, fewer than two such pets).
+   */
+  private forgetQuestion(
+    senderId: string,
+    name: string,
+    reason: string | undefined,
+    styled: (text: string) => string,
+  ): PetChoiceRun['value'] {
+    if (this.petChoices === undefined || this.pets === undefined) return null;
+    const same = this.pets
+      .knownPets(senderId)
+      .filter(
+        (pet) =>
+          pet.name !== undefined && foldPetName(pet.name) === foldPetName(name),
+      )
+      .slice(0, INTERACTIVE_LIMITS.rows);
+    if (same.length < 2) return null;
+    const question = petForgetQuestion(same[0].name!);
+    const prompt = styled(question);
+    const pick = petChoicePick(same, prompt, {
+      textFallback: (labels) =>
+        `${prompt} ¿${labels.slice(0, -1).join(', ')} o ${labels.at(-1)}?`,
+    });
+    if (pick === null) return null;
+    return {
+      reply: question,
+      interactive: pick.interactive,
+      choice: {
+        purpose: 'forget',
+        options: pick.options,
+        name: name.trim().slice(0, 60),
+        ...(reason === undefined ? {} : { reason }),
+      },
+    };
+  }
+
+  private memoryTools(
+    senderId: string,
+    memoryRun: PetChoiceRun = { attempted: false, value: null },
+    petChoiceRun: PetChoiceRun | null = null,
+    styled: (text: string) => string = (text) => text,
+  ): ToolSet {
     const profiles = this.profiles;
     if (profiles === undefined) return {};
+    // T4c-2b: one pet question per turn (askWhichPet's included).
+    const questionFree = () =>
+      memoryRun.value === null && (petChoiceRun?.value ?? null) === null;
     return {
       rememberPetDetails: tool({
         description: REMEMBER_PET_DESCRIPTION,
@@ -4184,6 +4728,25 @@ export class MinimalCatalogAgentService {
           // T4c-1-fix H1: never brings back a pet forgotten moments ago.
           if (this.petRecentlyForgotten(senderId, pet.name))
             return toolError('pet_recently_forgotten');
+          // T4c-2b Q3 (S10): «Brunito» of a known or just-forgotten «Bruno»
+          // is asked before any write; never written unconfirmed.
+          if (
+            this.pets !== undefined &&
+            !this.petsOverBudget.has(senderId) &&
+            this.petDiminutive(senderId, pet.name) !== null
+          ) {
+            const question = questionFree()
+              ? this.diminutiveQuestion(senderId, pet.name!, pet, styled)
+              : null;
+            if (question === null)
+              return toolError('pet_name_needs_confirmation');
+            memoryRun.value = question;
+            return {
+              ok: true as const,
+              remembered: false as const,
+              presentedByApplication: true as const,
+            };
+          }
           // T4b: the matched pet of the pet store (never mixes two pets).
           if (this.pets !== undefined) {
             // T4b-fix A2: the pets of this turn are not loaded; no writes.
@@ -4233,6 +4796,27 @@ export class MinimalCatalogAgentService {
           let keep = false;
           try {
             const result = await this.forgetPetNow(senderId, name, reason);
+            // T4c-2b Q1: 2+ pets with that name → the application asks
+            // which one (nothing archived yet: the window waits for the tap).
+            if (
+              'error' in result &&
+              result.error === 'several_pets_with_that_name' &&
+              questionFree()
+            ) {
+              const question = this.forgetQuestion(
+                senderId,
+                name,
+                reason,
+                styled,
+              );
+              if (question !== null) {
+                memoryRun.value = question;
+                return {
+                  ok: true as const,
+                  presentedByApplication: true as const,
+                };
+              }
+            }
             keep =
               result.ok ||
               ('error' in result && result.error === 'no_pet_with_that_name');
@@ -4347,20 +4931,16 @@ export class MinimalCatalogAgentService {
       !forgotPet &&
       !this.petsOverBudget.has(input.senderId)
     ) {
-      const facts: PetFacts = extractPetFacts(input.text);
+      const { facts, allergy, joined } = statementPetFacts(input.text);
       const legacy = profiles.cached(input.senderId)?.pet;
-      // T4c-1 G1: «<Nombre> es alérgico a X». With the same name as the
-      // statement's pet facts it joins them; else it goes only to a known
-      // pet with that name.
-      const allergy = extractPetAllergy(input.text);
-      const joined =
-        allergy !== null &&
-        facts.name !== undefined &&
-        foldPetName(facts.name) === foldPetName(allergy.name);
-      if (joined) facts.allergies = allergy.allergies;
       // T4c-1-fix H1: a pet forgotten earlier in the turn (or the window)
       // is never captured again (with the same name, the allergy neither).
-      if (!this.petRecentlyForgotten(input.senderId, facts.name))
+      // T4c-2b Q3: a diminutive of a known or just-forgotten pet is never
+      // written unconfirmed (the turn asked, or could not ask).
+      if (
+        !this.petRecentlyForgotten(input.senderId, facts.name) &&
+        this.petDiminutive(input.senderId, facts.name) === null
+      )
         void this.petsInBackground('capture', () =>
           pets.capture(input.senderId, facts, legacy),
         );
@@ -4391,9 +4971,16 @@ export class MinimalCatalogAgentService {
     }
     const names =
       this.forgottenPets.get(senderId) ??
-      new Map<string, Array<{ until: number; failed: boolean }>>();
+      new Map<
+        string,
+        Array<{ until: number; failed: boolean; name: string }>
+      >();
     const folded = foldPetName(name);
-    const mark = { until: now + PET_FORGOTTEN_WINDOW_MS, failed: false };
+    const mark = {
+      until: now + PET_FORGOTTEN_WINDOW_MS,
+      failed: false,
+      name: name.trim(),
+    };
     names.set(folded, [...(names.get(folded) ?? []), mark]);
     this.forgottenPets.set(senderId, names);
     this.petForgetTurns.add(senderId);
@@ -4414,6 +5001,17 @@ export class MinimalCatalogAgentService {
         .get(senderId)
         ?.get(foldPetName(name))
         ?.some((mark) => !mark.failed && mark.until > now) ?? false
+    );
+  }
+
+  /** T4c-2b Q3: the names (as given) with a live H1 mark. */
+  private recentlyForgottenNames(senderId: string): string[] {
+    const now = Date.now();
+    return [...(this.forgottenPets.get(senderId)?.values() ?? [])].flatMap(
+      (marks) => {
+        const live = marks.find((mark) => !mark.failed && mark.until > now);
+        return live === undefined ? [] : [live.name];
+      },
     );
   }
 
