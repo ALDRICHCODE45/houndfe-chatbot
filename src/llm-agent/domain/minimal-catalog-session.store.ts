@@ -34,6 +34,8 @@ export type MinimalCartConversationContext = {
 export type ReorderOfferContext = {
   reference: string;
   items: Array<{ productId: string; variantId?: string; quantity: number }>;
+  /** T5b (S15): a per-pet offer; a yes tags every line for this pet. */
+  pet?: { id: string; name: string };
 };
 
 /**
