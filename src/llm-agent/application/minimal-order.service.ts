@@ -188,6 +188,21 @@ const QUOTE_REJECTION_CODES: ReadonlySet<string> = new Set([
   SHIPPING_QUOTE_NOT_FOUND,
   SHIPPING_QUOTE_UNAVAILABLE,
 ]);
+/**
+ * Multi-pet T5a R4: checkout refusals about a line's `petId` (contract §5,
+ * §9). Nothing was created; a stale pet must never block the order.
+ */
+const PET_REFUSAL_CODES: ReadonlySet<string> = new Set([
+  'PET_NOT_FOUND',
+  'PET_ARCHIVED',
+  'PET_CUSTOMER_MISMATCH',
+]);
+/** The same line (or cart line) without its pet. */
+function withoutPet<T extends { pet?: unknown }>(line: T): T {
+  const copy = { ...line };
+  delete copy.pet;
+  return copy;
+}
 const isQuoteRejection = (error: unknown): boolean =>
   error instanceof ChatbotApiError &&
   error.errorCode !== null &&
@@ -340,6 +355,7 @@ function sameCartLines(
         line.productId === item.productId &&
         line.variantId === item.variantId &&
         line.backorder?.id === item.backorder?.id &&
+        line.pet?.id === item.pet?.id &&
         line.quantity === item.quantity &&
         line.unitPriceCents === item.unitPriceCents
       );
@@ -852,6 +868,9 @@ export class MinimalOrderService {
         ...(item.backorder === undefined
           ? {}
           : { backorderId: item.backorder.id }),
+        // Multi-pet T5a R4: the backend pet this line is for; sent only
+        // when present (it joins the idempotency hash only then).
+        ...(item.pet === undefined ? {} : { petId: item.pet.id }),
       })),
     };
   }
@@ -1013,11 +1032,18 @@ export class MinimalOrderService {
       const backorderRefusalAfterAttempt =
         (keyed.idempotencyAttempts ?? 1) > 1 &&
         this.isBackorderRefusal(error, keyed);
+      // Multi-pet T5a R4: a pet refusal also proves THIS call wrote nothing;
+      // after an earlier uncertain attempt the key is read the same way.
+      const petRefusal =
+        code !== null &&
+        PET_REFUSAL_CODES.has(code) &&
+        snapshot.items.some((item) => item.pet !== undefined);
       if (
         (isQuoteRejection(error) &&
           (code === SHIPPING_QUOTE_ALREADY_USED ||
             (keyed.idempotencyAttempts ?? 1) > 1)) ||
-        backorderRefusalAfterAttempt
+        backorderRefusalAfterAttempt ||
+        (petRefusal && (keyed.idempotencyAttempts ?? 1) > 1)
       ) {
         const own = await this.ownCheckout(keyed.idempotencyKey);
         if (own.kind === 'sale')
@@ -1066,6 +1092,22 @@ export class MinimalOrderService {
       const unkeyed = structuredClone({ ...keyed, idempotencyKey: '' });
       delete unkeyed.idempotencyFingerprint;
       delete unkeyed.idempotencyAttempts;
+      if (petRefusal) {
+        // Multi-pet T5a R4: the same order without pets (products and prices
+        // unchanged) under a new key; the stale current pet goes too. The
+        // resent snapshot has no pet, so this happens at most once.
+        unkeyed.items = unkeyed.items.map(withoutPet);
+        delete unkeyed.currentPet;
+        if (!(await this.commitCart(senderId, stored, unkeyed)))
+          return unverified;
+        this.logger.warn(
+          `checkout pet refusal code=${code}: pets removed, resending under a new key`,
+        );
+        return this.place(senderId, {
+          ...snapshot,
+          items: snapshot.items.map(withoutPet),
+        });
+      }
       // A quote is pinned to lines and address, never to the customer: kept,
       // it would be resent after the re-check and fail the same way.
       if (customerMismatch) delete unkeyed.shipping;

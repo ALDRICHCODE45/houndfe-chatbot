@@ -16,6 +16,20 @@ export interface CartItem {
    * line, so stored carts without a backorder are unchanged.
    */
   backorder?: CartBackorderRef;
+  /**
+   * Multi-pet T5a (S16, S17): the line is for this backend pet of the
+   * customer (sent as `petId` at checkout). Absent on pet-less lines and on
+   * every backorder line, so stored carts without a pet are unchanged.
+   */
+  pet?: CartPet;
+}
+
+/** A backend pet of the customer, as a cart line or the cart remembers it. */
+export interface CartPet {
+  /** Backend pet UUID (never a local or legacy ref). */
+  id: string;
+  /** Display name for «(para Max)». */
+  name: string;
 }
 
 /** What a backorder cart line remembers about its reservation. */

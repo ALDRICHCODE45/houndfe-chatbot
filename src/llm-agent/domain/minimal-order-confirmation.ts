@@ -42,6 +42,18 @@ export interface MinimalOrderLine {
    * lines, so their snapshots are unchanged.
    */
   readonly backorder?: MinimalOrderBackorder;
+  /**
+   * Multi-pet T5a: the backend pet this line is for (checkout `petId`,
+   * «(para Max)»). Absent on pet-less and backorder lines, so their
+   * snapshots are unchanged.
+   */
+  readonly pet?: MinimalOrderPet;
+}
+
+/** The backend pet of an order line. */
+export interface MinimalOrderPet {
+  readonly id: string;
+  readonly name: string;
 }
 
 /** The reservation a backorder line carries into the order. */
@@ -228,6 +240,8 @@ function canonicalize(snapshot: MinimalOrderSnapshot): string {
       item.appliedPromotionTitle ?? null,
       item.discountAmountCents ?? 0,
       ...(item.backorder === undefined ? [] : [item.backorder.id]),
+      // Multi-pet T5a: only when present, so pet-less lines are unchanged.
+      ...(item.pet === undefined ? [] : [['pet', item.pet.id, item.pet.name]]),
     ]),
     snapshot.totalCents,
     snapshot.shipping === undefined
@@ -309,6 +323,14 @@ export function minimalBackorderSuffix(
     : ` (pedido apartado ${item.backorder.folio})`;
 }
 
+/**
+ * Multi-pet T5a R5 (S16): « (para Max)» after a line for a pet; empty for
+ * every other line.
+ */
+export function minimalPetSuffix(item: Pick<MinimalOrderLine, 'pet'>): string {
+  return item.pet === undefined ? '' : ` (para ${item.pet.name})`;
+}
+
 function deliveryLine(snapshot: MinimalOrderSnapshot): string {
   const draft = snapshot.draft;
   if (draft === null)
@@ -381,7 +403,7 @@ export function renderMinimalOrderSummary(
     MINIMAL_ORDER_SUMMARY_HEADING,
     ...snapshot.items.map(
       (item) =>
-        `• ${minimalLineLabel(item.name, item.variantName)}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}${minimalBackorderSuffix(item)}`,
+        `• ${minimalLineLabel(item.name, item.variantName)}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}${minimalBackorderSuffix(item)}${minimalPetSuffix(item)}`,
     ),
     `Total de productos: ${mxn(snapshot.totalCents)}`,
     pickup
