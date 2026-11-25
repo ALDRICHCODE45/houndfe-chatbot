@@ -6,6 +6,7 @@ import {
   contextSpeciesFromImageBlock,
   speciesGroupsNamedIn,
 } from '../../src/llm-agent/domain/minimal-catalog-options';
+import { TITLE_EMOJI_LINE } from '../../src/llm-agent/domain/whatsapp-format';
 import type { RefusalExpectation } from './scenarios';
 
 /** Deterministic reply heuristics; no LLM judge. */
@@ -171,6 +172,20 @@ const count = (re: RegExp, text: string) => (text.match(re) ?? []).length;
 
 export const hasEmoji = (text: string) => EMOJI.test(text);
 
+/**
+ * Message formatting S3 (F3b-fix H1): the reply without the server title
+ * emojis (🧾 🚚 ✅ closing a «*Title*» line, `TITLE_EMOJI_LINE`), which go to
+ * every customer. Any other emoji, or a title emoji elsewhere, stays.
+ */
+const withoutTitleEmojis = (text: string): string =>
+  text
+    .split('\n')
+    .map((line) => {
+      const suffix = TITLE_EMOJI_LINE.exec(line)?.[1] ?? '';
+      return line.slice(0, line.length - suffix.length);
+    })
+    .join('\n');
+
 /** Sticky customer register: starts usted, follows the latest marker. */
 export function nextRegister(
   current: Register,
@@ -262,7 +277,7 @@ export function checkReply(input: {
     input.recentCustomerTexts ?? [customerText],
   );
   const botEmoji = hasEmoji(reply);
-  if (!emojiAllowed && botEmoji)
+  if (!emojiAllowed && hasEmoji(withoutTitleEmojis(reply)))
     out.push({
       check: 'emoji',
       severity: 'fail',

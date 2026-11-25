@@ -737,7 +737,7 @@ describe('customer style over every fixed customer reply (S2)', () => {
 describe('restock backorder copy in tú (S1/S14)', () => {
   it('pins the confirmation, the offer and the questions', () => {
     expect(applyCustomerStyle(REPLIES.backorderScheduled, tu)).toBe(
-      'Listo, quedó agendado tu pedido BO-000012: 2 × Collar a $1149.00 MXN c/u. Te aviso en cuanto llegue (aprox. el 27 de noviembre); no pagas nada hasta entonces.',
+      'Listo, quedó agendado tu pedido *BO-000012*:\n• Collar\n   2 × $1,149.00 = *$2,298.00*\n\nTe aviso en cuanto llegue (aprox. el 27 de noviembre); no pagas nada hasta entonces.',
     );
     expect(applyCustomerStyle(REPLIES.backorderOfferPrompt, tu)).toBe(
       '¿Quieres que te lo apartemos?',
@@ -799,7 +799,7 @@ describe('restock backorder copy in tú (S8 cancel and status)', () => {
 describe('restock backorder copy in tú (T5b confirm, checkout and reschedule)', () => {
   it('pins the confirmation lead, the refusals and the reschedule question', () => {
     expect(applyCustomerStyle(REPLIES.backorderAdded, tu)).toBe(
-      'Listo, tu pedido apartado BO-000012 (2 × Collar) ya está en tu carrito a $1099.00 MXN c/u. Te lo tenemos apartado hasta el 21 de noviembre a las 9:00 a. m.',
+      'Listo, tu pedido apartado *BO-000012* ya está en tu carrito:\n• Collar\n   2 × $1,099.00 = *$2,198.00*\n\nTe lo tenemos apartado hasta *el 21 de noviembre a las 9:00 a. m.*',
     );
     expect(applyCustomerStyle(REPLIES.backorderExpired, tu)).toBe(
       'Se venció el apartado de tu pedido BO-000012.',

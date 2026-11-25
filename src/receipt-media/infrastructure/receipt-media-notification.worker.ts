@@ -35,6 +35,7 @@ import {
   checkHandoffSendHold,
   type HandoffModeReader,
 } from '../../conversation/application/handoff-send-hold';
+import { bold, money } from '../domain/notice-format';
 
 export interface NotificationStoreSeam {
   claimBatch(limit: number, owner: string): Promise<ReceiptMediaOutboxRow[]>;
@@ -85,13 +86,14 @@ export const RETRY_DELAY_MS = 60_000;
 const isCents = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
-/** `$1,500.00 MXN`: the one customer-facing money format of receipt texts. */
-const pesos = (cents: number): string =>
-  `$${Math.floor(cents / 100).toLocaleString('en-US')}.${String(cents % 100).padStart(2, '0')} MXN`;
-
-/** "del pedido F-12", or "de su pedido" when the folio is unknown. */
+/** "del pedido *F-12*" (message formatting S2: bold folio), or "de su
+ *  pedido" when the folio is unknown. */
 const ofOrder = (folio: string | null): string =>
-  folio === null ? 'de su pedido' : `del pedido ${folio}`;
+  folio === null ? 'de su pedido' : `del pedido ${bold(folio)}`;
+
+/** "su pedido *F-12*", or "su pedido" when the folio is unknown. */
+const yourOrder = (folio: string | null): string =>
+  folio === null ? 'su pedido' : `su pedido ${bold(folio)}`;
 
 const RECEIVED_SUFFIX =
   'Lo estamos revisando y le avisamos en cuanto se confirme.';
@@ -137,6 +139,9 @@ const rejectionReason = (
 const REASON_SLOT = '\u0000reason\u0000';
 
 /**
+ * Message formatting F3c (S2, S4): bold folio, amounts as «$1,250.00» on
+ * their own bold-labelled lines, the closing question or offer apart.
+ *
  * S1: the canonical usted text, or the customer's stored style applied to
  * the fixed copy only — the backend rejection reason is never rewritten.
  * Without a style the text is byte-identical to the usted copy.
@@ -164,24 +169,33 @@ const renderUsted = (
       const received =
         folio === null
           ? TEXT.RECEIPT_ATTACHED_PENDING
-          : `Recibimos su comprobante del pedido ${folio}. ${RECEIVED_SUFFIX}`;
+          : `Recibimos su comprobante ${ofOrder(folio)}. ${RECEIVED_SUFFIX}`;
       const { extractedAmountCents: seen, totalCents: owed } = args;
       return isCents(seen) && isCents(owed) && seen !== owed
-        ? `${received} Vemos un monto de ${pesos(seen)} y su pedido es de ${pesos(owed)}; lo revisamos igual.`
+        ? [
+            received,
+            '',
+            `${bold('Monto en el comprobante:')} ${money(seen)}`,
+            `${bold('Total de su pedido:')} ${money(owed)}`,
+            'Lo revisamos igual.',
+          ].join('\n')
         : received;
     }
     // R5/S5: the human outcome; the bot never decides it (S1).
     case 'RECEIPT_PAYMENT_CONFIRMED':
       return `¡Listo! Confirmamos su pago ${ofOrder(folio)}. Gracias por su compra.`;
-    case 'RECEIPT_PAYMENT_PARTIAL': {
-      const order = folio === null ? 'su pedido' : `su pedido ${folio}`;
+    case 'RECEIPT_PAYMENT_PARTIAL':
       return isCents(args.debtCents)
-        ? `Confirmamos un pago de ${order}. Queda un saldo pendiente de ${pesos(args.debtCents)}; puede enviarnos el comprobante del resto cuando lo tenga.`
-        : `Confirmamos un pago de ${order}. Puede enviarnos el comprobante del resto cuando lo tenga.`;
-    }
+        ? [
+            `Confirmamos un pago de ${yourOrder(folio)}.`,
+            `${bold('Saldo pendiente:')} ${money(args.debtCents)}`,
+            '',
+            'Puede enviarnos el comprobante del resto cuando lo tenga.',
+          ].join('\n')
+        : `Confirmamos un pago de ${yourOrder(folio)}. Puede enviarnos el comprobante del resto cuando lo tenga.`;
     case 'RECEIPT_PAYMENT_REJECTED': {
       const reason = reasonText ?? rejectionReason(args);
-      return `No pudimos confirmar su comprobante ${ofOrder(folio)}${reason.length > 0 ? `: ${reason}` : ''}. ¿Me puede enviar otro comprobante?`;
+      return `No pudimos confirmar su comprobante ${ofOrder(folio)}${reason.length > 0 ? `: ${reason}` : ''}.\n\n¿Me puede enviar otro comprobante?`;
     }
     case 'RECEIPT_NOT_A_RECEIPT':
       return args.mediaKind === 'pdf'
@@ -190,11 +204,11 @@ const renderUsted = (
     case 'RECEIPT_SALE_ALREADY_PAID':
       return folio === null
         ? TEXT.RECEIPT_SALE_ALREADY_PAID
-        : `Su pedido ${folio} ya está pagado.`;
+        : `Su pedido ${bold(folio)} ya está pagado.`;
     // Follow-ups S7: the order was a pay-in-store hold the sweep cancelled.
     case 'RECEIPT_SALE_NOT_PAYABLE':
       return args.payInStoreHold === true
-        ? `${folio === null ? 'Su pedido' : `Su pedido ${folio}`} se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante. Si todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.`
+        ? `${folio === null ? 'Su pedido' : `Su pedido ${bold(folio)}`} se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante.\n\nSi todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.`
         : TEXT.RECEIPT_SALE_NOT_PAYABLE;
     default:
       return TEXT[row.templateKey];

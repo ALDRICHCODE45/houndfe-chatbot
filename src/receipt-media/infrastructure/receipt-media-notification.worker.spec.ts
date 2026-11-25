@@ -83,7 +83,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
     expect(h.sendText).toHaveBeenCalledTimes(1);
     expect(h.sendText).toHaveBeenCalledWith({
       to: '+525500000000',
-      text: 'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
+      text: 'Confirmamos un pago de su pedido *F-1*.\n*Saldo pendiente:* $1,234.56\n\nPuede enviarnos el comprobante del resto cuando lo tenga.',
     });
   });
 
@@ -202,7 +202,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
       expect(text).toBe(text.trim());
     }
     expect(renderNotificationText(intent())).toBe(
-      'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
+      'Confirmamos un pago de su pedido *F-1*.\n*Saldo pendiente:* $1,234.56\n\nPuede enviarnos el comprobante del resto cuando lo tenga.',
     );
   });
 
@@ -214,7 +214,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
 
     it('says received and in review with the folio, without any amount prompt', () => {
       expect(render('RECEIPT_ATTACHED_PENDING', { folio: 'F-0042' })).toBe(
-        'Recibimos su comprobante del pedido F-0042. Lo estamos revisando y le avisamos en cuanto se confirme.',
+        'Recibimos su comprobante del pedido *F-0042*. Lo estamos revisando y le avisamos en cuanto se confirme.',
       );
       expect(render('RECEIPT_ATTACHED_PENDING')).toBe(
         'Recibimos su comprobante. Lo estamos revisando y le avisamos en cuanto se confirme.',
@@ -229,7 +229,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
           totalCents: 150000,
         }),
       ).toBe(
-        'Recibimos su comprobante del pedido F-0042. Lo estamos revisando y le avisamos en cuanto se confirme. Vemos un monto de $1,400.50 MXN y su pedido es de $1,500.00 MXN; lo revisamos igual.',
+        'Recibimos su comprobante del pedido *F-0042*. Lo estamos revisando y le avisamos en cuanto se confirme.\n\n*Monto en el comprobante:* $1,400.50\n*Total de su pedido:* $1,500.00\nLo revisamos igual.',
       );
     });
 
@@ -237,7 +237,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
       [
         'RECEIPT_SALE_ALREADY_PAID',
         { folio: 'F-0042' },
-        'Su pedido F-0042 ya está pagado.',
+        'Su pedido *F-0042* ya está pagado.',
       ],
       ['RECEIPT_SALE_ALREADY_PAID', {}, 'Su pedido ya está pagado.'],
       [
@@ -254,12 +254,12 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
       [
         'RECEIPT_SALE_NOT_PAYABLE',
         { folio: 'F-0042', payInStoreHold: true },
-        'Su pedido F-0042 se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante. Si todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.',
+        'Su pedido *F-0042* se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante.\n\nSi todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.',
       ],
       [
         'RECEIPT_SALE_NOT_PAYABLE',
         { payInStoreHold: true },
-        'Su pedido se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante. Si todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.',
+        'Su pedido se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante.\n\nSi todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.',
       ],
       [
         'RECEIPT_UNSUPPORTED_FORMAT',
@@ -301,7 +301,7 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
       [
         'RECEIPT_PAYMENT_CONFIRMED',
         { folio: 'F-0042' },
-        '¡Listo! Confirmamos su pago del pedido F-0042. Gracias por su compra.',
+        '¡Listo! Confirmamos su pago del pedido *F-0042*. Gracias por su compra.',
       ],
       [
         'RECEIPT_PAYMENT_CONFIRMED',
@@ -311,27 +311,27 @@ describe('ReceiptMediaNotificationWorker (WU9)', () => {
       [
         'RECEIPT_PAYMENT_PARTIAL',
         { folio: 'F-0042', debtCents: 150000 },
-        'Confirmamos un pago de su pedido F-0042. Queda un saldo pendiente de $1,500.00 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
+        'Confirmamos un pago de su pedido *F-0042*.\n*Saldo pendiente:* $1,500.00\n\nPuede enviarnos el comprobante del resto cuando lo tenga.',
       ],
       [
         'RECEIPT_PAYMENT_PARTIAL',
         { debtCents: 5 },
-        'Confirmamos un pago de su pedido. Queda un saldo pendiente de $0.05 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
+        'Confirmamos un pago de su pedido.\n*Saldo pendiente:* $0.05\n\nPuede enviarnos el comprobante del resto cuando lo tenga.',
       ],
       [
         'RECEIPT_PAYMENT_REJECTED',
         { folio: 'F-0042', reason: 'El monto no coincide' },
-        'No pudimos confirmar su comprobante del pedido F-0042: El monto no coincide. ¿Me puede enviar otro comprobante?',
+        'No pudimos confirmar su comprobante del pedido *F-0042*: El monto no coincide.\n\n¿Me puede enviar otro comprobante?',
       ],
       [
         'RECEIPT_PAYMENT_REJECTED',
         { folio: 'F-0042' },
-        'No pudimos confirmar su comprobante del pedido F-0042. ¿Me puede enviar otro comprobante?',
+        'No pudimos confirmar su comprobante del pedido *F-0042*.\n\n¿Me puede enviar otro comprobante?',
       ],
       [
         'RECEIPT_PAYMENT_REJECTED',
         { reason: 'Comprobante ilegible.' },
-        'No pudimos confirmar su comprobante de su pedido: Comprobante ilegible. ¿Me puede enviar otro comprobante?',
+        'No pudimos confirmar su comprobante de su pedido: Comprobante ilegible.\n\n¿Me puede enviar otro comprobante?',
       ],
     ] as const)('renders %s %j', (key, args, text) => {
       expect(render(key, args)).toBe(text);

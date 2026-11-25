@@ -121,9 +121,12 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
         decision: 'BACKORDER_RESERVED_NOTICE',
         senderId: SENDER,
         text:
-          `¡Buenas noticias, Rosa! Ya llegó su pedido BO-000012: 2 × ${NAME}. ` +
-          'Se lo apartamos a $1099.00 MXN c/u (bajó de precio, antes $1149.00 MXN) ' +
-          'hasta el 21 de noviembre a las 9:00 a. m. ¿Lo confirmamos?',
+          '¡Buenas noticias, Rosa! Ya llegó su pedido *BO-000012*.\n\n' +
+          `• ${NAME}\n` +
+          '   2 × $1,099.00 = *$2,198.00*\n' +
+          '   _Bajó de precio, antes $1,149.00_\n\n' +
+          'Se lo apartamos hasta *el 21 de noviembre a las 9:00 a. m.*\n\n' +
+          '¿Lo confirmamos?',
         buttons: CONFIRM_BUTTONS,
         shortBody: '¿Lo confirmamos?',
         staffAlert: true,
@@ -143,10 +146,13 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
       expect(planned).toMatchObject({
         action: 'send',
         text:
-          `¡Buenas noticias, Rosa! Ya llegó su pedido BO-000012: 2 × ${NAME} (18 kg). ` +
-          'Se lo apartamos a $1149.00 MXN c/u hasta el 21 de noviembre a las 9:00 a. m. ¿Lo confirmamos?',
+          '¡Buenas noticias, Rosa! Ya llegó su pedido *BO-000012*.\n\n' +
+          `• ${NAME} (18 kg)\n` +
+          '   2 × $1,149.00 = *$2,298.00*\n\n' +
+          'Se lo apartamos hasta *el 21 de noviembre a las 9:00 a. m.*\n\n' +
+          '¿Lo confirmamos?',
       });
-      expect((planned as { text: string }).text).not.toMatch(/bajó/);
+      expect((planned as { text: string }).text).not.toMatch(/bajó/i);
     });
 
     it('without a first name the greeting has no name', async () => {
@@ -171,9 +177,12 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
       expect(planned).toMatchObject({
         action: 'send',
         text:
-          '¡Buenas noticias, Rosa! Ya llegó tu pedido BO-000012: 2 × Su pedido Premium. ' +
-          'Te lo apartamos a $1099.00 MXN c/u (bajó de precio, antes $1149.00 MXN) ' +
-          'hasta el 21 de noviembre a las 9:00 a. m. ¿Lo confirmamos?',
+          '¡Buenas noticias, Rosa! Ya llegó tu pedido *BO-000012*.\n\n' +
+          '• Su pedido Premium\n' +
+          '   2 × $1,099.00 = *$2,198.00*\n' +
+          '   _Bajó de precio, antes $1,149.00_\n\n' +
+          'Te lo apartamos hasta *el 21 de noviembre a las 9:00 a. m.*\n\n' +
+          '¿Lo confirmamos?',
         buttons: CONFIRM_BUTTONS,
       });
     });
@@ -222,7 +231,7 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
         action: 'send',
         decision: 'BACKORDER_REMINDER_NOTICE',
         senderId: SENDER,
-        text: 'Le recuerdo que su pedido BO-000012 sigue apartado hasta el 21 de noviembre a las 9:00 a. m. ¿Lo confirmamos?',
+        text: 'Le recuerdo que su pedido *BO-000012* sigue apartado hasta *el 21 de noviembre a las 9:00 a. m.*\n\n¿Lo confirmamos?',
         buttons: CONFIRM_BUTTONS,
         shortBody: '¿Lo confirmamos?',
         staffAlert: true,
@@ -235,7 +244,7 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
           Promise.resolve({ register: 'tu', tone: 'casual', emojis: false }),
       });
       await expect(plan(reminder())).resolves.toMatchObject({
-        text: 'Te recuerdo que tu pedido BO-000012 sigue apartado hasta el 21 de noviembre a las 9:00 a. m. ¿Lo confirmamos?',
+        text: 'Te recuerdo que tu pedido *BO-000012* sigue apartado hasta *el 21 de noviembre a las 9:00 a. m.*\n\n¿Lo confirmamos?',
       });
     });
   });
@@ -247,7 +256,7 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
         action: 'send',
         decision: 'BACKORDER_EXPIRED_NOTICE',
         senderId: SENDER,
-        text: `Se venció el apartado de su pedido BO-000012 (${NAME}).`,
+        text: `Se venció el apartado de su pedido *BO-000012* (${NAME}).`,
       });
     });
 
@@ -259,7 +268,7 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
         action: 'send',
         decision: 'BACKORDER_EXPIRED_NOTICE',
         senderId: SENDER,
-        text: `Se venció el apartado de su pedido BO-000012 (${NAME}). ¿Quiere que se lo vuelva a agendar?`,
+        text: `Se venció el apartado de su pedido *BO-000012* (${NAME}).\n\n¿Quiere que se lo vuelva a agendar?`,
         buttons: [
           { id: `backorder_reschedule:${ID}`, title: 'Sí, agéndalo' },
           { id: `backorder_reschedule_decline:${ID}`, title: 'No, gracias' },
@@ -284,7 +293,7 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
       await expect(
         plan(expired({ sourceDecisionId: DECISION })),
       ).resolves.toMatchObject({
-        text: `Se venció el apartado de tu pedido BO-000012 (${NAME}). ¿Quieres que te lo vuelva a agendar?`,
+        text: `Se venció el apartado de tu pedido *BO-000012* (${NAME}).\n\n¿Quieres que te lo vuelva a agendar?`,
       });
     });
   });
@@ -297,8 +306,8 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
         decision: 'BACKORDER_LOST_NOTICE',
         senderId: SENDER,
         text:
-          `Una disculpa, Rosa: el lote que le apartamos de ${NAME} caducó y no tenemos otro vigente. ` +
-          'Su pedido BO-000012 sigue en primer lugar; le aviso en cuanto llegue (aprox. 27 de noviembre).',
+          `Una disculpa, Rosa: el lote que le apartamos de ${NAME} caducó y no tenemos otro vigente.\n\n` +
+          'Su pedido *BO-000012* sigue en primer lugar; le aviso en cuanto llegue (aprox. 27 de noviembre).',
       });
     });
 
@@ -319,8 +328,8 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
       });
       await expect(plan(lost())).resolves.toMatchObject({
         text:
-          `Una disculpa, Rosa: el lote que te apartamos de ${NAME} caducó y no tenemos otro vigente. ` +
-          'Tu pedido BO-000012 sigue en primer lugar; te aviso en cuanto llegue (aprox. 27 de noviembre).',
+          `Una disculpa, Rosa: el lote que te apartamos de ${NAME} caducó y no tenemos otro vigente.\n\n` +
+          'Tu pedido *BO-000012* sigue en primer lugar; te aviso en cuanto llegue (aprox. 27 de noviembre).',
       });
     });
   });
@@ -334,7 +343,7 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
         action: 'send',
         decision: 'BACKORDER_CANCELLED_NOTICE',
         senderId: SENDER,
-        text: 'El equipo canceló su pedido BO-000012: Producto descontinuado.',
+        text: 'El equipo canceló su pedido *BO-000012*: Producto descontinuado.',
       });
     });
 
@@ -344,12 +353,12 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
           Promise.resolve({ register: 'tu', tone: 'casual', emojis: false }),
       });
       await expect(plan(cancelled({ reason: '  ' }))).resolves.toMatchObject({
-        text: 'El equipo canceló tu pedido BO-000012.',
+        text: 'El equipo canceló tu pedido *BO-000012*.',
       });
       await expect(
         plan(cancelled({ reason: 'Se lo avisamos a su correo.' })),
       ).resolves.toMatchObject({
-        text: 'El equipo canceló tu pedido BO-000012: Se lo avisamos a su correo.',
+        text: 'El equipo canceló tu pedido *BO-000012*: Se lo avisamos a su correo.',
       });
     });
   });
@@ -375,9 +384,11 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
         decision: 'BACKORDER_ETA_PENDING',
         senderId: SENDER,
         text:
-          `Rosa, le actualizo su pedido BO-000012 (2 × ${NAME}): el equipo nos confirmó ` +
-          'que llega aprox. el 27 de noviembre. Se lo aparto en cuanto llegue y le aviso; ' +
-          'sigue sin pagar nada hasta entonces. Con gusto se lo tengo listo. ¿Seguimos con su pedido?',
+          'Rosa, le actualizo su pedido *BO-000012*:\n' +
+          `• 2 × ${NAME}\n` +
+          'El equipo nos confirmó que llega aprox. el *27 de noviembre*.\n\n' +
+          'Se lo aparto en cuanto llegue y le aviso; sigue sin pagar nada hasta entonces. ' +
+          'Con gusto se lo tengo listo.\n\n¿Seguimos con su pedido?',
         buttons: WAIT_BUTTONS,
         shortBody: '¿Seguimos con su pedido?',
       });
@@ -405,7 +416,7 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
       await expect(
         plan(etaUpdated({ estimatedAt: '2026-11-28T03:00:00.000Z' })),
       ).resolves.toMatchObject({
-        text: expect.stringContaining('aprox. el 27 de noviembre') as unknown,
+        text: expect.stringContaining('aprox. el *27 de noviembre*') as unknown,
       });
     });
 
@@ -422,9 +433,11 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
           action: 'send',
           decision: 'BACKORDER_ETA_PENDING',
           text:
-            `Rosa, le actualizo su pedido BO-000012 (2 × ${NAME}): el equipo está confirmando ` +
-            'la nueva fecha de llegada. Se lo aparto en cuanto llegue y le aviso; ' +
-            'sigue sin pagar nada hasta entonces. Con gusto se lo tengo listo. ¿Seguimos con su pedido?',
+            'Rosa, le actualizo su pedido *BO-000012*:\n' +
+            `• 2 × ${NAME}\n` +
+            'El equipo está confirmando la nueva fecha de llegada.\n\n' +
+            'Se lo aparto en cuanto llegue y le aviso; sigue sin pagar nada hasta entonces. ' +
+            'Con gusto se lo tengo listo.\n\n¿Seguimos con su pedido?',
           buttons: WAIT_BUTTONS,
         });
         expect((planned as { text: string }).text).not.toMatch(/aprox\. el/);
@@ -439,7 +452,7 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
         ),
       ).resolves.toMatchObject({
         text: expect.stringMatching(
-          /^Le actualizo su pedido BO-000012/,
+          /^Le actualizo su pedido \*BO-000012\*:\n/,
         ) as unknown,
       });
     });
@@ -452,8 +465,8 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
         decision: 'BACKORDER_ETA_PENDING',
         senderId: SENDER,
         text:
-          `Rosa, el proveedor todavía no nos confirma fecha para ${NAME} (pedido BO-000012). ` +
-          'Su lugar sigue apartado: en cuanto llegue se lo separo y le aviso. ¿Seguimos con su pedido?',
+          `Rosa, el proveedor todavía no nos confirma fecha para ${NAME} (pedido *BO-000012*).\n\n` +
+          'Su lugar sigue apartado: en cuanto llegue se lo separo y le aviso.\n\n¿Seguimos con su pedido?',
         buttons: WAIT_BUTTONS,
         shortBody: '¿Seguimos con su pedido?',
       });
@@ -485,7 +498,7 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
       const updated = await plan(etaUpdated({}));
       expect(updated).toMatchObject({
         text: expect.stringContaining(
-          'te actualizo tu pedido BO-000012',
+          'te actualizo tu pedido *BO-000012*',
         ) as unknown,
       });
       expect((updated as { text: string }).text).toContain(
@@ -667,7 +680,7 @@ describe('BackorderFeedNoticeService (restock backorder T5a)', () => {
         decision: 'BACKORDER_EXPIRED_NOTICE',
         senderId: SENDER,
         text:
-          `Se venció el apartado de su pedido BO-000012 (${NAME}). ` +
+          `Se venció el apartado de su pedido *BO-000012* (${NAME}).\n\n` +
           '¿Quiere que se lo vuelva a agendar?',
         buttons: [
           { id: `backorder_reschedule:${ID}`, title: 'Sí, agéndalo' },

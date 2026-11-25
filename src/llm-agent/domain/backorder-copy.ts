@@ -1,4 +1,12 @@
 import type { BackorderBot } from '../../backorders/domain/backorder';
+import {
+  bold,
+  italic,
+  itemDetail,
+  itemLine,
+  money,
+  plain,
+} from './whatsapp-format';
 
 /**
  * Restock backorder S1/S2/S14: the exact customer copy of the answering turn,
@@ -18,8 +26,6 @@ export const BACKORDER_RETRY_REPLY =
   'No pude agendar su pedido en este momento. Intente de nuevo en unos minutos.';
 /** Nothing could be scheduled, and the same request would fail again. */
 export const BACKORDER_FAILED_REPLY = 'No pude agendar su pedido por ahora.';
-
-const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
 
 const MONTHS = [
   'enero',
@@ -64,6 +70,29 @@ const label = (backorder: Pick<BackorderBot, 'productName' | 'variantName'>) =>
     : `${backorder.productName} (${backorder.variantName})`;
 
 /**
+ * Message formatting F3c (S2, S4): one backorder line in the item layout of
+ * the cart and the order summary — «• <producto>» (a `plain` value, so it
+ * never breaks the markup), «   2 × $1,149.00 = *$2,298.00*», and an
+ * optional italic note under it.
+ */
+export function backorderItemLines(input: {
+  label: string;
+  quantity: number;
+  unitPriceCents: number;
+  note?: string | null;
+}): string[] {
+  return [
+    itemLine(plain(input.label)),
+    itemDetail(
+      `${input.quantity} × ${money(input.unitPriceCents)} = ${bold(money(input.quantity * input.unitPriceCents))}`,
+    ),
+    ...(input.note === undefined || input.note === null
+      ? []
+      : [itemDetail(italic(input.note))]),
+  ];
+}
+
+/**
  * S1/S2: the confirmation states the folio, the count, the product and the
  * reference price. The 24 h reservation is NOT mentioned (it ships with the
  * backend's arrival matching). A past estimate has no date to promise.
@@ -84,12 +113,18 @@ export function backorderScheduledReply(
     Date.parse(backorder.estimatedAt) > now.getTime()
       ? backorderDate(backorder.estimatedAt, now)
       : null;
-  return (
-    `Listo, quedó agendado su pedido ${backorder.folio}: ${backorder.quantity} × ` +
-    `${label(backorder)} a ${mxn(backorder.referencePriceCents)} c/u. ` +
+  // Message formatting F3c: bold folio, the item block, the ETA apart.
+  return [
+    `Listo, quedó agendado su pedido ${bold(backorder.folio)}:`,
+    ...backorderItemLines({
+      label: label(backorder),
+      quantity: backorder.quantity,
+      unitPriceCents: backorder.referencePriceCents,
+    }),
+    '',
     `Le aviso en cuanto llegue${date === null ? '' : ` (aprox. el ${date})`}; ` +
-    'no paga nada hasta entonces.'
-  );
+      'no paga nada hasta entonces.',
+  ].join('\n');
 }
 
 /** 409 STOCK_AVAILABLE_NOW: the stock came back while the customer decided. */
@@ -338,13 +373,18 @@ export function backorderAddedReply(
     Date.parse(backorder.reservedUntil) > now.getTime()
       ? backorderDateTime(backorder.reservedUntil, now)
       : null;
-  return (
-    `Listo, su pedido apartado ${backorder.folio} (${backorder.quantity} × ${label(backorder)}) ` +
-    `ya está en su carrito a ${mxn(backorder.finalPriceCents ?? 0)} c/u.` +
-    (until === null
-      ? ''
-      : ` Se lo tenemos apartado hasta ${endSentence(until)}`)
-  );
+  // Message formatting F3c: bold folio, the item block, the bold deadline.
+  return [
+    `Listo, su pedido apartado ${bold(backorder.folio)} ya está en su carrito:`,
+    ...backorderItemLines({
+      label: label(backorder),
+      quantity: backorder.quantity,
+      unitPriceCents: backorder.finalPriceCents ?? 0,
+    }),
+    ...(until === null
+      ? []
+      : ['', `Se lo tenemos apartado hasta ${bold(until)}`]),
+  ].join('\n');
 }
 
 /** What went wrong with the backorder line at checkout (all nothing-created). */

@@ -300,7 +300,7 @@ const buttons = (decision: unknown) =>
   ).interactive?.buttons ?? [];
 const TAP = `backorder_confirm:${BO_ID}`;
 const ADDED =
-  'Listo, su pedido apartado BO-000012 (2 × Croquetas Adulto 18 kg) ya está en su carrito a $1099.00 MXN c/u. Se lo tenemos apartado hasta el 21 de noviembre a las 9:00 a. m.';
+  'Listo, su pedido apartado *BO-000012* ya está en su carrito:\n• Croquetas Adulto 18 kg\n   2 × $1,099.00 = *$2,198.00*\n\nSe lo tenemos apartado hasta *el 21 de noviembre a las 9:00 a. m.*';
 
 describe('restock backorder confirm through the customer turn', () => {
   beforeEach(() =>
@@ -508,7 +508,9 @@ describe('the bare yes only confirms when nothing else could own it', () => {
       say('Su pedido apartado BO-000012 ya llegó. ¿Lo confirma?'),
     ]);
     const decision = await h.turn('sí', []);
-    expect(reply(decision)).toContain('Listo, su pedido apartado BO-000012');
+    expect(reply(decision)).toContain(
+      'Listo, su pedido apartado *BO-000012* ya está en su carrito:',
+    );
     expect((await h.slot())?.items).toHaveLength(1);
   });
 
@@ -549,7 +551,7 @@ describe('reschedule taps through the customer turn', () => {
       interactiveReplyId: `backorder_reschedule:${BO_ID}`,
     });
     expect(reply(scheduled)).toContain(
-      'Listo, quedó agendado su pedido BO-000020',
+      'Listo, quedó agendado su pedido *BO-000020*:',
     );
     expect(h.backorders.createBackorder).toHaveBeenCalledWith(
       expect.objectContaining({ sourceDecisionId: BO_DECISION, quantity: 2 }),

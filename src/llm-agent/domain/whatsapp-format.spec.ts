@@ -8,6 +8,7 @@ import {
   money,
   plain,
   sectionTitle,
+  storeLines,
 } from './whatsapp-format';
 
 describe('whatsapp-format (message formatting F2a)', () => {
@@ -70,4 +71,53 @@ describe('whatsapp-format (message formatting F2a)', () => {
       expect(bold(`Total ${plain(value)}`)).not.toMatch(/\*.*\*.*\*/);
     },
   );
+});
+
+describe('whatsapp-format storeLines (message formatting F3b-fix H3)', () => {
+  const lead = 'Recójalo en ';
+  const HOURS = { summary: 'Lunes a sábado: 09:00–18:00' };
+
+  it('bold name, address without its final dot, bold «Horario:» line', () => {
+    expect(
+      storeLines(lead, {
+        name: 'Sucursal *Centro*.',
+        address: { formatted: 'Av. Juárez 123, Centro..' },
+        hours: HOURS,
+      }),
+    ).toEqual([
+      'Recójalo en *Sucursal Centro*',
+      'Av. Juárez 123, Centro',
+      '*Horario:* Lunes a sábado: 09:00–18:00',
+    ]);
+  });
+
+  it('a bold name alone takes no final dot', () => {
+    expect(
+      storeLines(lead, { name: 'Sucursal Norte', address: null, hours: null }),
+    ).toEqual(['Recójalo en *Sucursal Norte*']);
+  });
+
+  it('a name emptied by plain() reads «la tienda»; address and hours kept', () => {
+    expect(
+      storeLines(lead, {
+        name: '***',
+        address: { formatted: 'Av. Juárez 123.' },
+        hours: HOURS,
+      }),
+    ).toEqual([
+      'Recójalo en la tienda',
+      'Av. Juárez 123',
+      '*Horario:* Lunes a sábado: 09:00–18:00',
+    ]);
+  });
+
+  it('«la tienda» alone closes the sentence with a dot', () => {
+    expect(
+      storeLines(lead, {
+        name: ' ',
+        address: { formatted: ' . ' },
+        hours: { summary: '**' },
+      }),
+    ).toEqual(['Recójalo en la tienda.']);
+  });
 });

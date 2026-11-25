@@ -31,7 +31,7 @@ describe('pay in store copy: «a la 1:00» / «a las 2:00» (S5)', () => {
         now: MORNING,
       }),
     ).toBe(
-      'Le recordamos que su pedido B-0042 está apartado hasta hoy a la 1:00 p. m. Páselo a recoger y pagar en la tienda.',
+      'Le recordamos que su pedido *B-0042* está apartado hasta *hoy a la 1:00 p. m.*\n\nPáselo a recoger y pagar en la tienda.',
     );
     expect(
       pickupReminderText({
@@ -40,7 +40,7 @@ describe('pay in store copy: «a la 1:00» / «a las 2:00» (S5)', () => {
         location: null,
         now: new Date('2026-11-19T06:00:00.000Z'),
       }),
-    ).toContain('hasta hoy a la 1:15 a. m.');
+    ).toContain('hasta *hoy a la 1:15 a. m.*');
   });
 
   it('reminder: plural for every other hour', () => {
@@ -51,7 +51,7 @@ describe('pay in store copy: «a la 1:00» / «a las 2:00» (S5)', () => {
         location: null,
         now: MORNING,
       }),
-    ).toContain('hasta hoy a las 2:00 p. m.');
+    ).toContain('hasta *hoy a las 2:00 p. m.*');
   });
 
   it('«{fecha y hora}» in the hold reply and the extension notice', () => {
@@ -65,7 +65,7 @@ describe('pay in store copy: «a la 1:00» / «a las 2:00» (S5)', () => {
       payInStoreHeldReply({ folio: 'B-1', holdUntil: ONE_PM, location: null }),
     ).toContain('hasta el *jueves 19 de noviembre a la 1:00 p. m.*\n');
     expect(pickupExtendedText({ folio: 'B-1', holdUntil: ONE_PM })).toBe(
-      'Le ampliamos el plazo de su pedido B-1: ahora puede recogerlo y pagarlo hasta el jueves 19 de noviembre a la 1:00 p. m.',
+      'Le ampliamos el plazo de su pedido *B-1*: ahora puede recogerlo y pagarlo hasta el *jueves 19 de noviembre a la 1:00 p. m.*',
     );
   });
 });
@@ -80,9 +80,9 @@ describe('pay in store copy: direction, expired review, templates', () => {
   const EARLIER = '2026-11-19T18:00:00.000Z';
   const LATER = '2026-11-20T18:00:00.000Z';
   const EXTENDED =
-    'Le ampliamos el plazo de su pedido B-1: ahora puede recogerlo y pagarlo hasta el jueves 19 de noviembre a las 2:00 p. m.';
+    'Le ampliamos el plazo de su pedido *B-1*: ahora puede recogerlo y pagarlo hasta el *jueves 19 de noviembre a las 2:00 p. m.*';
   const UPDATED =
-    'Actualizamos el plazo de su pedido B-1: ahora puede recogerlo y pagarlo hasta el jueves 19 de noviembre a las 2:00 p. m.';
+    'Actualizamos el plazo de su pedido *B-1*: ahora puede recogerlo y pagarlo hasta el *jueves 19 de noviembre a las 2:00 p. m.*';
 
   it.each<[string, Partial<Parameters<typeof pickupExtendedText>[0]>, string]>([
     ['direction EXTENDED', { direction: 'EXTENDED' }, EXTENDED],
@@ -116,10 +116,10 @@ describe('pay in store copy: direction, expired review, templates', () => {
 
   it('expired review: the exact text, «su pedido» without a folio', () => {
     expect(pickupExpiredReviewText('B-1')).toBe(
-      'El plazo de su pedido B-1 venció. Como tiene un pago registrado, alguien del equipo le va a contactar para cerrarlo.',
+      'El plazo de su pedido *B-1* venció.\n\nComo tiene un pago registrado, alguien del equipo le va a contactar para cerrarlo.',
     );
     expect(pickupExpiredReviewText(null)).toBe(
-      'El plazo de su pedido venció. Como tiene un pago registrado, alguien del equipo le va a contactar para cerrarlo.',
+      'El plazo de su pedido venció.\n\nComo tiene un pago registrado, alguien del equipo le va a contactar para cerrarlo.',
     );
   });
 

@@ -98,8 +98,8 @@ import {
   TITLE_EMOJI,
   bold,
   money,
-  plain,
   sectionTitle,
+  storeLines,
 } from '../domain/whatsapp-format';
 
 export { minimalPaymentInstructions } from './minimal-payment.service';
@@ -276,26 +276,16 @@ function checkoutFirstName(snapshot: MinimalOrderSnapshot): string | null {
 }
 
 /**
- * Backend pickup location (C1) on its own lines (message formatting S2):
- * «Recójalo en *<sucursal>*», the address, «*Horario:* …». Null parts are
- * omitted, never invented; values are `plain`.
+ * Backend pickup location (C1) on its own lines (message formatting S2,
+ * shared store block F3b-fix H3): «Recójalo en *<sucursal>*», the address,
+ * «*Horario:* …». No location → no block; null parts are omitted, never
+ * invented; values are `plain`.
  */
 function pickupLocationLines(
   location: CheckoutPickupLocation | null | undefined,
 ): string[] {
   if (location === null || location === undefined) return [];
-  const name = plain(location.name);
-  const address =
-    location.address === null
-      ? ''
-      : plain(location.address.formatted.replace(/\.$/, ''));
-  const hours = location.hours === null ? '' : plain(location.hours.summary);
-  const lines = [
-    ...(name === '' ? [] : [`Recójalo en ${bold(name)}`]),
-    ...(address === '' ? [] : [address]),
-    ...(hours === '' ? [] : [`${bold('Horario:')} ${hours}`]),
-  ];
-  return lines.length === 0 ? [] : ['', ...lines];
+  return ['', ...storeLines('Recójalo en ', location)];
 }
 
 /**

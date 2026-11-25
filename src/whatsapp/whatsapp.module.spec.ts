@@ -530,7 +530,7 @@ describe('WhatsappModule composition with ReceiptMediaModule (WU14D)', () => {
       expect(sendText).toHaveBeenCalledTimes(1);
       expect(sendText).toHaveBeenCalledWith({
         to: '+525500000000',
-        text: 'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
+        text: 'Confirmamos un pago de su pedido *F-1*.\n*Saldo pendiente:* $1,234.56\n\nPuede enviarnos el comprobante del resto cuando lo tenga.',
       });
       const closing = moduleRef.close(); // destroy waits for the drain
       await drainMicrotasks();

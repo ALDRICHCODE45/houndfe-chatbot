@@ -101,4 +101,41 @@ describe('eval emoji check (same rule as limitCustomerEmojis)', () => {
   ])('%s', (_name, texts, reply, severity) => {
     expect(emoji(texts, reply)?.severity).toBe(severity);
   });
+
+  // Message formatting F3b-fix H1: the S3 title emojis go to every customer.
+  const noEmojiCustomer = ['hola', 'ok', 'la de 2 kg'];
+  it.each<[string, string, 'pass' | 'fail']>([
+    [
+      'passes a 🧾 closing a *Title* line for a customer without emojis',
+      '*Resumen de tu pedido* 🧾\n\n*Productos*\n• Arena — 3.8 L',
+      'pass',
+    ],
+    [
+      'passes a 🚚 closing a *Title* line for a customer without emojis',
+      '*Envío a domicilio* 🚚\nDHL Express — *$120.00*',
+      'pass',
+    ],
+    [
+      'passes a ✅ closing a *Title* line for a customer without emojis',
+      '*¡Pedido registrado!* ✅\n*Folio:* A-12',
+      'pass',
+    ],
+    [
+      'fails another emoji closing a *Title* line',
+      '*Listo* 🐾\nTe aviso.',
+      'fail',
+    ],
+    [
+      'fails a title emoji that does not close a *Title* line',
+      'Listo, pedido registrado ✅',
+      'fail',
+    ],
+    [
+      'fails a body emoji next to a kept title emoji',
+      '*¡Pedido registrado!* ✅\nGracias 🐾',
+      'fail',
+    ],
+  ])('%s', (_name, reply, severity) => {
+    expect(emoji(noEmojiCustomer, reply)?.severity).toBe(severity);
+  });
 });

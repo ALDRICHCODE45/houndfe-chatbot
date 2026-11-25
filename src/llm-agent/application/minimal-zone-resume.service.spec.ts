@@ -328,7 +328,7 @@ describe('MinimalZoneResumeService (S4: zone approved resumes checkout)', () => 
     );
     const resume = (await h.prepare('SURCHARGE'))!;
     expect(resume.shippingSentence).toBe(
-      'el envío cuesta $125.00 MXN y llega en aproximadamente 3 días hábiles',
+      'el envío cuesta $125.00 y llega en aproximadamente 3 días hábiles',
     );
     expect(resume.summary.text).toContain('*Total a pagar: $155.00*');
   });

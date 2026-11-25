@@ -15,6 +15,7 @@ import { BackorderGates } from './gates/backorder.gates';
 import { MinimalBackorderManageService } from './minimal-backorder-manage.service';
 import { MinimalBackorderOfferService } from './minimal-backorder-offer.service';
 import { MinimalCatalogAgentService } from './minimal-catalog-agent.service';
+import { money } from '../domain/whatsapp-format';
 
 /**
  * Restock backorder S1/S14 through the real customer turn: the reply right
@@ -64,7 +65,7 @@ const backorder = (quantity: number): BackorderBot => ({
   customerFirstName: 'Rosa',
 });
 const scheduled = (quantity: number) =>
-  `Listo, quedó agendado su pedido BO-000012: ${quantity} × Croquetas Adulto 18 kg a $1149.00 MXN c/u. Le aviso en cuanto llegue (aprox. el 27 de noviembre); no paga nada hasta entonces.`;
+  `Listo, quedó agendado su pedido *BO-000012*:\n• Croquetas Adulto 18 kg\n   ${quantity} × $1,149.00 = *${money(quantity * 114900)}*\n\nLe aviso en cuanto llegue (aprox. el 27 de noviembre); no paga nada hasta entonces.`;
 
 function world() {
   const gateStore = new InMemoryConversationGateStore(() => new Date(T0));

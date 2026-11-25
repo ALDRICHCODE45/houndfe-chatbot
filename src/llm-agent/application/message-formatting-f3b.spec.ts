@@ -71,10 +71,33 @@ describe('message formatting F3b: bank details (S2, S4)', () => {
     );
   });
 
-  it('keeps bank values from breaking the bold labels (plain)', () => {
+  it('[F3b-fix H2] shows bank values exactly as configured (no plain())', () => {
+    const block = minimalPaymentInstructions({
+      ...BANK,
+      beneficiary: 'Hound_Fe SA de CV',
+      accountNumber: '****6789',
+    });
+    expect(block).toContain('\n*Beneficiario:* Hound_Fe SA de CV\n');
+    expect(block).toContain('\n*Cuenta:* ****6789\n');
+    expect(applyCustomerStyle(block, tu)).toContain('\n*Cuenta:* ****6789\n');
+  });
+
+  it('[F3b-fix H2] a missing or empty bank value omits its line', () => {
     expect(
-      minimalPaymentInstructions({ ...BANK, beneficiary: '*Hound_Fe*' }),
-    ).toContain('*Beneficiario:* Hound Fe');
+      minimalPaymentInstructions({
+        ...BANK,
+        accountNumber: '',
+        beneficiary: '   ',
+        clabe: null as unknown as string,
+      }),
+    ).toBe(
+      [
+        '*Pago por transferencia*',
+        '*Banco:* BBVA',
+        '',
+        'Cuando haga la transferencia, envíe aquí la foto de su comprobante.',
+      ].join('\n'),
+    );
   });
 
   it('keeps the payment question short', () => {
@@ -210,6 +233,28 @@ describe('message formatting F3b: pay-in-store hold (S2)', () => {
         location: { name: 'Sucursal *Norte*', address: null, hours: null },
       }),
     ).toContain('Páselo a recoger y pagar en *Sucursal Norte*\n\nSi no pasa');
+  });
+
+  it('[F3b-fix H3] a name emptied by plain() reads «la tienda», address and hours kept', () => {
+    expect(
+      payInStoreHeldReply({
+        folio: 'B-1',
+        holdUntil: HOLD_UNTIL,
+        location: {
+          name: '**',
+          address: { formatted: 'Av. Juárez 123, Centro.' },
+          hours: { summary: 'Lunes a sábado: 09:00–18:00' },
+        } as never,
+      }),
+    ).toContain(
+      [
+        '',
+        'Páselo a recoger y pagar en la tienda',
+        'Av. Juárez 123, Centro',
+        '*Horario:* Lunes a sábado: 09:00–18:00',
+        '',
+      ].join('\n'),
+    );
   });
 });
 
@@ -354,6 +399,35 @@ describe('message formatting F3b: order created (S2, S3, S4)', () => {
     expect(applyCustomerStyle(reply, tu)).toContain(
       '\nRecógelo en *Sucursal Centro*\n',
     );
+  });
+
+  it('[F3b-fix H3] pickup: a name emptied by plain() reads «la tienda», same as the hold', () => {
+    const location = {
+      name: '~~',
+      address: { formatted: 'Av. Juárez 123, Centro.' },
+      hours: null,
+    } as never;
+    expect(minimalOrderCreatedReply(sale, { mode: 'pickup' }, location)).toBe(
+      [
+        '*¡Pedido registrado!* ✅',
+        '*Folio:* A-12',
+        '*Total a pagar:* $1,250.00 (recoge en tienda, sin costo de envío)',
+        '',
+        'Recójalo en la tienda',
+        'Av. Juárez 123, Centro',
+      ].join('\n'),
+    );
+    expect(
+      minimalOrderCreatedReply(
+        sale,
+        { mode: 'pickup' },
+        {
+          name: 'Sucursal Centro.',
+          address: null,
+          hours: null,
+        },
+      ),
+    ).toMatch(/\nRecójalo en \*Sucursal Centro\*$/);
   });
 
   it('free shipping, no shipping and no folio', () => {

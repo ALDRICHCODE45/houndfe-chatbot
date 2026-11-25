@@ -83,3 +83,44 @@ export function itemLine(label: string): string {
 export function itemDetail(text: string): string {
   return `${ITEM_DETAIL_INDENT}${text}`;
 }
+
+/** The pickup branch as the store block needs it (structural, any source). */
+export interface StoreLinesLocation {
+  name: string;
+  address: { formatted: string } | null;
+  hours: { summary: string } | null;
+}
+
+const withoutFinalDot = (text: string): string =>
+  text.trim().replace(/\.+$/, '').trim();
+
+/**
+ * Message formatting F3b-fix H3: the one store block of the server copy
+ * (order created, pay-in-store hold, pickup reminder). «<lead><name>» with
+ * the bold branch name, then the address and the bold «Horario:» line, each
+ * on its own line; values are `plain` and the name and address lose their
+ * final dots. A name emptied by `plain()` reads «la tienda» (address and
+ * hours still shown); «la tienda» alone closes the sentence with a dot.
+ */
+export function storeLines(
+  lead: string,
+  location: StoreLinesLocation,
+): string[] {
+  const name = withoutFinalDot(plain(location.name));
+  const address =
+    location.address === null
+      ? ''
+      : withoutFinalDot(plain(location.address.formatted));
+  const hours = location.hours === null ? '' : plain(location.hours.summary);
+  const details = [
+    ...(address === '' ? [] : [address]),
+    ...(hours === '' ? [] : [`${bold('Horario:')} ${hours}`]),
+  ];
+  const place =
+    name !== ''
+      ? bold(name)
+      : details.length === 0
+        ? 'la tienda.'
+        : 'la tienda';
+  return [`${lead}${place}`, ...details];
+}

@@ -63,7 +63,7 @@ describe('receipt notices in the stored customer style (S1)', () => {
     const { text, styleFor } = await sentText(() => Promise.resolve(TU));
     expect(styleFor).toHaveBeenCalledWith('5215550001111');
     expect(text).toBe(
-      'Confirmamos un pago de tu pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puedes enviarnos el comprobante del resto cuando lo tengas.',
+      'Confirmamos un pago de tu pedido *F-1*.\n*Saldo pendiente:* $1,234.56\n\nPuedes enviarnos el comprobante del resto cuando lo tengas.',
     );
   });
 
@@ -83,7 +83,7 @@ describe('receipt notices in the stored customer style (S1)', () => {
       templateArgs: { folio: 'F-1', payInStoreHold: true },
     });
     expect(renderNotificationText(row, TU)).toBe(
-      'Tu pedido F-1 se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante. Si todavía lo quieres, con gusto te ayudo a pedirlo de nuevo.',
+      'Tu pedido *F-1* se canceló porque venció el plazo para recogerlo y pagarlo en tienda, así que no pudimos aplicar este comprobante.\n\nSi todavía lo quieres, con gusto te ayudo a pedirlo de nuevo.',
     );
   });
 
@@ -96,7 +96,7 @@ describe('receipt notices in the stored customer style (S1)', () => {
       },
     });
     expect(renderNotificationText(row, TU)).toBe(
-      'No pudimos confirmar tu comprobante del pedido F-1: el monto no coincide con su pedido. ¿Me puedes enviar otro comprobante?',
+      'No pudimos confirmar tu comprobante del pedido *F-1*: el monto no coincide con su pedido.\n\n¿Me puedes enviar otro comprobante?',
     );
     expect(renderNotificationText(row, null)).toBe(renderNotificationText(row));
   });

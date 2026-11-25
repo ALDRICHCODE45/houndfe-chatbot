@@ -31,9 +31,9 @@ const ddescribe = DOCKER ? describe : describe.skip;
 type Row = Record<string, unknown>;
 const OWNER = 'odd6c.worker';
 const AMOUNT_CONFIRM =
-  'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.';
+  'Confirmamos un pago de su pedido *F-1*.\n*Saldo pendiente:* $1,234.56\n\nPuede enviarnos el comprobante del resto cuando lo tenga.';
 const ATTACHED_PENDING =
-  'Recibimos su comprobante del pedido F-1. Lo estamos revisando y le avisamos en cuanto se confirme.';
+  'Recibimos su comprobante del pedido *F-1*. Lo estamos revisando y le avisamos en cuanto se confirme.';
 
 type SendHandler = (message: OutboundText) => Promise<SendResult>;
 const fakeSender = (handler: SendHandler) => {

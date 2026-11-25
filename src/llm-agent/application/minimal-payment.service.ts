@@ -33,7 +33,7 @@ import {
   ReceiptReviewStatusRegistry,
   type ReceiptReviewStatusPort,
 } from '../domain/receipt-review-status';
-import { bold, money, plain, sectionTitle } from '../domain/whatsapp-format';
+import { bold, money, sectionTitle } from '../domain/whatsapp-format';
 import {
   parseMinimalCart,
   type MinimalCartState,
@@ -67,7 +67,9 @@ export const MINIMAL_PAYMENT_UNAVAILABLE_REPLY =
 /**
  * Transfer instructions from the backend's active bank account, as a block
  * (message formatting S2): bold title, one bold label per line, the photo
- * instruction apart. Values are `plain` so they never break the markup.
+ * instruction apart. F3b-fix H2: values are shown exactly as configured
+ * (never `plain`: a CLABE, account or masked «****6789» must stay intact);
+ * a missing or empty value omits its line.
  */
 export function minimalPaymentInstructions(
   detail: Pick<
@@ -75,14 +77,16 @@ export function minimalPaymentInstructions(
     'bankName' | 'beneficiary' | 'clabe' | 'accountNumber'
   >,
 ): string {
-  const field = (label: string, value: string) =>
-    `${bold(`${label}:`)} ${plain(value)}`;
+  const field = (label: string, value: string | null | undefined) => {
+    const shown = typeof value === 'string' ? value.trim() : '';
+    return shown === '' ? [] : [`${bold(`${label}:`)} ${shown}`];
+  };
   return [
     sectionTitle('Pago por transferencia'),
-    field('Banco', detail.bankName),
-    field('Beneficiario', detail.beneficiary),
-    field('CLABE', detail.clabe),
-    field('Cuenta', detail.accountNumber),
+    ...field('Banco', detail.bankName),
+    ...field('Beneficiario', detail.beneficiary),
+    ...field('CLABE', detail.clabe),
+    ...field('Cuenta', detail.accountNumber),
     '',
     'Cuando haga la transferencia, envíe aquí la foto de su comprobante.',
   ].join('\n');
