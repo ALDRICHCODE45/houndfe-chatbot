@@ -9,7 +9,7 @@ import {
   CONVERSATION_STORE,
   type ConversationStore,
 } from '../../conversation/domain/conversation-store';
-import type { CartItem, CartState } from '../../sale-flow/domain/cart-state';
+import type { CartItem, CartPet } from '../../sale-flow/domain/cart-state';
 import type { BackorderBot } from '../../backorders/domain/backorder';
 import { backorderDateTime } from '../domain/backorder-copy';
 import type { CartEvaluationResult } from '../../chatbot-api/domain/dtos/pricing.dto';
@@ -24,6 +24,7 @@ import {
 import {
   minimalBackorderSuffix,
   minimalLineLabel,
+  minimalPetSuffix,
   minimalPromotionSuffix,
 } from '../domain/minimal-order-confirmation';
 
@@ -35,6 +36,14 @@ const backorderRefSchema = z.strictObject({
   variantName: z.string().nullable(),
   reservedUntil: z.iso.datetime({ offset: true }),
 });
+/** Longest pet name the backend accepts (contract §2: name 1-60). */
+export const CART_PET_NAME_MAX = 60;
+// Multi-pet T5a (S16, S17): a backend pet of the customer (UUID, never a
+// local or legacy ref) with its display name.
+const cartPetSchema = z.strictObject({
+  id: z.uuid(),
+  name: z.string().min(1).max(CART_PET_NAME_MAX).regex(/\S/),
+});
 const lineSchema = z.strictObject({
   productId: z.uuid(),
   variantId: z.uuid().optional(),
@@ -43,6 +52,9 @@ const lineSchema = z.strictObject({
   // Present only on the line of a RESERVED backorder (priced at its final
   // price); absent on every ordinary line.
   backorder: backorderRefSchema.optional(),
+  // Multi-pet T5a: the backend pet this line is for (checkout `petId`).
+  // Absent on pet-less lines and on every backorder line.
+  pet: cartPetSchema.optional(),
 });
 // Last order created by the minimal route; informational, never a sale input.
 const placedSaleSchema = z.strictObject({
@@ -86,6 +98,10 @@ const cartSchema = z.strictObject({
   shipping: z
     .union([minimalShippingQuoteSchema, minimalPickupSchema])
     .optional(),
+  // Multi-pet T5a (S17): the pet the customer chose in the which-pet
+  // question; lines added or changed afterwards are for it. Cleared with
+  // the cart when the order is placed. Absent: no choice.
+  currentPet: cartPetSchema.optional(),
 });
 export type MinimalCartState = z.infer<typeof cartSchema>;
 
@@ -103,7 +119,7 @@ export function parseMinimalCart(raw: unknown): MinimalCartState | null {
   return parsed.data;
 }
 export const minimalCartInput = lineSchema
-  .omit({ unitPriceCents: true, backorder: true })
+  .omit({ unitPriceCents: true, backorder: true, pet: true })
   .extend({
     quantity: z.number().int().nonnegative(),
   });
@@ -165,20 +181,69 @@ const sameProduct = (
   a: Pick<CartItem, 'productId' | 'variantId'>,
   b: Pick<CartItem, 'productId' | 'variantId'>,
 ) => a.productId === b.productId && a.variantId === b.variantId;
-/** The stored shape of a quoted line; a backorder line keeps its reservation. */
+/**
+ * The stored shape of a quoted line; a backorder line keeps its reservation
+ * and a pet line its pet.
+ */
 const storedLine = ({
   productId,
   variantId,
   quantity,
   unitPriceCents,
   backorder,
+  pet,
 }: QuotedItem): CartItem => ({
   productId,
   ...(variantId ? { variantId } : {}),
   quantity,
   unitPriceCents,
   ...(backorder ? { backorder } : {}),
+  ...(pet ? { pet } : {}),
 });
+/** The cart after a line write: fresh lines and total, no order key or
+ * shipping, the customer's current pet kept. */
+const rewritten = (
+  cart: MinimalCartState,
+  quote: Extract<MinimalCartResult, { ok: true }>,
+): MinimalCartState => ({
+  items: quote.items.map(storedLine),
+  idempotencyKey: '',
+  expectedTotalCents: quote.totalCents,
+  ...(cart.currentPet === undefined ? {} : { currentPet: cart.currentPet }),
+});
+/**
+ * Multi-pet T5a: the pet of a cart write, normalized and valid, else
+ * `undefined` (the line gets no pet; an invalid pet never reaches the store,
+ * where it would make the cart unreadable).
+ */
+function validPet(pet: CartPet | null | undefined): CartPet | undefined {
+  if (pet === null || pet === undefined) return undefined;
+  const parsed = cartPetSchema.safeParse({
+    id: pet.id,
+    name:
+      typeof pet.name === 'string'
+        ? pet.name.replace(/\s+/g, ' ').trim()
+        : pet.name,
+  });
+  return parsed.success ? parsed.data : undefined;
+}
+/**
+ * Multi-pet T5a R3 (S9): one line per product (and presentation). A new line
+ * is for `pet`; fewer units keep the line's pet; more units keep it only
+ * when they are for the same pet; another pet, or a pet and no pet, make it
+ * one line without pet (the backend refuses lines that disagree).
+ */
+function mergedPet(
+  existing: CartItem | undefined,
+  pet: CartPet | undefined,
+  quantity: number,
+): CartPet | undefined {
+  if (existing === undefined) return pet;
+  if (quantity <= existing.quantity) return existing.pet;
+  return existing.pet !== undefined && existing.pet.id === pet?.id
+    ? existing.pet
+    : undefined;
+}
 const money = (value: number) => Number.isSafeInteger(value) && value >= 0;
 
 /** Cart only: no reservation, sale or payment calls. Prices are server-derived. */
@@ -304,11 +369,13 @@ export class MinimalCartService {
   }
 
   /** Quantity is the desired TOTAL for this line, not an increment; zero removes. */
+  /** `pet`: the customer's current pet (T5a R2); never model input. */
   async setItem(
     senderId: string,
     input: MinimalCartInput,
     allowedIds: ReadonlySet<string>,
     onInvalidVariant?: VariantDiagnosticObserver,
+    pet?: CartPet,
   ): Promise<MinimalCartResult> {
     return this.changeItem(
       senderId,
@@ -316,6 +383,7 @@ export class MinimalCartService {
       allowedIds,
       'set',
       onInvalidVariant,
+      pet,
     );
   }
 
@@ -325,6 +393,7 @@ export class MinimalCartService {
     input: MinimalCartAdjustmentInput,
     allowedIds: ReadonlySet<string>,
     onInvalidVariant?: VariantDiagnosticObserver,
+    pet?: CartPet,
   ): Promise<MinimalCartResult> {
     return this.changeItem(
       senderId,
@@ -332,7 +401,56 @@ export class MinimalCartService {
       allowedIds,
       'adjust',
       onInvalidVariant,
+      pet,
     );
+  }
+
+  /** T5a R2 (S17): the pet the customer chose for this cart, or `null`. */
+  async currentPet(senderId: string): Promise<CartPet | null> {
+    try {
+      return (
+        this.read((await this.store.get(senderId))?.data.minimalCart)
+          ?.currentPet ?? null
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * T5a R2 (S17): remember (or, with `null`, forget) the pet the customer
+   * chose, in one CAS that keeps every other field; never retried. Refused
+   * (`false`) for an invalid pet, an unreadable cart or an order in flight.
+   */
+  async setCurrentPet(senderId: string, pet: CartPet | null): Promise<boolean> {
+    try {
+      const chosen = pet === null ? null : validPet(pet);
+      if (chosen === undefined) return false;
+      const raw = structuredClone(
+        (await this.store.get(senderId))?.data.minimalCart,
+      );
+      const cart = this.read(raw);
+      if (!cart || cart.idempotencyKey !== '') return false;
+      const current = cart.currentPet;
+      if (
+        chosen === null
+          ? current === undefined
+          : current?.id === chosen.id && current.name === chosen.name
+      )
+        return true;
+      const next: MinimalCartState = structuredClone({ ...cart });
+      if (chosen === null) delete next.currentPet;
+      else next.currentPet = chosen;
+      if (!this.store.commitMinimalCart) return false;
+      return await this.store.commitMinimalCart(
+        senderId,
+        raw,
+        next,
+        new Date().toISOString(),
+      );
+    } catch {
+      return false;
+    }
   }
 
   /** Retain exact existing pairs with unchanged quantities, in one CAS; never retry. */
@@ -361,11 +479,7 @@ export class MinimalCartService {
       const dropped = cart.items.filter((line) => !items.includes(line));
       const quote = await this.quote(senderId, items);
       if (!quote.ok || items.length === cart.items.length) return quote;
-      const next: CartState = {
-        items: quote.items.map(storedLine),
-        idempotencyKey: '',
-        expectedTotalCents: quote.totalCents,
-      };
+      const next = rewritten(cart, quote);
       if (!this.store.commitMinimalCart)
         return { ok: false, error: 'cart_unavailable' };
       const saved = await this.store.commitMinimalCart(
@@ -406,6 +520,8 @@ export class MinimalCartService {
   async addItems(
     senderId: string,
     lines: Array<Pick<CartItem, 'productId' | 'variantId' | 'quantity'>>,
+    /** T5a R2: the customer's current pet; never model input. */
+    pet?: CartPet,
   ): Promise<MinimalCartResult> {
     try {
       if (
@@ -427,6 +543,7 @@ export class MinimalCartService {
       if (!cart) return { ok: false, error: 'invalid_cart' };
       if (cart.idempotencyKey !== '')
         return { ok: false, error: 'order_unresolved' };
+      const tag = validPet(pet);
       const items: CartItem[] = cart.items.map((item) => ({ ...item }));
       for (const line of lines) {
         const identity = {
@@ -434,23 +551,28 @@ export class MinimalCartService {
           ...(line.variantId ? { variantId: line.variantId } : {}),
         };
         const existing = items.find((item) => sameLine(item, identity));
-        if (existing) existing.quantity += line.quantity;
-        else
+        if (existing) {
+          const merged = mergedPet(
+            existing,
+            tag,
+            existing.quantity + line.quantity,
+          );
+          existing.quantity += line.quantity;
+          if (merged === undefined) delete existing.pet;
+          else existing.pet = merged;
+        } else
           items.push({
             ...identity,
             quantity: line.quantity,
             unitPriceCents: 0,
+            ...(tag === undefined ? {} : { pet: tag }),
           });
       }
       if (items.some((item) => !Number.isSafeInteger(item.quantity)))
         return { ok: false, error: 'invalid_quantity_or_identity' };
       const quote = await this.quote(senderId, items);
       if (!quote.ok) return quote;
-      const next: CartState = {
-        items: quote.items.map(storedLine),
-        idempotencyKey: '',
-        expectedTotalCents: quote.totalCents,
-      };
+      const next = rewritten(cart, quote);
       if (!this.store.commitMinimalCart)
         return { ok: false, error: 'cart_unavailable' };
       const saved = await this.store.commitMinimalCart(
@@ -526,11 +648,7 @@ export class MinimalCartService {
         return { ok: false, error: 'invalid_quantity_or_identity' };
       const quote = await this.quote(senderId, [...cart.items, parsed.data]);
       if (!quote.ok) return quote;
-      const next: CartState = {
-        items: quote.items.map(storedLine),
-        idempotencyKey: '',
-        expectedTotalCents: quote.totalCents,
-      };
+      const next = rewritten(cart, quote);
       if (!this.store.commitMinimalCart)
         return { ok: false, error: 'cart_unavailable' };
       const saved = await this.store.commitMinimalCart(
@@ -551,6 +669,7 @@ export class MinimalCartService {
     allowedIds: ReadonlySet<string>,
     operation: 'set' | 'adjust',
     onInvalidVariant?: VariantDiagnosticObserver,
+    pet?: CartPet,
   ): Promise<MinimalCartResult> {
     try {
       const parsed =
@@ -595,11 +714,7 @@ export class MinimalCartService {
             request,
           );
           if (!quote.ok) return quote;
-          const next: CartState = {
-            items: quote.items.map(storedLine),
-            idempotencyKey: '',
-            expectedTotalCents: quote.totalCents,
-          };
+          const next = rewritten(cart, quote);
           if (!this.store.commitMinimalCart)
             return { ok: false, error: 'cart_unavailable' };
           const saved = await this.store.commitMinimalCart(
@@ -625,12 +740,14 @@ export class MinimalCartService {
       if (!Number.isSafeInteger(quantity) || quantity < 0)
         return { ok: false, error: 'invalid_quantity_or_identity' };
       const items = cart.items.filter((i) => !sameLine(i, request));
+      const tag = mergedPet(existing, validPet(pet), quantity);
       if (quantity > 0)
         items.push({
           productId: request.productId,
           ...(request.variantId ? { variantId: request.variantId } : {}),
           quantity,
           unitPriceCents: 0,
+          ...(tag === undefined ? {} : { pet: tag }),
         });
       const quote = await this.quote(
         senderId,
@@ -639,11 +756,7 @@ export class MinimalCartService {
         request,
       );
       if (!quote.ok) return quote;
-      const next: CartState = {
-        items: quote.items.map(storedLine),
-        idempotencyKey: '',
-        expectedTotalCents: quote.totalCents,
-      };
+      const next = rewritten(cart, quote);
       if (!this.store.commitMinimalCart)
         return { ok: false, error: 'cart_unavailable' };
       const saved = await this.store.commitMinimalCart(
@@ -658,7 +771,7 @@ export class MinimalCartService {
     }
   }
 
-  private read(raw: unknown): CartState | null {
+  private read(raw: unknown): MinimalCartState | null {
     return parseMinimalCart(raw);
   }
 
@@ -853,14 +966,15 @@ export class MinimalCartService {
 /** Stable short digest of cart lines; order-independent. */
 export function minimalCartFingerprint(
   items: ReadonlyArray<
-    Pick<CartItem, 'productId' | 'variantId' | 'quantity' | 'backorder'>
+    Pick<CartItem, 'productId' | 'variantId' | 'quantity' | 'backorder' | 'pet'>
   >,
 ): string {
   const lines = items
     .map(
       (item) =>
         `${item.productId}|${item.variantId ?? ''}|${item.quantity}` +
-        (item.backorder === undefined ? '' : `|${item.backorder.id}`),
+        (item.backorder === undefined ? '' : `|${item.backorder.id}`) +
+        (item.pet === undefined ? '' : `|pet:${item.pet.id}`),
     )
     .sort();
   return createHash('sha256')
@@ -895,7 +1009,7 @@ export function minimalCartReply(result: MinimalCartResult): string {
   const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
   const lines = result.items.map(
     (i) =>
-      `• ${minimalLineLabel(i.name, i.variantName)}: ${i.quantity} × ${mxn(i.unitPriceCents)}; importe ${mxn(i.finalPriceCents)}${minimalPromotionSuffix(i)}${minimalBackorderSuffix(i)}`,
+      `• ${minimalLineLabel(i.name, i.variantName)}: ${i.quantity} × ${mxn(i.unitPriceCents)}; importe ${mxn(i.finalPriceCents)}${minimalPromotionSuffix(i)}${minimalBackorderSuffix(i)}${minimalPetSuffix(i)}`,
   );
   return `Su carrito:\n${lines.join('\n')}\nTotal de productos: ${mxn(result.totalCents)}.${result.promotionEvaluationStatus === 'needs_human_review' ? '\nLas promociones requieren revisión del equipo.' : ''}\n${MINIMAL_CART_SUMMARY_TAIL}${kept}`;
 }

@@ -59,6 +59,7 @@ import {
   type ForgetPetOutcome,
   type KnownPet,
 } from '../../customer-profile/application/customer-pets.service';
+import type { CartPet } from '../../sale-flow/domain/cart-state';
 import {
   chosenPetOptionPromptLine,
   foldPetName,
@@ -258,6 +259,7 @@ import {
   REORDER_DECLINE_REPLY,
   REORDER_NEXT_STEP,
   REORDER_UNAVAILABLE_REPLY,
+  reorderPetEmptyReply,
   prepareMinimalReorder,
   type MinimalReorderPresentation,
 } from './minimal-reorder';
@@ -816,6 +818,15 @@ const REORDER_INSTRUCTIONS_FRAGMENT =
   ' Use getLastOrder solo para un pedido ANTERIOR ya entregado o cerrado: si el cliente pide repetirlo ("lo mismo de la vez pasada", "lo de siempre", "repetir mi último pedido", "otra vez lo mismo", "mi pedido anterior", "¿qué pedí la última vez?"), llame getLastOrder sin argumentos: la aplicación presenta ese pedido con existencias y precios de hoy y pide la confirmación. Nunca invente productos, cantidades ni precios de pedidos anteriores, y no agregue nada al carrito por su cuenta. ' +
   'Si el cliente pide ver el resumen o el estado de SU pedido actual ("el resumen de mi pedido", "mi resumen", "ver mi pedido"), no llame getLastOrder: la aplicación muestra el resumen del pedido o carrito actual, o el pedido que ya registró; si no hay ninguno, dígalo y ofrezca ayudarle a armar su compra.';
 
+/** T5b (S4, S14): the per-pet reorder; added only with the pet store. */
+export const REORDER_PET_INSTRUCTIONS_FRAGMENT =
+  ' Si el cliente pide lo de siempre o su último pedido para UNA mascota nombrada ("lo mismo de siempre para Max", "lo de siempre de Bruno", "¿qué le compré a Max la última vez?"), llame getLastOrder con petName: el nombre de esa mascota tal como lo escribió; la aplicación presenta solo lo que fue para esa mascota. Si responde several_pets_with_that_name, llame askWhichPet; si responde no_pet_with_that_name, pregunte de qué mascota habla; si responde pet_memory_unavailable, dígale con amabilidad que ahora no puede buscar lo de esa mascota y nunca llame getLastOrder sin argumentos en su lugar. Sin un nombre de mascota en el mensaje, llame getLastOrder sin argumentos.';
+
+const GET_LAST_ORDER_DESCRIPTION =
+  'Consulta el último pedido de este cliente (por su número de WhatsApp) y pide a la aplicación presentarlo con existencias y precios de hoy para que el cliente confirme si lo agrega al carrito. No modifica el carrito. No acepta argumentos.';
+const GET_LAST_ORDER_PET_DESCRIPTION =
+  'Consulta el último pedido de este cliente (por su número de WhatsApp) y pide a la aplicación presentarlo con existencias y precios de hoy para que el cliente confirme si lo agrega al carrito. No modifica el carrito. Sin argumentos: el último pedido completo. Con petName (solo si el cliente nombró a una de sus mascotas): el último pedido con algo para esa mascota, y solo lo que fue para ella.';
+
 const CHECKOUT_TOOL_NAMES: ReadonlySet<string> = new Set([
   'lookupCheckoutCustomer',
   'selectCheckoutAddress',
@@ -1194,6 +1205,23 @@ function customerTexts(turns: readonly MinimalCatalogTurn[]): string[] {
 
 // Minimal SDK route: in-memory catalog history; optional durable cart and human
 // inquiry capabilities. No checkout, payment or inventory reservations.
+/**
+ * T5a R1: the cart pet of a known BACKEND pet with a name (`ref`
+ * `backend:<uuid>`); local and legacy pets never go on a cart line.
+ */
+function backendCartPet(
+  known: readonly KnownPet[],
+  ref: string,
+): CartPet | undefined {
+  const pet = known.find(
+    (candidate) => candidate.ref === ref && candidate.source === 'backend',
+  );
+  const name = pet?.name?.trim();
+  return pet === undefined || !ref.startsWith('backend:') || !name
+    ? undefined
+    : { id: ref.slice('backend:'.length), name };
+}
+
 @Injectable()
 export class MinimalCatalogAgentService {
   private readonly model: string;
@@ -2822,6 +2850,42 @@ export class MinimalCatalogAgentService {
     );
   }
 
+  /**
+   * T5b (S4): the pet a «lo de siempre para <nombre>» names: exactly one
+   * known pet with that folded name (with 2+, the pet the customer chose in
+   * the which-pet question when it is one of them). A backend pet is read by
+   * id; a local or legacy pet has no orders (`{ name }` only). Only an
+   * explicit name gets here: the cart's current pet is never implied.
+   */
+  private async reorderPet(
+    senderId: string,
+    petName: string,
+  ): Promise<{ pet: CartPet | { name: string } } | { error: string }> {
+    if (this.pets === undefined || !this.petListLoaded(senderId))
+      return { error: 'pet_memory_unavailable' };
+    const wanted = foldPetName(petName);
+    const matches = this.pets
+      .knownPets(senderId)
+      .filter(
+        (pet) => pet.name !== undefined && foldPetName(pet.name) === wanted,
+      );
+    let match = matches.length === 1 ? matches[0] : undefined;
+    if (matches.length > 1) {
+      const current = await this.cart?.currentPet(senderId).catch(() => null);
+      match =
+        current === null || current === undefined
+          ? undefined
+          : matches.find((pet) => pet.ref === `backend:${current.id}`);
+      if (match === undefined) return { error: 'several_pets_with_that_name' };
+    }
+    if (match === undefined) return { error: 'no_pet_with_that_name' };
+    return {
+      pet: backendCartPet([match], match.ref) ?? {
+        name: (match.name ?? petName).trim(),
+      },
+    };
+  }
+
   /** S2: the reorder offer of the bot's latest message, if any. */
   private pendingReorder(senderId: string): ReorderOfferContext | null {
     return this.sessionStore.read(senderId).at(-1)?.reorderOffer ?? null;
@@ -2876,7 +2940,12 @@ export class MinimalCatalogAgentService {
     const priorShipping = this.shippingAvailable()
       ? await cart.shippingMode(senderId)
       : null;
-    const result = await cart.addItems(senderId, offer.items);
+    // T5a: a past order may hold lines for several pets; its lines are
+    // added without a pet. T5b (S15): a per-pet offer tags its own lines.
+    const result =
+      offer.pet === undefined
+        ? await cart.addItems(senderId, offer.items)
+        : await cart.addItems(senderId, offer.items, offer.pet);
     const code = result.ok
       ? 'none'
       : CART_TRACE_ERROR_CODES.has(result.error)
@@ -3256,6 +3325,7 @@ export class MinimalCatalogAgentService {
         'Consulte getCart si necesita recuperar o aclarar qué renglón se modifica, especialmente tras un reinicio. Nunca elija una presentación ni una cantidad por su cuenta; pregunte si faltan. ' +
         CART_VARIANT_GUIDANCE +
         REORDER_INSTRUCTIONS_FRAGMENT +
+        (this.pets === undefined ? '' : REORDER_PET_INSTRUCTIONS_FRAGMENT) +
         ' ' +
         'No envíe precios ni senderId: la aplicación los obtiene y confirma el resultado. Si getCart no logra verificar el carrito, no suponga que está vacío. ' +
         'El carrito no reserva existencias, no incluye envío y no crea pedidos. No ofrezca cobrar ni cerrar la compra en esta ruta. ' +
@@ -4288,6 +4358,7 @@ export class MinimalCatalogAgentService {
     }
     const line = this.chosenPetLine(senderId, option);
     if (line === null) return reply(STALE_BUTTON_FALLBACK);
+    await this.chooseCartPet(senderId, option.ref);
     return this.continuePetChoice(input, live.request, line);
   }
 
@@ -4338,6 +4409,7 @@ export class MinimalCatalogAgentService {
       return this.answerPetPurpose(input, live, option);
     const line = this.chosenPetLine(input.senderId, option);
     if (line === null) return null;
+    await this.chooseCartPet(input.senderId, option.ref);
     return this.continuePetChoice(input, live.request, line);
   }
 
@@ -4545,6 +4617,59 @@ export class MinimalCatalogAgentService {
       case 'failed':
         return answered(PET_CHOICE_UNAVAILABLE_REPLY, false);
     }
+  }
+
+  /**
+   * T5a R2 (S17): the which-pet answer replaces the cart's current pet: the
+   * chosen backend pet, else none (a local or legacy pet, or a pet that is no
+   * longer known). With this turn's pets not loaded only a repeat of the
+   * pet already chosen keeps it. Best effort: a failed write is logged and
+   * the request continues (its lines then simply carry no chosen pet).
+   */
+  private async chooseCartPet(senderId: string, ref: string): Promise<void> {
+    const cart = this.cart;
+    if (cart === undefined) return;
+    try {
+      let pet: CartPet | null;
+      if (this.petListLoaded(senderId))
+        pet = backendCartPet(this.pets?.knownPets(senderId) ?? [], ref) ?? null;
+      else {
+        const current = await cart.currentPet(senderId);
+        if (current !== null && ref === `backend:${current.id}`) return;
+        pet = null;
+      }
+      if (!(await cart.setCurrentPet(senderId, pet)))
+        this.logger.warn('cart current pet not recorded');
+    } catch (error) {
+      this.logger.warn(
+        `cart current pet not recorded: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+    }
+  }
+
+  /**
+   * T5a R2 (S17): the backend pet the cart lines written now are for: the
+   * pet the customer chose (kept on the cart) while still known, else the
+   * only known pet when it is a backend pet. `undefined` when this turn's
+   * pets are not loaded, for prospects (local pets) and the legacy pet.
+   * Never from model input.
+   */
+  private async cartPet(senderId: string): Promise<CartPet | undefined> {
+    const { cart, pets } = this;
+    if (
+      cart === undefined ||
+      pets === undefined ||
+      !this.petListLoaded(senderId)
+    )
+      return undefined;
+    const known = pets.knownPets(senderId);
+    const chosen = await cart.currentPet(senderId);
+    return (
+      (chosen === null
+        ? undefined
+        : backendCartPet(known, `backend:${chosen.id}`)) ??
+      (known.length === 1 ? backendCartPet(known, known[0].ref) : undefined)
+    );
   }
 
   /** T4c-2b: a pet store write waited at most PET_PREPARE_BUDGET_MS; past
@@ -5947,6 +6072,7 @@ export class MinimalCatalogAgentService {
           },
           allowedIds,
           traceInvalidVariant('adjustCartItem'),
+          await this.cartPet(context.senderId),
         );
         traceCartResult('adjustCartItem', result);
         cartReply.value =
@@ -5968,6 +6094,7 @@ export class MinimalCatalogAgentService {
         },
         allowedIds,
         traceInvalidVariant('setCartItem'),
+        await this.cartPet(context.senderId),
       );
       traceCartResult('setCartItem', result);
       cartReply.value = minimalCartReply(result);
@@ -6037,6 +6164,53 @@ export class MinimalCatalogAgentService {
         grounded.defaulted,
       );
     };
+    /**
+     * S2 / T5b: the getLastOrder body. Without a pet name it is the existing
+     * whole-order reorder; with one, that pet's lines only (S14, S15).
+     */
+    const presentLastOrder = async (
+      petName: string | undefined,
+    ): Promise<
+      { ok: true; presentedByApplication: true } | { ok: false; error: string }
+    > => {
+      if (reorderRun === null || cart === undefined)
+        return toolError('reorder_unavailable');
+      if (reorderRun.attempted)
+        return toolError('reorder_presentation_settled');
+      let pet: CartPet | { name: string } | undefined;
+      if (petName !== undefined) {
+        const resolved = await this.reorderPet(context.senderId, petName);
+        if ('error' in resolved) return toolError(resolved.error);
+        pet = resolved.pet;
+      }
+      reorderRun.attempted = true;
+      try {
+        reorderRun.value =
+          pet !== undefined && !('id' in pet)
+            ? {
+                reply: reorderPetEmptyReply(pet.name),
+                offer: null,
+                productIds: [],
+              }
+            : await prepareMinimalReorder(
+                chatbotApi,
+                cart,
+                context.senderId,
+                new Date(),
+                ...(pet === undefined ? [] : [pet]),
+              );
+      } catch {
+        reorderRun.value = {
+          reply: REORDER_UNAVAILABLE_REPLY,
+          offer: null,
+          productIds: [],
+        };
+      }
+      trace(
+        `tool getLastOrder result=${reorderRun.value.offer === null ? 'no_offer' : 'offer'} lines=${reorderRun.value.offer?.items.length ?? 0}${pet === undefined ? '' : ' pet=yes'}`,
+      );
+      return { ok: true as const, presentedByApplication: true as const };
+    };
     const withCart = cart
       ? {
           ...readTools,
@@ -6069,38 +6243,25 @@ export class MinimalCatalogAgentService {
           ...(reorderRun === null
             ? {}
             : {
-                getLastOrder: tool({
-                  description:
-                    'Consulta el último pedido de este cliente (por su número de WhatsApp) y pide a la aplicación presentarlo con existencias y precios de hoy para que el cliente confirme si lo agrega al carrito. No modifica el carrito. No acepta argumentos.',
-                  inputSchema: z.strictObject({}),
-                  strict: true,
-                  execute: async () => {
-                    if (reorderRun.attempted)
-                      return toolError('reorder_presentation_settled');
-                    reorderRun.attempted = true;
-                    try {
-                      reorderRun.value = await prepareMinimalReorder(
-                        chatbotApi,
-                        cart,
-                        context.senderId,
-                        new Date(),
-                      );
-                    } catch {
-                      reorderRun.value = {
-                        reply: REORDER_UNAVAILABLE_REPLY,
-                        offer: null,
-                        productIds: [],
-                      };
-                    }
-                    trace(
-                      `tool getLastOrder result=${reorderRun.value.offer === null ? 'no_offer' : 'offer'} lines=${reorderRun.value.offer?.items.length ?? 0}`,
-                    );
-                    return {
-                      ok: true as const,
-                      presentedByApplication: true as const,
-                    };
-                  },
-                }),
+                getLastOrder:
+                  this.pets === undefined
+                    ? tool({
+                        description: GET_LAST_ORDER_DESCRIPTION,
+                        inputSchema: z.strictObject({}),
+                        strict: true,
+                        execute: () => presentLastOrder(undefined),
+                      })
+                    : tool({
+                        description: GET_LAST_ORDER_PET_DESCRIPTION,
+                        inputSchema: z.strictObject({
+                          petName: z
+                            .string()
+                            .min(1)
+                            .max(PET_CHOICE_NAME_MAX_CHARS)
+                            .optional(),
+                        }),
+                        execute: ({ petName }) => presentLastOrder(petName),
+                      }),
               }),
           getCart: tool({
             description:

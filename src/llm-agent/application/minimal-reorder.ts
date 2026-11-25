@@ -4,6 +4,7 @@ import type { StockCheckResponse } from '../../chatbot-api/domain/dtos/catalog.d
 import type { OrderHistoryResponse } from '../../chatbot-api/domain/dtos/sales.dto';
 import { NotFoundError } from '../../chatbot-api/domain/errors';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
+import type { CartPet } from '../../sale-flow/domain/cart-state';
 import type { ReorderOfferContext } from '../domain/minimal-catalog-session.store';
 import { minimalLineLabel } from '../domain/minimal-order-confirmation';
 import type { MinimalCartService } from './minimal-cart.service';
@@ -26,6 +27,15 @@ export const REORDER_CHANGE_REPLY =
 export const REORDER_NEXT_STEP =
   '¿Desea agregar algo más o seguimos con su compra?';
 export const REORDER_BUTTONS_PROMPT = '¿Lo agrego a su carrito?';
+/**
+ * T5b (S4): no order for that pet — the pet has no orders (`200 []`), the
+ * backend does not know it (`404 PET_NOT_FOUND`), or it is not a backend pet.
+ * `{pet}` is the pet's name.
+ */
+export const REORDER_PET_EMPTY_REPLY =
+  'Todavía no encuentro pedidos anteriores para {pet}. ¿Qué producto busca?';
+export const reorderPetEmptyReply = (petName: string): string =>
+  REORDER_PET_EMPTY_REPLY.replace('{pet}', petName);
 
 export type MinimalReorderPresentation = {
   reply: string;
@@ -102,10 +112,14 @@ export function shortOrderDate(iso: string | null, now: Date): string | null {
   return year === mexicoCityDate(now).year ? label : `${label} ${year}`;
 }
 
-/** Same product/presentation lines of one order merged, in order. */
-function orderLines(order: OrderHistoryResponse): Line[] {
+/**
+ * Same product/presentation lines of one order merged, in order. With a pet
+ * id (T5b S15), only the lines that were for that pet.
+ */
+function orderLines(order: OrderHistoryResponse, petId?: string): Line[] {
   const lines: Line[] = [];
   for (const item of order.items) {
+    if (petId !== undefined && item.pet?.id !== petId) continue;
     const variantId = item.variantId ?? undefined;
     const same = lines.find(
       (line) =>
@@ -166,19 +180,38 @@ export async function prepareMinimalReorder(
   cart: MinimalCartService,
   senderId: string,
   now: Date,
+  /**
+   * T5b (S14, S15): a backend pet: its order history (`?petId`), the newest
+   * order with a line for it and only those lines; a yes tags them for it.
+   */
+  pet?: CartPet,
 ): Promise<MinimalReorderPresentation> {
   const phone = parseMexicanWhatsAppPhone(senderId);
-  if (phone === null) return empty(REORDER_EMPTY_REPLY);
+  const none = empty(
+    pet === undefined ? REORDER_EMPTY_REPLY : reorderPetEmptyReply(pet.name),
+  );
+  if (phone === null) return none;
   let history: OrderHistoryResponse[];
   try {
-    history = await api.getOrderHistory(phone.phone, phone.phoneCountryCode);
-  } catch {
+    history =
+      pet === undefined
+        ? await api.getOrderHistory(phone.phone, phone.phoneCountryCode)
+        : await api.getOrderHistory(phone.phone, phone.phoneCountryCode, {
+            petId: pet.id,
+          });
+  } catch (error) {
+    // Contract §6: with ?petId a 404 is PET_NOT_FOUND (unknown pet or phone).
+    if (pet !== undefined && error instanceof NotFoundError) return none;
     return empty(REORDER_UNAVAILABLE_REPLY);
   }
-  const last = history.find((order) => order.items.length > 0);
-  if (last === undefined) return empty(REORDER_EMPTY_REPLY);
+  const last = history.find((order) =>
+    pet === undefined
+      ? order.items.length > 0
+      : order.items.some((item) => item.pet?.id === pet.id),
+  );
+  if (last === undefined) return none;
   const checked: Checked[] = [];
-  for (const line of orderLines(last)) {
+  for (const line of orderLines(last, pet?.id)) {
     try {
       checked.push(checkLine(line, await api.getStock(line.productId)));
     } catch (error) {
@@ -221,11 +254,16 @@ export async function prepareMinimalReorder(
       );
     }
   }
-  const parts = [
-    `Su último pedido${details.length === 0 ? '' : ` (${details.join(', ')})`} fue:`,
-    ...lines,
-    `El total de esa vez fue ${mxn(last.totalCents)}.`,
-  ];
+  const when = details.length === 0 ? '' : ` (${details.join(', ')})`;
+  // T5b: the sale total covers every pet's lines, so a per-pet offer omits it.
+  const parts =
+    pet === undefined
+      ? [
+          `Su último pedido${when} fue:`,
+          ...lines,
+          `El total de esa vez fue ${mxn(last.totalCents)}.`,
+        ]
+      : [`Lo último que pidió para ${pet.name}${when} fue:`, ...lines];
   if (quote === null || !quote.ok)
     return empty(
       [
@@ -258,6 +296,7 @@ export async function prepareMinimalReorder(
         ...(variantId === undefined ? {} : { variantId }),
         quantity,
       })),
+      ...(pet === undefined ? {} : { pet: { id: pet.id, name: pet.name } }),
     },
     productIds: [...new Set(available.map((line) => line.productId))],
   };

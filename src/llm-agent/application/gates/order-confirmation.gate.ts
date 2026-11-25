@@ -31,6 +31,10 @@ const line = z.strictObject({
       reservedUntil: z.string().min(1),
     })
     .optional(),
+  // Multi-pet T5a: absent on pet-less lines.
+  pet: z
+    .strictObject({ id: z.string().min(1), name: z.string().min(1) })
+    .optional(),
 });
 const shipping = z.union([
   z.strictObject({

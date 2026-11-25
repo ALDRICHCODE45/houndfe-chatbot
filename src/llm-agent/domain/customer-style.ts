@@ -289,6 +289,7 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['¿Qué desea hacer?', '¿Qué quieres hacer?'],
   // S2 reorder offer, its buttons and replies.
   ['Su último pedido', 'Tu último pedido'],
+  ['Lo último que pidió para ', 'Lo último que pediste para '],
   ['Sí, agréguelo', 'Sí, agrégalo'],
   [
     '¿Desea agregar algo más o seguimos con su compra?',
