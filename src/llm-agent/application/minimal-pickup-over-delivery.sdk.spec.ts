@@ -57,9 +57,10 @@ const freeQuote = (): ShippingQuoteResponse => ({
   currency: 'MXN',
   eta: { days: 1, reason: null },
 });
-const DELIVERY_SUMMARY = /^Confirm[ae] (sus|tus) datos de entrega:/m;
+// Message formatting F3a: the bold heading line, usted or tú.
+const DELIVERY_SUMMARY = /^\*Confirm[ae] (sus|tus) datos de entrega\*$/m;
 const ORDER_ENDING =
-  'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.';
+  '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
 
 async function setup() {
   const store = new InMemoryConversationStore();
@@ -268,7 +269,7 @@ describe('S2 (N17) store pickup dismisses a pending delivery-data confirmation',
       say(),
     ]);
     expect(pickup.reply).toContain('recoge su pedido en tienda');
-    expect(pickup.reply).toContain('Recoge en tienda (sin costo de envío)');
+    expect(pickup.reply).toContain('*Envío:* recoge en tienda — sin costo');
     expect(pickup.reply.endsWith(ORDER_ENDING)).toBe(true);
     expect(pickup.reply).not.toMatch(CONFIRMED_DELIVERY);
     return { h, pickup };
@@ -287,9 +288,7 @@ describe('S2 (N17) store pickup dismisses a pending delivery-data confirmation',
       buttonId(pickup.interactive, 'order_confirm:'),
     );
     expect(tapped.reply).not.toMatch(CONFIRMED_DELIVERY);
-    expect(tapped.reply).toContain(
-      'Su pedido quedó registrado con folio B-42.',
-    );
+    expect(tapped.reply).toContain('*¡Pedido registrado!* ✅\n*Folio:* B-42\n');
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     const payload = (
       h.api.createCheckout.mock.calls[0] as unknown as [
@@ -303,7 +302,7 @@ describe('S2 (N17) store pickup dismisses a pending delivery-data confirmation',
     const { h } = await pickupOverPendingDelivery();
     const typed = await h.turn('SÍ');
     expect(typed).not.toMatch(CONFIRMED_DELIVERY);
-    expect(typed).toContain('Su pedido quedó registrado con folio B-42.');
+    expect(typed).toContain('*¡Pedido registrado!* ✅\n*Folio:* B-42\n');
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
   });
 
@@ -334,7 +333,7 @@ describe('S2 (N17) store pickup dismisses a pending delivery-data confirmation',
       buttonId(delivery.interactive, 'checkout_confirm:'),
     );
     expect(confirmed.reply).toMatch(
-      /^Gracias, sus datos de entrega quedaron confirmados\.\n\nResumen de su pedido:/,
+      /^Gracias, sus datos de entrega quedaron confirmados\.\n\n\*Resumen de su pedido\* 🧾\n/,
     );
     expect(confirmed.reply.endsWith(ORDER_ENDING)).toBe(true);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
@@ -344,7 +343,7 @@ describe('S2 (N17) store pickup dismisses a pending delivery-data confirmation',
       buttonId(confirmed.interactive, 'order_confirm:'),
     );
     expect(created.reply).toContain(
-      'Su pedido quedó registrado con folio B-42.',
+      '*¡Pedido registrado!* ✅\n*Folio:* B-42\n',
     );
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
   });

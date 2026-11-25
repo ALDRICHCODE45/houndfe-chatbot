@@ -94,6 +94,14 @@ import {
   MINIMAL_PAYMENT_QUESTION,
 } from './minimal-payment.service';
 
+import {
+  TITLE_EMOJI,
+  bold,
+  money,
+  sectionTitle,
+  storeLines,
+} from '../domain/whatsapp-format';
+
 export { minimalPaymentInstructions } from './minimal-payment.service';
 
 export const MINIMAL_ORDER_INELIGIBLE_REPLIES: Record<
@@ -208,8 +216,6 @@ const isQuoteRejection = (error: unknown): boolean =>
   error.errorCode !== null &&
   QUOTE_REJECTION_CODES.has(error.errorCode);
 
-const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
-
 type FreshOrder =
   | { ok: true; snapshot: MinimalOrderSnapshot }
   | { ok: false; reply: string; reason?: MinimalOrderIneligibleReason };
@@ -269,39 +275,46 @@ function checkoutFirstName(snapshot: MinimalOrderSnapshot): string | null {
   );
 }
 
-/** Backend pickup location (C1); null parts are omitted, never invented. */
-function pickupLocationText(
+/**
+ * Backend pickup location (C1) on its own lines (message formatting S2,
+ * shared store block F3b-fix H3): «Recójalo en *<sucursal>*», the address,
+ * «*Horario:* …». No location → no block; null parts are omitted, never
+ * invented; values are `plain`.
+ */
+function pickupLocationLines(
   location: CheckoutPickupLocation | null | undefined,
-): string {
-  if (location === null || location === undefined) return '';
-  const place =
-    location.address === null
-      ? ` Recójalo en ${location.name}.`
-      : ` Recójalo en ${location.name}: ${location.address.formatted.replace(/\.$/, '')}.`;
-  return location.hours === null
-    ? place
-    : `${place} Horario: ${location.hours.summary}`;
+): string[] {
+  if (location === null || location === undefined) return [];
+  return ['', ...storeLines('Recójalo en ', location)];
 }
 
-/** Server-owned order-created copy; amounts and folio come from the sale. */
+/**
+ * Server-owned order-created copy; amounts and folio come from the sale.
+ * Message formatting S2/S3: the «*¡Pedido registrado!* ✅» title, the bold
+ * folio and total lines, then the pickup place and hours apart.
+ */
 export function minimalOrderCreatedReply(
   sale: PlacedSaleIdentity,
   shipping: { mode: 'pickup' } | { customerChargeCents: number } | undefined,
   pickupLocation: CheckoutPickupLocation | null | undefined,
 ): string {
-  return (
-    (sale.folio === null
-      ? 'Su pedido quedó registrado.'
-      : `Su pedido quedó registrado con folio ${sale.folio}.`) +
-    (shipping === undefined
-      ? ` Total de productos: ${mxn(sale.totalCents)}. El envío no está incluido y se coordinará por separado.`
+  const total = (label: string, note: string | null) =>
+    `${bold(`${label}:`)} ${money(sale.totalCents)}${note === null ? '' : ` (${note})`}`;
+  return [
+    sectionTitle('¡Pedido registrado!', TITLE_EMOJI.created),
+    ...(sale.folio === null ? [] : [`${bold('Folio:')} ${sale.folio}`]),
+    ...(shipping === undefined
+      ? [
+          total('Total de productos', null),
+          'El envío no está incluido y se coordinará por separado.',
+        ]
       : !('customerChargeCents' in shipping)
-        ? ` Total a pagar: ${mxn(sale.totalCents)}. Recoge en tienda (sin costo de envío).`
+        ? [total('Total a pagar', 'recoge en tienda, sin costo de envío')]
         : shipping.customerChargeCents === 0
-          ? ` Total de productos: ${mxn(sale.totalCents)}. Envío sin costo para usted.`
-          : ` Total a pagar: ${mxn(sale.totalCents)} (envío incluido).`) +
-    pickupLocationText(pickupLocation)
-  );
+          ? [total('Total a pagar', 'envío sin costo')]
+          : [total('Total a pagar', 'envío incluido')]),
+    ...pickupLocationLines(pickupLocation),
+  ].join('\n');
 }
 
 /** A created order whose reply asks how to pay (buttons, then details). */
@@ -1368,7 +1381,7 @@ export class MinimalOrderService {
     this.uploadPetsInBackground(senderId);
     // Bank details are fetched when the customer chooses how to pay.
     return {
-      reply: `¡Listo! ${minimalOrderCreatedReply(sale, shipping, pickupLocation)}\n\n${MINIMAL_PAYMENT_QUESTION}`,
+      reply: `${minimalOrderCreatedReply(sale, shipping, pickupLocation)}\n\n${MINIMAL_PAYMENT_QUESTION}`,
       saleId: sale.saleId,
       payInStore,
     };

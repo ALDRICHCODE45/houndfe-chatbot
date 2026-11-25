@@ -5,7 +5,9 @@ import {
 import {
   backorderDate,
   backorderDateTime,
+  backorderItemLines,
 } from '../../llm-agent/domain/backorder-copy';
+import { bold, money, plain } from '../../llm-agent/domain/whatsapp-format';
 
 /**
  * Restock backorder T5a: the customer copy of the `backorder.*` feed notices
@@ -15,6 +17,12 @@ import {
  * Skeletons carry `{placeholders}` that are filled AFTER the register is
  * applied, so a product or first name is never rewritten by a phrase pair
  * (a product called «Su pedido Premium» stays as it is).
+ *
+ * Message formatting F3c (S2, S4): the multi-fact notices carry their
+ * WhatsApp layout in the skeleton (bold folio and deadline, the item block,
+ * the closing question apart); names and products are `plain` values and
+ * amounts are «$1,250.00». The Meta templates and their one-line
+ * parameters (`backorderMoney`, `backorderLabel`) stay as approved.
  */
 
 // ------------------------------------------------------------- buttons
@@ -123,7 +131,8 @@ export function renderNotice(
   );
 }
 
-/** `$1099.00 MXN`, the money format of the rest of the bot. */
+/** `$1099.00 MXN`: the approved template parameters only (S9); the free
+ *  notices use the shared `money()` («$1,099.00»). */
 export const backorderMoney = (cents: number): string =>
   `$${(cents / 100).toFixed(2)} MXN`;
 
@@ -137,6 +146,16 @@ export const backorderLabel = (
 /** «a. m.» already ends with its period: never «a. m..». */
 const endSentence = (text: string): string =>
   text.endsWith('.') ? text : `${text}.`;
+
+/** A first name as shown (`plain`); `''` when absent or emptied. */
+const firstNameText = (firstName: string | null): string =>
+  firstName === null ? '' : plain(firstName);
+
+/** «, Ana» after «¡Buenas noticias» / «Una disculpa», or nothing. */
+const greeting = (firstName: string | null): string => {
+  const name = firstNameText(firstName);
+  return name === '' ? '' : `, ${name}`;
+};
 
 /** «el 21 de noviembre a las 9:00 a. m.» (Mexico City), `null` if unreadable. */
 export const backorderDeadline = (iso: string, now: Date): string | null =>
@@ -174,18 +193,22 @@ export function reservedNotice(
     input.referencePriceCents !== null &&
     input.finalPriceCents < input.referencePriceCents;
   return renderNotice(
-    `¡Buenas noticias{greeting}! Ya llegó su pedido {folio}: {quantity} × {label}. ` +
-      `Se lo apartamos a {price} c/u{drop} hasta {deadline} {question}`,
+    '¡Buenas noticias{greeting}! Ya llegó su pedido *{folio}*.\n\n' +
+      '{item}\n\n' +
+      'Se lo apartamos hasta *{deadline}*\n\n' +
+      '{question}',
     {
-      greeting: input.firstName === null ? '' : `, ${input.firstName}`,
+      greeting: greeting(input.firstName),
       folio: input.folio,
-      quantity: String(input.quantity),
-      label: input.label,
-      price: backorderMoney(input.finalPriceCents),
-      drop: lowered
-        ? ` (bajó de precio, antes ${backorderMoney(input.referencePriceCents as number)})`
-        : '',
-      deadline: endSentence(input.deadline),
+      item: backorderItemLines({
+        label: input.label,
+        quantity: input.quantity,
+        unitPriceCents: input.finalPriceCents,
+        note: lowered
+          ? `Bajó de precio, antes ${money(input.referencePriceCents as number)}`
+          : null,
+      }).join('\n'),
+      deadline: input.deadline,
       question: renderNotice(BACKORDER_CONFIRM_QUESTION, {}, style),
     },
     style,
@@ -198,10 +221,10 @@ export function reminderNotice(
   style: CustomerStyle | null,
 ): string {
   return renderNotice(
-    'Le recuerdo que su pedido {folio} sigue apartado hasta {deadline} {question}',
+    'Le recuerdo que su pedido *{folio}* sigue apartado hasta *{deadline}*\n\n{question}',
     {
       folio: input.folio,
-      deadline: endSentence(input.deadline),
+      deadline: input.deadline,
       question: renderNotice(BACKORDER_CONFIRM_QUESTION, {}, style),
     },
     style,
@@ -216,9 +239,9 @@ export function expiredNotice(
 ): string {
   return renderNotice(
     input.offerReschedule
-      ? `Se venció el apartado de su pedido {folio} ({product}). ${BACKORDER_RESCHEDULE_QUESTION}`
-      : 'Se venció el apartado de su pedido {folio} ({product}).',
-    { folio: input.folio, product: input.productName },
+      ? `Se venció el apartado de su pedido *{folio}* ({product}).\n\n${BACKORDER_RESCHEDULE_QUESTION}`
+      : 'Se venció el apartado de su pedido *{folio}* ({product}).',
+    { folio: input.folio, product: plain(input.productName) },
     style,
   );
 }
@@ -235,11 +258,11 @@ export function lostNotice(
   style: CustomerStyle | null,
 ): string {
   return renderNotice(
-    'Una disculpa{greeting}: el lote que le apartamos de {product} caducó y no tenemos otro vigente. ' +
-      'Su pedido {folio} sigue en primer lugar; le aviso en cuanto llegue{when}.',
+    'Una disculpa{greeting}: el lote que le apartamos de {product} caducó y no tenemos otro vigente.\n\n' +
+      'Su pedido *{folio}* sigue en primer lugar; le aviso en cuanto llegue{when}.',
     {
-      greeting: input.firstName === null ? '' : `, ${input.firstName}`,
-      product: input.productName,
+      greeting: greeting(input.firstName),
+      product: plain(input.productName),
       folio: input.folio,
       when:
         input.estimateDate === null ? '' : ` (aprox. ${input.estimateDate})`,
@@ -266,23 +289,22 @@ export function etaUpdatedNotice(
   },
   style: CustomerStyle | null,
 ): string {
+  const name = firstNameText(input.firstName);
   const lead =
-    input.firstName === null
-      ? 'Le actualizo su pedido'
-      : '{name}, le actualizo su pedido';
+    name === '' ? 'Le actualizo su pedido' : '{name}, le actualizo su pedido';
   return renderNotice(
-    `${lead} {folio} ({quantity} × {label}): {when}. ` +
+    `${lead} *{folio}*:\n• {quantity} × {label}\n{when}.\n\n` +
       'Se lo aparto en cuanto llegue y le aviso; sigue sin pagar nada hasta entonces. ' +
-      `Con gusto se lo tengo listo. ${BACKORDER_ETA_QUESTION}`,
+      `Con gusto se lo tengo listo.\n\n${BACKORDER_ETA_QUESTION}`,
     {
-      name: input.firstName ?? '',
+      name,
       folio: input.folio,
       quantity: String(input.quantity),
-      label: input.label,
+      label: plain(input.label),
       when:
         input.estimateDate === null
-          ? 'el equipo está confirmando la nueva fecha de llegada'
-          : `el equipo nos confirmó que llega aprox. el ${input.estimateDate}`,
+          ? 'El equipo está confirmando la nueva fecha de llegada'
+          : `El equipo nos confirmó que llega aprox. el ${bold(input.estimateDate)}`,
     },
     style,
   );
@@ -293,15 +315,15 @@ export function etaUnavailableNotice(
   input: { firstName: string | null; productName: string; folio: string },
   style: CustomerStyle | null,
 ): string {
-  const lead =
-    input.firstName === null ? 'El proveedor' : '{name}, el proveedor';
+  const name = firstNameText(input.firstName);
+  const lead = name === '' ? 'El proveedor' : '{name}, el proveedor';
   return renderNotice(
-    `${lead} todavía no nos confirma fecha para {product} (pedido {folio}). ` +
-      'Su lugar sigue apartado: en cuanto llegue se lo separo y le aviso. ' +
+    `${lead} todavía no nos confirma fecha para {product} (pedido *{folio}*).\n\n` +
+      'Su lugar sigue apartado: en cuanto llegue se lo separo y le aviso.\n\n' +
       BACKORDER_ETA_QUESTION,
     {
-      name: input.firstName ?? '',
-      product: input.productName,
+      name,
+      product: plain(input.productName),
       folio: input.folio,
     },
     style,
@@ -314,7 +336,7 @@ export function cancelledNotice(
   style: CustomerStyle | null,
 ): string {
   const head = renderNotice(
-    'El equipo canceló su pedido {folio}',
+    'El equipo canceló su pedido *{folio}*',
     { folio: input.folio },
     style,
   );

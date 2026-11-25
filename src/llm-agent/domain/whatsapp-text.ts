@@ -11,6 +11,12 @@ const IMAGE_URL = /\.(?:jpe?g|png|gif|webp|avif|svg)(?:[?#]\S*)?$/i;
 const HEADING = /^#{1,6}\s+/;
 const BULLET = /^[-*+•]\s+/;
 const ORDERED = /^(\d{1,3})[.)]\s+/;
+/**
+ * Message formatting F4: deepest indentation kept. Three spaces is the
+ * server layout's detail line under a bullet («• Name» then «   1 × …»), so a
+ * model list can mirror it; deeper nesting is flattened to it.
+ */
+const MAX_INDENT = 3;
 /** A line left with nothing but a list marker. */
 const MARKER_ONLY = /^(?:[-*+•]|\d{1,3}[.)])?$/;
 
@@ -39,7 +45,7 @@ function formatLine(raw: string): string | null {
   else if (BULLET.test(body)) body = `• ${body.replace(BULLET, '')}`;
   body = bold(body);
   if (body === '') return '';
-  return `${' '.repeat(Math.min(indent, 2))}${body}`;
+  return `${' '.repeat(Math.min(indent, MAX_INDENT))}${body}`;
 }
 
 export function toWhatsAppText(text: string): string {

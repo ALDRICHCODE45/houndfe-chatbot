@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { MinimalCheckoutDraftAddress } from '../../conversation/domain/minimal-checkout-draft';
 import type { ShippingQuoteResponse } from '../../chatbot-api/domain/dtos/shipping-quote.dto';
+import { money as formatMoney } from './whatsapp-format';
 const money = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const iso = z.iso.datetime({ offset: true });
 const cartLineSchema = z.strictObject({
@@ -244,13 +245,11 @@ export function minimalShippingEtaLine(
     : `Llega en aproximadamente ${eta.days} días hábiles.`;
 }
 
-const resumeMxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
-
 /**
  * S4: the shipping clause of the «zone approved» notice, from the fresh
  * quote only: free (the customer's charge is 0, credit included) or the
- * amount the customer pays, plus the ETA when the backend gave one. No
- * trailing period.
+ * amount the customer pays («$1,250.00», message formatting S4), plus the
+ * ETA when the backend gave one. No trailing period.
  */
 export function minimalZoneResumeShippingSentence(
   quote: Pick<MinimalShippingQuote, 'eta' | 'option'> & {
@@ -271,7 +270,7 @@ export function minimalZoneResumeShippingSentence(
   return `${
     quote.customerChargeCents === 0
       ? 'el envío no tiene costo'
-      : `el envío cuesta ${resumeMxn(quote.customerChargeCents)}`
+      : `el envío cuesta ${formatMoney(quote.customerChargeCents)}`
   }${arrival}`;
 }
 

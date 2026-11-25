@@ -308,15 +308,15 @@ describe('summary and createCheckout with a backorder line (S2, S6, S11)', () =>
 
     const offer = await h.offer();
     expect(offer.reply).toContain(
-      '• Croquetas Adulto 18 kg: 2 × $1099.00 MXN; importe $2198.00 MXN (pedido apartado BO-000012)',
+      '• Croquetas Adulto 18 kg (pedido apartado BO-000012)\n   2 × $1,099.00 = *$2,198.00*',
     );
-    expect(offer.reply).toContain('Total de productos: $2198.00 MXN');
-    expect(offer.reply).toContain('Total a pagar: $2198.00 MXN');
+    expect(offer.reply).not.toContain('Total de productos');
+    expect(offer.reply).toContain('*Total a pagar: $2,198.00*');
     // Nothing to evaluate: no promotion call for a backorder-only cart.
     expect(h.api.evaluateCart).not.toHaveBeenCalled();
 
     const placed = await h.yes();
-    expect(placed?.reply).toContain('¡Listo!');
+    expect(placed?.reply).toContain('*¡Pedido registrado!* ✅');
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
     expect(sentBody(h)).toEqual({
       phoneCountryCode: '52',
@@ -349,10 +349,10 @@ describe('summary and createCheckout with a backorder line (S2, S6, S11)', () =>
     const offer = await h.offer();
     // The promotion applies to the ordinary line only.
     expect(offer.reply).toContain(
-      '• Ibuprofeno: 2 × $15.00 MXN; importe $27.00 MXN (promoción: Promo orden, ahorro $3.00 MXN)',
+      '• Ibuprofeno\n   2 × $15.00 = *$27.00*\n   _Promo orden: ahorra $3.00_',
     );
     expect(offer.reply).toContain(
-      '• Croquetas Adulto 18 kg: 2 × $1099.00 MXN; importe $2198.00 MXN (pedido apartado BO-000012)',
+      '• Croquetas Adulto 18 kg (pedido apartado BO-000012)\n   2 × $1,099.00 = *$2,198.00*',
     );
     expect(h.api.evaluateCart.mock.calls[0][0]).toEqual([
       { productId: BO_PRODUCT, quantity: 2, unitPriceCents: 1500 },
@@ -420,7 +420,7 @@ describe('summary and createCheckout with a backorder line (S2, S6, S11)', () =>
 
     const offer = await h.offer();
     expect(offer.reply).toContain('(pedido apartado BO-000012)');
-    expect(offer.reply).toContain('Total a pagar: $89.00 MXN');
+    expect(offer.reply).toContain('*Total a pagar: $89.00*');
     await h.yes();
     const { expectedTotalCents, shipping, items } = sentBody(h).sale;
     expect(shipping).toEqual({ quoteId: 'quote-1' });
@@ -665,7 +665,7 @@ describe('checkout refusals of a backorder line (contract §7)', () => {
     );
     expect(h.backorders.getBackorder).toHaveBeenCalledWith(BO_ID);
     expect(answer?.reply).toContain(MINIMAL_ORDER_CHANGED_REPLY);
-    expect(answer?.reply).toContain('2 × $999.00 MXN; importe $1998.00 MXN');
+    expect(answer?.reply).toContain('2 × $999.00 = *$1,998.00*');
     expect((await h.slot()).items[1].unitPriceCents).toBe(99900);
 
     // The next SÍ sends the refreshed price and the matching total.
@@ -696,9 +696,9 @@ describe('checkout refusals of a backorder line (contract §7)', () => {
 
     expect(answer?.reply).toContain(MINIMAL_ORDER_CHANGED_REPLY);
     expect(answer?.reply).not.toContain('necesito saber cómo recibirá');
-    expect(answer?.reply).toContain('Resumen de su pedido:');
-    expect(answer?.reply).toContain('2 × $999.00 MXN; importe $1998.00 MXN');
-    expect(answer?.reply).toContain('Total a pagar: $2078.00 MXN');
+    expect(answer?.reply).toContain('*Resumen de su pedido* 🧾');
+    expect(answer?.reply).toContain('2 × $999.00 = *$1,998.00*');
+    expect(answer?.reply).toContain('*Total a pagar: $2,078.00*');
     // The stored quote was pinned to the old price: one fresh quote was asked.
     expect(h.quotes.calls).toHaveLength(2);
     expect((await h.slot()).items[1].unitPriceCents).toBe(99900);
@@ -737,7 +737,7 @@ describe('checkout refusals of a backorder line (contract §7)', () => {
       h,
       refusal(409, 'PRICE_OUT_OF_DATE', { currentPriceCents: 99900 }),
     );
-    expect(answer?.reply).toContain('2 × $999.00 MXN');
+    expect(answer?.reply).toContain('2 × $999.00 = ');
   });
 
   it("an ordinary line PRICE_OUT_OF_DATE (no detail) keeps today's handling and the backorder line", async () => {
@@ -760,9 +760,9 @@ describe('checkout refusals of a backorder line (contract §7)', () => {
     );
     const answer = await h.yes();
     expect(answer?.reply).toContain(MINIMAL_ORDER_CHANGED_REPLY);
-    expect(answer?.reply).toContain('importe $24.00 MXN');
+    expect(answer?.reply).toContain('= *$24.00*');
     expect(answer?.reply).toContain(
-      'importe $2198.00 MXN (pedido apartado BO-000012)',
+      '(pedido apartado BO-000012)\n   2 × $1,099.00 = *$2,198.00*',
     );
     answer?.onSent?.();
     h.api.createCheckout.mockClear();
@@ -867,7 +867,7 @@ describe('a backorder refusal after an earlier uncertain attempt (same idempoten
     );
     const answer = await h.yes('wamid.o4');
     expect(answer?.reply).toContain(MINIMAL_ORDER_CHANGED_REPLY);
-    expect(answer?.reply).toContain('2 × $999.00 MXN');
+    expect(answer?.reply).toContain('2 × $999.00 = ');
     expect((await h.slot()).idempotencyKey).toBe('');
   });
 
@@ -885,7 +885,7 @@ describe('a backorder refusal after an earlier uncertain attempt (same idempoten
         checkout: { sale: placedSale() },
       } as never);
     const answer = await h.yes('wamid.o4');
-    expect(answer?.reply).toContain('¡Listo!');
+    expect(answer?.reply).toContain('*¡Pedido registrado!* ✅');
     expect(answer?.reply).toContain('B-0042');
     expect((await h.slot()).items).toEqual([]);
   });
@@ -926,14 +926,19 @@ describe('a cart without backorder lines is unchanged (previous behaviour)', () 
     const offer = await h.offer();
     expect(offer.reply).toBe(
       [
-        'Resumen de su pedido:',
-        '• Ibuprofeno: 2 × $15.00 MXN; importe $30.00 MXN',
-        'Total de productos: $30.00 MXN',
-        'Datos del cliente: Ana',
-        'Recoge en tienda (sin costo de envío)',
-        'Total a pagar: $30.00 MXN',
+        '*Resumen de su pedido* 🧾',
         '',
-        'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
+        '*Productos*',
+        '• Ibuprofeno',
+        '   2 × $15.00 = *$30.00*',
+        '',
+        '*Datos del cliente*',
+        'Ana',
+        '',
+        '*Envío:* recoge en tienda — sin costo',
+        '*Total a pagar: $30.00*',
+        '',
+        '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.',
       ].join('\n'),
     );
     await h.yes();
@@ -973,7 +978,7 @@ describe('a cart without backorder lines is unchanged (previous behaviour)', () 
     );
     const answer = await h.yes();
     expect(answer?.reply).toContain(MINIMAL_ORDER_CHANGED_REPLY);
-    expect(answer?.reply).toContain('Total a pagar: $15.00 MXN');
+    expect(answer?.reply).toContain('*Total a pagar: $15.00*');
   });
 });
 

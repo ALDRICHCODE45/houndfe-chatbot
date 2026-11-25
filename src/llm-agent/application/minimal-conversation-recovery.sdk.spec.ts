@@ -99,7 +99,7 @@ const scenarioTurns = (id: string): string[] => {
   );
 };
 
-const ORDER_ENDING = /Respond[ae] "SÍ" para crear el pedido/;
+const ORDER_ENDING = /Respond[ae] \*SÍ\* para crear el pedido/;
 const FAKE_DELIVERY_SUMMARY =
   'Confirma tus datos de entrega nuevamente:\nNombre: Mariana\nCalle: Calle Francisco Sosa 150\n\nResponde "SÍ" para confirmar estos datos y crear el pedido, o dime qué quieres cambiar.';
 const FAKE_ORDER_SUMMARY =
@@ -235,14 +235,14 @@ describe('G2 a cart change after the order summary continues to the updated summ
       { variantId: variant(COLLAR, 2), quantity: 2 },
     ]);
     expect(updated).toMatch(ORDER_ENDING);
-    expect(updated).toContain('2 × $149.00 MXN');
+    expect(updated).toContain('2 × $149.00 = *$298.00*');
     expect(updated).toContain('Envío');
     expect(updated).not.toContain('Todavía no se ha creado un pedido');
     expect(h.createCheckout).not.toHaveBeenCalled();
 
     // The model would write its own summary again; the armed gate answers.
     const created = await h.turn(t8, [say(FAKE_DELIVERY_SUMMARY)]);
-    expect(created).toContain('folio EV-0001');
+    expect(created).toContain('*Folio:* EV-0001');
     expect(orderedQuantities(h)).toEqual([[2]]);
 
     await h.turn(t9, [say('¡Gracias por su compra!')]);
@@ -273,8 +273,8 @@ describe('G2 a cart change after the order summary continues to the updated summ
       say(),
     ]);
     expect(updated).toMatch(ORDER_ENDING);
-    expect(updated).toContain('Recoge en tienda');
-    expect(updated).toContain('2 × $179.00 MXN');
+    expect(updated).toContain('recoge en tienda');
+    expect(updated).toContain('2 × $179.00 = *$358.00*');
     await h.turn('sí');
     expect(orderedQuantities(h)).toEqual([[2]]);
     expect(h.createCheckout.mock.calls[0][0].sale.shipping).toEqual({
@@ -306,10 +306,39 @@ describe('G2 a cart change after the order summary continues to the updated summ
     ]);
     expect(reply).not.toContain('nuevamente');
     expect(reply).toMatch(ORDER_ENDING);
-    expect(reply).toContain('1 × $149.00 MXN');
+    expect(reply).toContain('1 × $149.00 = *$149.00*');
     await h.turn('sí');
     expect(orderedQuantities(h)).toEqual([[1]]);
   });
+
+  it.each([
+    [
+      'the bold S2 summary',
+      '*Resumen de tu pedido* 🧾\n\n*Productos*\n• Collar\n   1 × $999.00 = *$999.00*\n\n¿Está todo bien? Responde *SÍ* para crear el pedido, o dime qué cambiar.',
+    ],
+    [
+      'only the bold SÍ closing',
+      'Listo:\n• Collar 1 × $999.00\n\n¿Está todo bien? Responde *SÍ* para crear el pedido.',
+    ],
+    [
+      'the bold F3a delivery-data confirmation',
+      '*Confirma tus datos de entrega*\n\n*Nombre:* Mariana\n*Calle:* Calle $999.00\n\nResponde *SÍ* para confirmar estos datos, o dime qué quieres cambiar.',
+    ],
+    [
+      'only the bold F3a delivery-data SÍ line',
+      'Revisé todo:\nCalle $999.00\n\nResponde *SÍ* para confirmar estos datos.',
+    ],
+  ])(
+    '[message-formatting F2b] a model imitating %s is replaced by the real order summary',
+    async (_name, fake) => {
+      const h = harness('04000');
+      await summaryForOneCollar(h);
+      const reply = await h.turn('¿y cuándo llega?', [say(fake)]);
+      expect(reply).not.toContain('$999.00');
+      expect(reply).toMatch(ORDER_ENDING);
+      expect(reply).toContain('1 × $149.00 = *$149.00*');
+    },
+  );
 
   it('a model-written delivery summary before checkout runs the real confirmation step', async () => {
     const h = harness('04000');
@@ -423,7 +452,7 @@ describe('G3 lines never repeat the product name in the presentation', () => {
         promotionEvaluationStatus: 'fully_evaluated',
       }),
     ).toContain(
-      '• Collar Ajustable de Nylon para Perro — Mediana: 1 × $149.00 MXN',
+      '• Collar Ajustable de Nylon para Perro — Mediana\n   1 × $149.00 = *$149.00*',
     );
     const h = harness('04000');
     await summaryForOneCollar(h);
@@ -432,7 +461,7 @@ describe('G3 lines never repeat the product name in the presentation', () => {
       say(),
     ]);
     expect(summary).toContain(
-      '• Collar Ajustable de Nylon para Perro — Mediana: 1 × $149.00 MXN',
+      '• Collar Ajustable de Nylon para Perro — Mediana\n   1 × $149.00 = *$149.00*',
     );
   });
 });

@@ -153,8 +153,17 @@ describe('sale-flow-instructions', () => {
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
         'Muestra al cliente el `originalPriceCents` de cada línea y el total',
       );
+    });
+
+    it('never asks the model for its own order summary (message formatting F4)', () => {
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain('resumen estructurado');
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain('viñetas: productos');
+      expect(SALE_FLOW_INSTRUCTIONS).not.toContain('en viñetas solo si ayudan');
       expect(SALE_FLOW_INSTRUCTIONS).toContain(
-        'productos, cantidades, precios, total',
+        '10. No escribas tú el resumen del pedido ni la confirmación de datos de entrega, ni pidas responder «SÍ»: la aplicación los envía.',
+      );
+      expect(SALE_FLOW_INSTRUCTIONS).toContain(
+        'Varios candidatos: opciones breves con diferencias útiles, una por línea como indica el formato WhatsApp',
       );
     });
 

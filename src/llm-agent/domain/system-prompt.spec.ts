@@ -1,4 +1,4 @@
-import { SYSTEM_PROMPT } from './system-prompt';
+import { SYSTEM_PROMPT, WHATSAPP_FORMAT_GUIDANCE } from './system-prompt';
 
 /**
  * Contract tests for the SYSTEM_PROMPT.
@@ -206,14 +206,60 @@ describe('SYSTEM_PROMPT', () => {
     });
   });
 
+  describe('WhatsApp formatting guidance (message formatting F4, S1/S2/S4)', () => {
+    it('ships one formatting block with the S2 list layout and the S4 money format', () => {
+      expect(SYSTEM_PROMPT.split('Formato WhatsApp').length - 1).toBe(1);
+      expect(SYSTEM_PROMPT).toContain(WHATSAPP_FORMAT_GUIDANCE);
+      for (const rule of [
+        'párrafos cortos',
+        'Un solo producto: un párrafo breve y natural, sin lista',
+        'Varios productos: uno por línea, «• *Nombre*: $1,250.00»',
+        'tres espacios de sangría',
+        'Negritas con un solo asterisco (*así*), solo para nombres de producto y precios',
+        'Importes como «$1,250.00»: separador de miles, dos decimales y sin «MXN»',
+        'Sin encabezados (#), tablas ni listas anidadas',
+        'sin imágenes ni enlaces Markdown (las fotos se envían aparte)',
+      ]) {
+        expect(WHATSAPP_FORMAT_GUIDANCE).toContain(rule);
+      }
+    });
+
+    it('keeps the emoji rule and reserves the title emojis for application messages', () => {
+      expect(WHATSAPP_FORMAT_GUIDANCE).toContain(
+        'Emojis: solo si el cliente los usa, como máximo uno natural por mensaje',
+      );
+      expect(WHATSAPP_FORMAT_GUIDANCE).toContain(
+        'nunca 🧾, 🚚 ni ✅, reservados a los mensajes de la aplicación',
+      );
+    });
+
+    it('forbids imitating the server-owned summaries and the order-created message', () => {
+      expect(WHATSAPP_FORMAT_GUIDANCE).toContain(
+        'Nunca imites el resumen del pedido, la confirmación de datos de entrega ni el mensaje de pedido creado: los envía la aplicación',
+      );
+    });
+
+    it('bank details: never from memory, repeated exactly when a tool returns them (sale-flow step 12 relays them)', () => {
+      expect(WHATSAPP_FORMAT_GUIDANCE).toContain(
+        'Datos bancarios: nunca los escribas de memoria; si una herramienta te los devuelve, repítelos exactamente como vienen.',
+      );
+      expect(WHATSAPP_FORMAT_GUIDANCE).not.toContain('los datos bancarios ni');
+    });
+
+    it('drops the optional-bullets rule that contradicted the one-per-line layout', () => {
+      expect(SYSTEM_PROMPT).not.toContain('en viñetas solo si ayudan');
+    });
+  });
+
   it('is non-empty and reasonably bounded', () => {
     // Sanity check only: no production code caps the prompt length or
     // truncates it before the provider call. The owner-approved voice
     // guidance (greeting/emoji/thanks) is layered on top of the preserved
     // safety guards (catalog-vs-stock, importes, UUID suppression, tool-use
     // and flow pointers), so the prompt legitimately needs headroom above
-    // the previous 4000 bound.
+    // the previous 4000 bound. Message formatting F4 adds the single
+    // WhatsApp formatting block (~1,000 chars), hence 6000.
     expect(SYSTEM_PROMPT.length).toBeGreaterThan(200);
-    expect(SYSTEM_PROMPT.length).toBeLessThan(5000);
+    expect(SYSTEM_PROMPT.length).toBeLessThan(6000);
   });
 });

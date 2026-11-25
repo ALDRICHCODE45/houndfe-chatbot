@@ -227,6 +227,13 @@ import {
 } from './minimal-shipping.service';
 import { minimalShippingEtaLine } from '../domain/minimal-shipping';
 import {
+  TITLE_EMOJI,
+  bold,
+  money,
+  plain,
+  sectionTitle,
+} from '../domain/whatsapp-format';
+import {
   searchWithBroadening,
   type BroadenedSearchInfo,
 } from '../domain/minimal-catalog-search-broadening';
@@ -321,14 +328,13 @@ const INSTRUCTIONS =
   'producto, precio ni stock: los ejemplos son condicionales, no respuestas forzadas. ' +
   'Estilo (solo si aplica): si su mensaje abre con saludo, empieza con un saludo recíproco ' +
   '(usa "¡Hola!" si es neutro; no inventes la hora); identidad de servicio cálida en el registro del cliente, ' +
-  'sin personificar a una persona. Un producto en un párrafo breve y natural, no una lista ' +
-  'anidada, y sin "¿en qué puedo ayudarle?" si ya pidió un producto. Ejemplos solo de estilo, ' +
+  'sin personificar a una persona. Da formato según el bloque de formato WhatsApp, ' +
+  'y sin "¿en qué puedo ayudarle?" si ya pidió un producto. Ejemplos solo de estilo, ' +
   'sustituye únicamente datos verificados por herramienta: "¡Hola! Encontré {nombre} en ' +
   'nuestro catálogo. ¿Buscaba esa presentación?" (de tú: "¿Buscabas esa presentación?"); tras out_of_stock verificado: "Por ahora, ' +
   '{nombre} está agotado." Sin cierre automático ("Si necesita...", "No dude...", ' +
   '"estoy aquí..."), sin upsell ni aviso forzado, sin emoji al informar agotado, sin saludar ' +
-  'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha. ' +
-  'Escribe para WhatsApp: negritas con un solo asterisco (*así*) y solo si ayudan, sin imágenes ni enlaces Markdown (las fotos se envían aparte), sin encabezados y con listas cortas.';
+  'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
 
 /** S3: the structured customer reply (text + optional media) of one turn. */
 export type MinimalCatalogAgentDecision = CustomerReply & {
@@ -462,9 +468,16 @@ const priceKey = (productId: string, variantId?: string | null) =>
 /**
  * Model text imitating the server-owned delivery-data or order summaries.
  * Only the application presents them (and arms their SÍ gate).
+ *
+ * The «SÍ» of «Responda *SÍ* …» is closed by the lookahead
+ * `(?![a-záéíóúñ])` instead of `\b`: without the `u` flag `\b` only knows
+ * ASCII word characters, so it never matched right after an accented «Í»
+ * (a bare «SÍ» slipped through) while the lookahead still rejects longer
+ * words such as «sigue» or «siempre». The optional `[«"“'*]` accepts the
+ * quoted and the bold (message formatting S2) forms.
  */
 const IMITATED_CONFIRMATION =
-  /confirm[ae] (?:sus|tus) datos de entrega|resumen de (?:su|tu) pedido|respond[ae]\s*[«"“']?\s*s[ií]\b[^\n]{0,40}\b(?:crear el pedido|confirmar (?:estos|sus|tus) datos)/i;
+  /confirm[ae] (?:sus|tus) datos de entrega|resumen de (?:su|tu) pedido|respond[ae]\s*[«"“'*]?\s*s[ií](?![a-záéíóúñ])[^\n]{0,40}\b(?:crear el pedido|confirmar (?:estos|sus|tus) datos)/i;
 
 const toolError = (kind: string) => ({ ok: false as const, error: kind });
 
@@ -845,11 +858,16 @@ const SHIPPING_INSTRUCTIONS_FRAGMENT =
 const ORDER_INSTRUCTIONS_FRAGMENT =
   ' Pedido: cuando los datos de entrega ya estén confirmados (o el cliente eligió recoger en tienda) y el cliente quiera hacer su pedido, llame prepareOrder sin argumentos. La aplicación muestra el resumen con el total y pide al cliente responder SÍ; solo esa respuesta crea el pedido. Usted nunca crea pedidos ni afirma que un pedido existe; el envío no está incluido.';
 
-const shippingMxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
 const zipPhrase = (zipCode: string | null) =>
   zipCode === null ? 'su código postal' : `su código postal ${zipCode}`;
 
-/** Server-owned reply for one quote attempt; amounts come only from the backend. */
+/**
+ * Server-owned reply for one quote attempt; amounts come only from the
+ * backend. A quote is a block (message formatting S2/S3): the «*Envío a
+ * domicilio* 🚚» title, the carrier/service line with its cost (names
+ * `plain`), the credit, the bold amount the customer pays and the ETA, one
+ * per line.
+ */
 export function minimalShippingReply(result: MinimalShippingResult): string {
   switch (result.kind) {
     case 'quoted': {
@@ -859,9 +877,10 @@ export function minimalShippingReply(result: MinimalShippingResult): string {
           : { days: result.eta?.days ?? result.option?.etaDays ?? null },
       );
       const carrier = result.option
-        ? ` con ${result.option.carrier} (${result.option.service})`
+        ? plain(`${result.option.carrier} ${result.option.service}`)
         : '';
       return [
+        sectionTitle('Envío a domicilio', TITLE_EMOJI.shipping),
         ...(result.zoneStatus === 'FREE'
           ? [
               result.zipCode === null
@@ -869,17 +888,19 @@ export function minimalShippingReply(result: MinimalShippingResult): string {
                 : `Su envío al código postal ${result.zipCode} no tiene costo.`,
             ]
           : [
-              `Envío a domicilio${carrier}: ${shippingMxn(result.costCents)}.`,
+              carrier === ''
+                ? `Costo: ${money(result.costCents)}`
+                : `${carrier} — ${money(result.costCents)}`,
               ...(result.creditCents > 0
                 ? [
-                    `Usted tiene un crédito de ${shippingMxn(result.creditCents)} por sus productos.`,
+                    `Usted tiene un crédito de ${money(result.creditCents)} por sus productos.`,
                   ]
                 : []),
-              `Usted paga ${shippingMxn(result.customerChargeCents)}.`,
+              bold(`Usted paga: ${money(result.customerChargeCents)}`),
             ]),
         // F1: the order summary follows in the same reply; no magic phrase.
         ...(eta === null ? [] : [eta]),
-      ].join(' ');
+      ].join('\n');
     }
     case 'zone_pending':
       return `Estamos validando la entrega a ${zipPhrase(result.zipCode)}. Le avisamos por aquí en cuanto quede lista; mientras tanto, si prefiere, puede recoger su pedido en tienda.`;

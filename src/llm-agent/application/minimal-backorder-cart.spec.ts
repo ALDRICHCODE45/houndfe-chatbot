@@ -523,7 +523,7 @@ describe('a cart without backorder lines is untouched (previous behaviour)', () 
       '{"items":[{"productId":"11111111-1111-4111-8111-111111111111","quantity":2,"unitPriceCents":1500}],"idempotencyKey":"","expectedTotalCents":3000}',
     );
     expect(minimalCartReply(result)).toBe(
-      'Su carrito:\n• Ibuprofeno: 2 × $15.00 MXN; importe $30.00 MXN\nTotal de productos: $30.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+      '*Su carrito*\n• Ibuprofeno\n   2 × $15.00 = *$30.00*\n\n*Total de productos: $30.00*\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
     );
     expect(result).not.toHaveProperty('removedBackorders');
   });

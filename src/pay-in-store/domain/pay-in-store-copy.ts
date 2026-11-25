@@ -5,6 +5,7 @@ import {
   formatDay,
   zonedParts,
 } from '../../scheduling/domain/slot-time';
+import { bold, storeLines } from '../../llm-agent/domain/whatsapp-format';
 
 /**
  * Pay in store (odd/tasks/pay-in-store.md S3): the exact customer copy, in
@@ -105,31 +106,57 @@ export function payInStoreDateTime(
   return `${weekday} ${day} de ${month} ${atTime(formatClock(date, timeZone))}`;
 }
 
-/** A clause that may end in "p. m." gets no second dot. */
-const endSentence = (text: string): string =>
-  text.endsWith('.') ? text : `${text}.`;
-
+/** «su pedido *B-1*» (message formatting S2: bold folio) / «su pedido». */
 const order = (folio: string | null): string =>
-  folio === null || folio === '' ? 'su pedido' : `su pedido ${folio}`;
+  folio === null || folio === '' ? 'su pedido' : `su pedido ${bold(folio)}`;
 
-/** The tap answer once the backend holds the order (S3). */
+/**
+ * Message formatting S2: the store of the hold reply on its own lines, the
+ * shared store block (F3b-fix H3): the bold branch name closing the
+ * «Páselo…» sentence, then the address and the bold «Horario:» line (null
+ * parts omitted). Unknown location → `fallbackName` (the feed item's
+ * branch), else «la tienda.». Backend values are `plain`.
+ */
+function heldStoreLines(
+  location: CheckoutPickupLocation | null | undefined,
+  fallbackName?: string | null,
+): string[] {
+  return storeLines(
+    'Páselo a recoger y pagar en ',
+    location ?? { name: fallbackName ?? '', address: null, hours: null },
+  );
+}
+
+/**
+ * The tap answer once the backend holds the order (S3), in the message
+ * formatting S2 layout: folio and deadline in bold, the store block, the
+ * cancellation notice apart.
+ */
 export function payInStoreHeldReply(input: {
   folio: string | null;
   holdUntil: string;
   location: CheckoutPickupLocation | null | undefined;
 }): string {
-  return (
-    `${endSentence(`Listo, le apartamos ${order(input.folio)} hasta el ${payInStoreDateTime(input.holdUntil)}`)} ` +
-    `Páselo a recoger y pagar en ${payInStoreStoreText(input.location)}. ` +
-    'Si no pasa antes de esa fecha, el pedido se cancela.'
-  );
+  const folio =
+    input.folio === null || input.folio === ''
+      ? 'su pedido'
+      : `su pedido ${bold(input.folio)}`;
+  return [
+    `Listo, le apartamos ${folio} hasta el ${bold(payInStoreDateTime(input.holdUntil))}`,
+    '',
+    ...heldStoreLines(input.location),
+    '',
+    'Si no pasa antes de esa fecha, el pedido se cancela.',
+  ].join('\n');
 }
 
 /**
  * sale.pickup_reminder: "hasta hoy a las {hora}" ("a la 1:…" at 1 o'clock,
  * follow-ups S5). The reminder fires 3 h
  * before the deadline, normally the same local day; a deadline on another
- * day says "mañana" / the date instead of a wrong "hoy".
+ * day says "mañana" / the date instead of a wrong "hoy". Message formatting
+ * F3c: bold folio and deadline, then the shared store block (unknown
+ * location → the feed item's branch name, else «la tienda.»).
  */
 export function pickupReminderText(input: {
   folio: string | null;
@@ -139,10 +166,11 @@ export function pickupReminderText(input: {
   now: Date;
 }): string {
   const deadline = pickupReminderDeadline(input.holdUntil, input.now);
-  return (
-    `${endSentence(`Le recordamos que ${order(input.folio)} está apartado hasta ${deadline}`)} ` +
-    `Páselo a recoger y pagar en ${payInStoreStoreText(input.location, input.branchName)}.`
-  );
+  return [
+    `Le recordamos que ${order(input.folio)} está apartado hasta ${bold(deadline)}`,
+    '',
+    ...heldStoreLines(input.location, branchNameText(input.branchName)),
+  ].join('\n');
 }
 
 /** The reminder deadline, «hoy a las 4:18 p. m.» / «mañana a las …» / the
@@ -154,11 +182,11 @@ export function pickupReminderDeadline(holdUntil: string, now: Date): string {
   return `${day} ${at}`;
 }
 
-/** sale.pickup_expired: the order was cancelled. */
+/** sale.pickup_expired: the order was cancelled (F3c: the offer apart). */
 export function pickupExpiredText(folio: string | null): string {
   const subject = order(folio).replace(/^su/, 'Su');
   return (
-    `${subject} se canceló porque venció el plazo para recogerlo y pagarlo en tienda. ` +
+    `${subject} se canceló porque venció el plazo para recogerlo y pagarlo en tienda.\n\n` +
     'Si todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.'
   );
 }
@@ -194,9 +222,8 @@ export function pickupExtendedText(input: {
   const lead = pickupHoldShortened(input)
     ? 'Actualizamos el plazo de'
     : 'Le ampliamos el plazo de';
-  return endSentence(
-    `${lead} ${order(input.folio)}: ahora puede recogerlo y pagarlo hasta ${pickupNewDeadline(input.holdUntil)}`,
-  );
+  // F3c: the bold deadline closes the sentence, as in the hold reply.
+  return `${lead} ${order(input.folio)}: ahora puede recogerlo y pagarlo hasta el ${bold(payInStoreDateTime(input.holdUntil))}`;
 }
 
 /** «el {fecha y hora}» (also template {{2}} of
@@ -212,7 +239,7 @@ export function pickupNewDeadline(holdUntil: string): string {
  */
 export function pickupExpiredReviewText(folio: string | null): string {
   return (
-    `El plazo de ${order(folio)} venció. ` +
+    `El plazo de ${order(folio)} venció.\n\n` +
     'Como tiene un pago registrado, alguien del equipo le va a contactar para cerrarlo.'
   );
 }

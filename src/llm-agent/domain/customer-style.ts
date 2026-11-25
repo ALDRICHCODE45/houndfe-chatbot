@@ -9,6 +9,8 @@
  * amounts, folios, CLABE and interpolated data are never rewritten.
  */
 
+import { TITLE_EMOJI_LINE } from './whatsapp-format';
+
 export type CustomerRegister = 'usted' | 'tu';
 export type CustomerTone = 'formal' | 'neutral' | 'casual';
 
@@ -285,6 +287,20 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     '¿Te lo enviamos a tu dirección o prefieres recogerlo en tienda?',
   ],
   ['¿Confirma su pedido?', '¿Confirmas tu pedido?'],
+  // Message formatting F2b: the S2 order summary closing («¿Está todo
+  // bien?» reads the same in tú) and its bold SÍ.
+  [
+    '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.',
+    '¿Está todo bien? Responde *SÍ* para crear el pedido, o dime qué cambiar.',
+  ],
+  // Message formatting F3a: the delivery-data SÍ line (before the short
+  // «Responda *SÍ*» pair, which it contains).
+  [
+    'Responda *SÍ* para confirmar estos datos, o dígame qué quiere cambiar.',
+    'Responde *SÍ* para confirmar estos datos, o dime qué quieres cambiar.',
+  ],
+  ['Responda *SÍ*', 'Responde *SÍ*'],
+  ['dígame qué cambiar', 'dime qué cambiar'],
   ['Claro, ¿qué desea cambiar?', 'Claro, ¿qué quieres cambiar?'],
   ['¿Qué desea hacer?', '¿Qué quieres hacer?'],
   // S2 reorder offer, its buttons and replies.
@@ -458,7 +474,8 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['después deberá confirmar', 'después deberás confirmar'],
   ['necesito que confirme', 'necesito que confirmes'],
   ['para que lo confirme de nuevo', 'para que lo confirmes de nuevo'],
-  ['Confirme sus datos de entrega:', 'Confirma tus datos de entrega:'],
+  // Message formatting F3a: the bold delivery-data heading (no colon).
+  ['Confirme sus datos de entrega', 'Confirma tus datos de entrega'],
   ['Usted tiene un crédito de', 'Tienes un crédito de'],
   ['sin costo para usted', 'sin costo para ti'],
   ['Usted paga', 'Pagas'],
@@ -560,16 +577,37 @@ function toTu(text: string): string {
   return out;
 }
 
-function limitEmojis(text: string, keep: number): string {
+/**
+ * Keeps the first `keep` emojis and drops the rest. Message formatting S3:
+ * with `keepTitleEmojis` (server-owned copy only, F2-fix G3) a title emoji
+ * closing a bold title line (`TITLE_EMOJI_LINE`) is never dropped nor
+ * counted; model text never gets that exemption. S2: only the whitespace a
+ * removed leading emoji left at the start of its own line is trimmed, so
+ * item indentation survives.
+ */
+function limitEmojis(
+  text: string,
+  keep: number,
+  keepTitleEmojis: boolean,
+): string {
   let seen = 0;
   let changed = false;
-  const out = text.replace(EMOJI_SEQUENCE, (emoji) => {
-    seen += 1;
-    if (seen <= keep) return emoji;
-    changed = true;
-    return '';
+  const lines = text.split('\n').map((line) => {
+    const titleEmoji = keepTitleEmojis
+      ? (TITLE_EMOJI_LINE.exec(line)?.[1] ?? '')
+      : '';
+    const body = line.slice(0, line.length - titleEmoji.length);
+    let leadingRemoved = false;
+    const out = body.replace(EMOJI_SEQUENCE, (emoji, offset: number) => {
+      seen += 1;
+      if (seen <= keep) return emoji;
+      changed = true;
+      if (offset === 0) leadingRemoved = true;
+      return '';
+    });
+    return (leadingRemoved ? out.replace(/^[ \t]+/, '') : out) + titleEmoji;
   });
-  return changed ? out.replace(/^[ \t]+/gm, '').trim() : text;
+  return changed ? lines.join('\n').trim() : text;
 }
 
 /**
@@ -580,7 +618,7 @@ function limitEmojis(text: string, keep: number): string {
  */
 export function applyCustomerStyle(text: string, style: CustomerStyle): string {
   const registered = style.register === 'tu' ? toTu(text) : text;
-  return limitEmojis(registered, style.emojis ? 1 : 0);
+  return limitEmojis(registered, style.emojis ? 1 : 0, true);
 }
 
 /**
@@ -594,10 +632,14 @@ export function applyCustomerRegister(
   return style.register === 'tu' ? toTu(text) : text;
 }
 
-/** Emoji guard only, for model-authored text the prompt already styled. */
+/**
+ * Emoji guard only, for model-authored text the prompt already styled. The
+ * S3 title-emoji exemption is server copy only (F2-fix G3): a model line
+ * «*Listo* ✅» loses its ✅ for a customer who uses no emojis.
+ */
 export function limitCustomerEmojis(
   text: string,
   style: CustomerStyle,
 ): string {
-  return style.emojis ? text : limitEmojis(text, 0);
+  return style.emojis ? text : limitEmojis(text, 0, false);
 }

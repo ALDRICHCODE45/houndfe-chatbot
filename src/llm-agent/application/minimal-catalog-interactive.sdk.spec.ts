@@ -287,7 +287,7 @@ describe('S4 order summary buttons', () => {
       [call('prepareOrder'), say()],
       'o1',
     );
-    expect(offer.reply).toContain('Resumen de su pedido:');
+    expect(offer.reply).toContain('*Resumen de su pedido* 🧾');
     expect(offer.interactive).toEqual({
       type: 'buttons',
       buttons: [
@@ -305,7 +305,7 @@ describe('S4 order summary buttons', () => {
     const calls = h.seen.length;
     const placed = await h.turn('SÍ', [say('no')], 'o2', confirm);
     expect(h.seen).toHaveLength(calls);
-    expect(placed.reply).toContain('folio B-0042');
+    expect(placed.reply).toContain('*Folio:* B-0042');
     // Only the payment-method button; never a confirm button.
     expect(placed.interactive).toMatchObject({
       type: 'buttons',
@@ -364,7 +364,7 @@ describe('S4 order summary buttons', () => {
     const stale = await h.turn('SÍ', [say('no')], 'o3', buttonIds(first)[0]);
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     expect(stale.reply).toMatch(/^Ese botón ya no está vigente\./);
-    expect(stale.reply).toContain('Resumen de su pedido:');
+    expect(stale.reply).toContain('*Resumen de su pedido* 🧾');
     const current = buttonIds(stale)[0];
     expect(current).toMatch(/^order_confirm:/);
     expect([buttonIds(first)[0], buttonIds(second)[0]]).not.toContain(current);
@@ -438,7 +438,7 @@ describe('S2 cart summary invites the customer to continue', () => {
     const h = orderHarness();
     await h.unconfirmed();
     const view = await viewCart(h, '¿Qué llevo en mi carrito?', 'c1');
-    expect(view.reply).toContain('Su carrito:');
+    expect(view.reply).toContain('*Su carrito*');
     expect(view.reply.endsWith(`${CART_TAIL}\n\n${CART_QUESTION}`)).toBe(true);
     expect(view.interactive).toEqual({
       type: 'buttons',
@@ -570,7 +570,7 @@ describe('S2 cart summary invites the customer to continue', () => {
     expect(h.seen).toHaveLength(calls);
     expect(h.api.getCustomerCheckoutContext).toHaveBeenCalledTimes(lookups);
     expect(stale.reply).toMatch(/^Ese botón ya no está vigente\./);
-    expect(stale.reply).toContain('3 × $15.00 MXN');
+    expect(stale.reply).toContain('3 × $15.00 = *$45.00*');
     expect(stale.reply.endsWith(CART_QUESTION)).toBe(true);
     const current = buttonIds(stale);
     expect(current).toHaveLength(2);
@@ -600,7 +600,7 @@ describe('S4 delivery-data summary buttons', () => {
       [call('prepareOrder'), say()],
       'd1',
     );
-    expect(offer.reply).toMatch(/^Confirme sus datos de entrega:/);
+    expect(offer.reply).toMatch(/^\*Confirme sus datos de entrega\*/);
     expect(offer.interactive).toEqual({
       type: 'buttons',
       buttons: [

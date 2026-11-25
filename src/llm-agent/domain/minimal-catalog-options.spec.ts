@@ -149,8 +149,8 @@ describe('planCatalogOptions + renderCatalogOptions (S13)', () => {
     expect(out.text).toBe(
       [
         'Croquetas Pedigree no tengo, pero tengo estas opciones:',
-        '• *[PRUEBA] Croquetas Naturales sin Grano Salmón y Camote 2 kg* (de otra marca): Croquetas para perros adultos de raza grande. $450.00 MXN',
-        '• *Pedigree Dentastix Premios Dentales Perro Mediano 7 pzas*: Premios para la limpieza dental de su perro. $89.00 MXN',
+        '• *[PRUEBA] Croquetas Naturales sin Grano Salmón y Camote 2 kg* (de otra marca): Croquetas para perros adultos de raza grande. $450.00',
+        '• *Pedigree Dentastix Premios Dentales Perro Mediano 7 pzas*: Premios para la limpieza dental de su perro. $89.00',
         'Además, tengo Pedigree Adulto Trozos de Res en Salsa Lata 375 g, pero está agotado.',
         '',
         '¿Cuál le gustaría llevar? Y si la que busca es Pedigree Adulto Trozos de Res en Salsa Lata 375 g, con gusto le averiguo cuándo nos vuelve a llegar.',
@@ -193,8 +193,8 @@ describe('planCatalogOptions + renderCatalogOptions (S13)', () => {
     expect(out.text).toBe(
       [
         'Encontré estas opciones:',
-        '• *Nupec Cachorro Raza Pequeña 2 kg*: $100.00 MXN',
-        '• *Nupec Cachorro Raza Grande 8 kg*: $100.00 MXN',
+        '• *Nupec Cachorro Raza Pequeña 2 kg*: $100.00',
+        '• *Nupec Cachorro Raza Grande 8 kg*: $100.00',
         '',
         CATALOG_CHOOSE_QUESTION,
       ].join('\n'),
@@ -418,7 +418,7 @@ describe('planCatalogOptions + renderCatalogOptions (S13)', () => {
     expect(out.text).toBe(
       [
         'Encontré estas opciones:',
-        '• *Croquetas Nupec Adulto*: 2 kg $200.00 MXN, 8 kg $700.00 MXN (agotada)',
+        '• *Croquetas Nupec Adulto*: 2 kg $200.00, 8 kg $700.00 (agotada)',
         'Además, tengo Croquetas Ganador Cachorro (4 kg y 10 kg), pero está agotado.',
         '',
         // Multi-presentation agotado has no single restock subject: no promise.
@@ -492,8 +492,50 @@ describe('planCatalogOptions + renderCatalogOptions (S13)', () => {
       [planCatalogOptions('croquetas', [many])!],
       { restockAvailable: false, style: usted },
     ).text;
-    expect(text).toContain('P6 $1.00 MXN y 4 presentaciones más');
+    expect(text).toContain('P6 $1.00 y 4 presentaciones más');
     expect(text).not.toContain('P7');
+  });
+
+  it('[F4/S4] option amounts use money(): thousands separator, two decimals, no «MXN»', () => {
+    const big = item(86, {
+      name: 'Croquetas Nupec Adulto 15 kg',
+      price: {
+        priceCents: 125000,
+        fromPriceCents: null,
+        promoPriceCents: null,
+        promotionEvaluationStatus: 'needs_human_review',
+      },
+    });
+    const from = item(87, {
+      name: 'Croquetas Nupec Senior',
+      price: {
+        priceCents: null,
+        fromPriceCents: 1099950,
+        promoPriceCents: null,
+        promotionEvaluationStatus: 'needs_human_review',
+      },
+    });
+    const sized = item(88, {
+      name: 'Croquetas Nupec Cachorro',
+      variants: [
+        {
+          variantId: vid(200),
+          name: '20 kg',
+          option: null,
+          value: null,
+          priceCents: 189900,
+          stock: available,
+        },
+      ],
+    });
+    const text = renderCatalogOptions(
+      [planCatalogOptions('croquetas nupec', [big, from, sized])!],
+      { restockAvailable: false, style: usted },
+    ).text;
+    expect(text).toContain('• *Croquetas Nupec Adulto 15 kg*: $1,250.00');
+    expect(text).toContain('• *Croquetas Nupec Senior*: desde $10,999.50');
+    expect(text).toContain('• *Croquetas Nupec Cachorro*: 20 kg $1,899.00');
+    expect(text).not.toContain('MXN');
   });
 
   it('no classifiable item, no token, or no item → null (the model answers as before)', () => {

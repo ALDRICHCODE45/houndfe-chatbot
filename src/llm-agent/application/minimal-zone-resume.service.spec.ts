@@ -257,7 +257,7 @@ describe('MinimalZoneResumeService (S4: zone approved resumes checkout)', () => 
     );
     expect(h.quotes.calls).toHaveLength(1);
     expect(resume!.summary.text).toContain(MINIMAL_ORDER_SUMMARY_HEADING);
-    expect(resume!.summary.text).toContain('Total a pagar: $30.00 MXN');
+    expect(resume!.summary.text).toContain('*Total a pagar: $30.00*');
     const status = h.order.offerStatus(SENDER)!;
     expect(status).toMatchObject({ armed: false });
     expect(resume!.summary.buttons).toEqual([
@@ -328,9 +328,9 @@ describe('MinimalZoneResumeService (S4: zone approved resumes checkout)', () => 
     );
     const resume = (await h.prepare('SURCHARGE'))!;
     expect(resume.shippingSentence).toBe(
-      'el envío cuesta $125.00 MXN y llega en aproximadamente 3 días hábiles',
+      'el envío cuesta $125.00 y llega en aproximadamente 3 días hábiles',
     );
-    expect(resume.summary.text).toContain('Total a pagar: $155.00 MXN');
+    expect(resume.summary.text).toContain('*Total a pagar: $155.00*');
   });
 
   it('a credit that covers the surcharge reads as free; one business day is singular', async () => {

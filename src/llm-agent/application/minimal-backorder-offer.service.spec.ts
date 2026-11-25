@@ -145,7 +145,7 @@ function world(
 }
 
 const SCHEDULED_REPLY =
-  'Listo, quedó agendado su pedido BO-000012: 2 × Croquetas Adulto 18 kg a $1149.00 MXN c/u. Le aviso en cuanto llegue (aprox. el 26 de noviembre); no paga nada hasta entonces.';
+  'Listo, quedó agendado su pedido *BO-000012*:\n• Croquetas Adulto 18 kg\n   2 × $1,149.00 = *$2,298.00*\n\nLe aviso en cuanto llegue (aprox. el 26 de noviembre); no paga nada hasta entonces.';
 
 describe('arming the offer (called after Meta accepted the estimate)', () => {
   it('has the capability shape the coordinator resolves through the registry', () => {
@@ -260,7 +260,9 @@ describe('accepting the offer with a stated count (S1, S14)', () => {
     });
     await w.service.arm({ ...OFFER, variantId: VARIANT, statedQuantity: 2 });
     const result = await w.turn({ text: 'sí' });
-    expect(replyOf(result)).toContain('2 × Croquetas Adulto 18 kg (18 kg) a ');
+    expect(replyOf(result)).toContain(
+      '• Croquetas Adulto 18 kg (18 kg)\n   2 × ',
+    );
     expect(w.client.createBackorder).toHaveBeenCalledWith(
       expect.objectContaining({ variantId: VARIANT }),
       expect.any(String),
@@ -305,7 +307,7 @@ describe('accepting the offer with a stated count (S1, S14)', () => {
     expect(result).toEqual({
       kind: 'reply',
       reply:
-        'Listo, quedó agendado su pedido BO-000012: 2 × Croquetas Adulto 18 kg a $1149.00 MXN c/u. Le aviso en cuanto llegue; no paga nada hasta entonces.',
+        'Listo, quedó agendado su pedido *BO-000012*:\n• Croquetas Adulto 18 kg\n   2 × $1,149.00 = *$2,298.00*\n\nLe aviso en cuanto llegue; no paga nada hasta entonces.',
     });
   });
 
@@ -357,7 +359,7 @@ describe('asking the count when none was stated (S14)', () => {
     await w.arm(null);
     await w.turn({ text: 'sí' });
     const result = await w.turn({ text });
-    expect(replyOf(result)).toContain(`${quantity} × Croquetas`);
+    expect(replyOf(result)).toContain(`\n   ${quantity} × $1,149.00 = `);
     expect(w.client.createBackorder).toHaveBeenCalledWith(
       expect.objectContaining({ quantity }),
       `backorder:${DECISION}:${SENDER}`,

@@ -353,7 +353,7 @@ function setup(options: { manage?: boolean; active?: BackorderBot[] } = {}) {
 type Harness = ReturnType<typeof setup>;
 const reply = (decision: unknown) => (decision as { reply: string }).reply;
 const PAYMENT_QUESTION = 'Para terminar solo falta el pago. ¿Cómo desea pagar?';
-const LEAD = 'Pedido con folio B-0042. Total a pagar: $30.00 MXN.';
+const LEAD = 'Pedido con folio B-0042. Total a pagar: $30.00.';
 
 const interactiveOf = (decision: unknown) =>
   (decision as { interactive?: { buttons?: Array<{ id: string }> } })

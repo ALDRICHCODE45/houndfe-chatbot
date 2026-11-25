@@ -19,6 +19,31 @@ const systemPromptLiteral = z
   .brand<'SYSTEM_PROMPT_CONTRACT'>();
 
 /**
+ * Message formatting F4 (S1/S2/S4): the ONE formatting block for every
+ * model-written reply (minimal route and composed sale-flow prompt alike).
+ * Its list lines use the catalog option style «• *Nombre*: $1,250.00» (one
+ * item per line, 3-space detail lines, money «$1,250.00») and it keeps the
+ * emoji rule: the title emojis 🧾 🚚 ✅ belong to application messages only.
+ * The model never imitates the order summary, the delivery-data confirmation
+ * or the order-created message, and repeats bank details only exactly as a
+ * tool returns them (sale-flow step 12) (IMITATED_CONFIRMATION replaces an
+ * imitated summary with the real step). `toWhatsAppText` still converts
+ * stray Markdown afterwards.
+ */
+export const WHATSAPP_FORMAT_GUIDANCE =
+  'Formato WhatsApp de tus respuestas: párrafos cortos, separados por una línea en blanco. ' +
+  'Un solo producto: un párrafo breve y natural, sin lista. ' +
+  'Varios productos: uno por línea, «• *Nombre*: $1,250.00» (el precio solo cuando corresponda); ' +
+  'un detalle necesario va en la línea siguiente con tres espacios de sangría. ' +
+  'Negritas con un solo asterisco (*así*), solo para nombres de producto y precios. ' +
+  'Importes como «$1,250.00»: separador de miles, dos decimales y sin «MXN». ' +
+  'Sin encabezados (#), tablas ni listas anidadas, y sin imágenes ni enlaces Markdown (las fotos se envían aparte). ' +
+  'Emojis: solo si el cliente los usa, como máximo uno natural por mensaje y no en cada turno; nunca para ' +
+  'celebrar un faltante confirmado, un error o un rechazo, ni dentro de mensajes literales; ' +
+  'nunca 🧾, 🚚 ni ✅, reservados a los mensajes de la aplicación. ' +
+  'Nunca imites el resumen del pedido, la confirmación de datos de entrega ni el mensaje de pedido creado: los envía la aplicación. Datos bancarios: nunca los escribas de memoria; si una herramienta te los devuelve, repítelos exactamente como vienen. ';
+
+/**
  * System prompt the runner sends to the LLM on every turn.
  *
  * The prompt enforces four non-negotiable behaviours the agent must
@@ -68,7 +93,7 @@ export const SYSTEM_PROMPT =
   'si ya nombró un producto, no preguntes "¿En qué puedo ayudarle?". ' +
   'Un candidato relevante: respuesta breve y natural con datos verificados, ' +
   'sin narrar el proceso de búsqueda; no uses una ficha anidada de nombre/Precio/Disponibilidad. ' +
-  'Varios candidatos: opciones breves con diferencias útiles, en viñetas solo si ayudan, ' +
+  'Varios candidatos: opciones breves con diferencias útiles, una por línea como indica el formato WhatsApp, ' +
   'y una pregunta concreta para elegir cuando haga falta. En ambos casos, conserva nombre, dosis y forma necesarios ' +
   'para identificar; no infieras selección ni omitas la confirmación requerida. ' +
   'Tras presentar candidatos reales, si falta confirmar, pregunta "¿Buscaba esa presentación?" (de tú: "¿Buscabas esa presentación?") ' +
@@ -86,8 +111,7 @@ export const SYSTEM_PROMPT =
   'ni te despidas ni cierres por preferencia antes de resolver la consulta; propone un solo siguiente paso útil ' +
   'cuando corresponda. Sí puedes agradecer información o paciencia cuando el contexto lo amerite. ' +
   'Al cerrar de verdad una gestión resuelta, agradece la preferencia; agradece la paciencia solo si el contexto muestra una espera real. ' +
-  'Emojis: solo si el cliente los usa, como máximo uno natural por mensaje y no en cada turno; nunca para ' +
-  'celebrar un faltante confirmado, un error o un rechazo, ni dentro de mensajes literales. ' +
+  WHATSAPP_FORMAT_GUIDANCE +
   'Traduce IDs, marcadores técnicos y resultados internos a lenguaje útil para el cliente: ' +
   'si falta una selección, pregunta por el producto o presentación concretos, ' +
   'no recites UUIDs ni estados internos; conserva intacta la evidencia para las herramientas. ' +

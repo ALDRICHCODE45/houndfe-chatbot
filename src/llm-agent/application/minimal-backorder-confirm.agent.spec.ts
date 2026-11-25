@@ -300,7 +300,7 @@ const buttons = (decision: unknown) =>
   ).interactive?.buttons ?? [];
 const TAP = `backorder_confirm:${BO_ID}`;
 const ADDED =
-  'Listo, su pedido apartado BO-000012 (2 × Croquetas Adulto 18 kg) ya está en su carrito a $1099.00 MXN c/u. Se lo tenemos apartado hasta el 21 de noviembre a las 9:00 a. m.';
+  'Listo, su pedido apartado *BO-000012* ya está en su carrito:\n• Croquetas Adulto 18 kg\n   2 × $1,099.00 = *$2,198.00*\n\nSe lo tenemos apartado hasta *el 21 de noviembre a las 9:00 a. m.*';
 
 describe('restock backorder confirm through the customer turn', () => {
   beforeEach(() =>
@@ -335,7 +335,7 @@ describe('restock backorder confirm through the customer turn', () => {
       [
         ADDED,
         '',
-        'Su carrito:\n• Croquetas Adulto 18 kg: 2 × $1099.00 MXN; importe $2198.00 MXN (pedido apartado BO-000012)\nTotal de productos: $2198.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+        '*Su carrito*\n• Croquetas Adulto 18 kg (pedido apartado BO-000012)\n   2 × $1,099.00 = *$2,198.00*\n\n*Total de productos: $2,198.00*\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
         '',
         '¿Desea agregar algo más o seguimos con su compra?',
       ].join('\n'),
@@ -356,9 +356,9 @@ describe('restock backorder confirm through the customer turn', () => {
     const decision = await h.turn('Confirmo mi pedido apartado', [], {
       interactiveReplyId: TAP,
     });
-    expect(reply(decision)).toContain('• Ibuprofeno: 1 × $15.00 MXN');
+    expect(reply(decision)).toContain('• Ibuprofeno\n   1 × $15.00 = *$15.00*');
     expect(reply(decision)).toContain('(pedido apartado BO-000012)');
-    expect(reply(decision)).toContain('Total de productos: $2213.00 MXN.');
+    expect(reply(decision)).toContain('*Total de productos: $2,213.00*');
     expect((await h.slot())?.items).toHaveLength(2);
     expect(h.seen).toHaveLength(0);
   });
@@ -407,11 +407,11 @@ describe('restock backorder confirm through the customer turn', () => {
       interactiveReplyId: pickup!.id,
       inboundEvent: EVENT('wamid.s1'),
     });
-    expect(reply(summary)).toContain('Resumen de su pedido:');
+    expect(reply(summary)).toContain('*Resumen de su pedido* 🧾');
     expect(reply(summary)).toContain(
-      '• Croquetas Adulto 18 kg: 2 × $1099.00 MXN; importe $2198.00 MXN (pedido apartado BO-000012)',
+      '• Croquetas Adulto 18 kg (pedido apartado BO-000012)\n   2 × $1,099.00 = *$2,198.00*',
     );
-    expect(reply(summary)).toContain('Total a pagar: $2198.00 MXN');
+    expect(reply(summary)).toContain('*Total a pagar: $2,198.00*');
     (summary as { onSent: () => void }).onSent();
 
     await h.turn('SÍ', [], { inboundEvent: EVENT('wamid.s2') });
@@ -508,7 +508,9 @@ describe('the bare yes only confirms when nothing else could own it', () => {
       say('Su pedido apartado BO-000012 ya llegó. ¿Lo confirma?'),
     ]);
     const decision = await h.turn('sí', []);
-    expect(reply(decision)).toContain('Listo, su pedido apartado BO-000012');
+    expect(reply(decision)).toContain(
+      'Listo, su pedido apartado *BO-000012* ya está en su carrito:',
+    );
     expect((await h.slot())?.items).toHaveLength(1);
   });
 
@@ -549,7 +551,7 @@ describe('reschedule taps through the customer turn', () => {
       interactiveReplyId: `backorder_reschedule:${BO_ID}`,
     });
     expect(reply(scheduled)).toContain(
-      'Listo, quedó agendado su pedido BO-000020',
+      'Listo, quedó agendado su pedido *BO-000020*:',
     );
     expect(h.backorders.createBackorder).toHaveBeenCalledWith(
       expect.objectContaining({ sourceDecisionId: BO_DECISION, quantity: 2 }),

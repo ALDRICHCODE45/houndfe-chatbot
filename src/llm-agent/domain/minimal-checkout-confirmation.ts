@@ -39,6 +39,7 @@ import {
 } from '../../conversation/domain/minimal-checkout-draft';
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import { classifyConfirmationReply } from './confirmation-reply';
+import { bold, plain, sectionTitle } from './whatsapp-format';
 
 /** Pending-confirmation TTL; mirrors the RESTOCK volatile lifecycle. */
 export const MINIMAL_CHECKOUT_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
@@ -125,13 +126,28 @@ export function evaluateMinimalCheckoutReadiness(
   return { ready: missing.length === 0, missing };
 }
 
-/** First line of the server-owned delivery-data summary. */
-export const MINIMAL_CHECKOUT_SUMMARY_HEADING =
-  'Confirme sus datos de entrega:';
+/**
+ * First line of the server-owned delivery-data summary (message formatting
+ * F3a: bold, no title emoji). Every `.includes` check finds it in the styled
+ * reply; its tú form comes from `applyCustomerRegister`.
+ */
+export const MINIMAL_CHECKOUT_SUMMARY_HEADING = sectionTitle(
+  'Confirme sus datos de entrega',
+);
+
+/** Last line of the delivery-data summary: the SÍ/change question. */
+export const MINIMAL_CHECKOUT_SUMMARY_CLOSING =
+  'Responda *SÍ* para confirmar estos datos, o dígame qué quiere cambiar.';
+
+/** «*Label:* value», the value `plain` (F2-fix G1). */
+const field = (label: string, value: string | null): string =>
+  `${bold(`${label}:`)} ${plain(value ?? '')}`.trimEnd();
 
 /**
- * Deterministic server-owned confirmation summary. Short on purpose (F2):
- * the order summary that follows asks its own explicit SÍ.
+ * Deterministic server-owned confirmation summary in the message-formatting
+ * S2 layout: bold heading, one field per line with a bold label, the SÍ
+ * line apart. Short on purpose (F2): the order summary that follows asks
+ * its own explicit SÍ.
  */
 export function renderMinimalCheckoutConfirmation(
   draft: MinimalCheckoutDraft,
@@ -139,18 +155,29 @@ export function renderMinimalCheckoutConfirmation(
   const fields = addressFields(draft);
   const name = [draft.customer.firstName, draft.customer.lastName]
     .filter((part): part is string => isFilled(part))
+    .map(plain)
+    .filter((part) => part !== '')
     .join(' ');
   const location = isFilled(fields.city) ? fields.city : fields.municipality;
+  const street = [
+    plain(fields.street ?? ''),
+    plain(fields.exteriorNumber ?? ''),
+  ]
+    .filter((part) => part !== '')
+    .join(' ');
+  const interior = plain(fields.interiorNumber ?? '');
   return [
     MINIMAL_CHECKOUT_SUMMARY_HEADING,
-    `Nombre: ${name}`,
-    `Calle: ${fields.street ?? ''} ${fields.exteriorNumber ?? ''}${isFilled(fields.interiorNumber) ? `, int. ${fields.interiorNumber}` : ''}`.trim(),
-    `Colonia: ${fields.neighborhood ?? ''}`,
-    `Código postal: ${fields.zipCode ?? ''}`,
-    `Ciudad o municipio: ${location ?? ''}`,
-    `Estado: ${fields.state ?? ''}`,
     '',
-    'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.',
+    // F2a advisory: a name `plain` empties leaves no bare «*Nombre:*».
+    ...(name === '' ? [] : [field('Nombre', name)]),
+    field('Calle', interior === '' ? street : `${street}, int. ${interior}`),
+    field('Colonia', fields.neighborhood),
+    field('Código postal', fields.zipCode),
+    field('Ciudad o municipio', location),
+    field('Estado', fields.state),
+    '',
+    MINIMAL_CHECKOUT_SUMMARY_CLOSING,
   ].join('\n');
 }
 

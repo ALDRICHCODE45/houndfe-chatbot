@@ -191,7 +191,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     expect(result).toEqual({
       kind: 'handled',
       reply:
-        'Revisión de compra: subtotal de productos $30.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, cotizar el envío o elegir recoger en tienda y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
+        'Revisión de compra: subtotal de productos $30.00. No incluye envío. Falta confirmar sus datos y dirección, cotizar el envío o elegir recoger en tienda y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
     });
     expect(String(f.seen[0].system)).toContain('reviewCheckout');
     expect(Object.keys(f.seen[0].tools ?? {})).not.toContain('createSale');
@@ -284,7 +284,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     f.steps([call(), call('getCart'), say]);
     const result = await review(f);
     expect(result.kind === 'handled' && result.reply).toContain(
-      'Revisión de compra: subtotal de productos $30.00 MXN.',
+      'Revisión de compra: subtotal de productos $30.00.',
     );
   });
 
@@ -310,7 +310,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     f.steps([call(), call('reviewCheckout', { priceCents: 1 }), say]);
     const result = await review(f);
     expect(result.kind === 'handled' && result.reply).toContain(
-      'Revisión de compra: subtotal de productos $30.00 MXN.',
+      'Revisión de compra: subtotal de productos $30.00.',
     );
     expect(f.api.getStock).toHaveBeenCalledTimes(1);
     expect(f.api.evaluateCart).toHaveBeenCalledTimes(1);
@@ -363,7 +363,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
       expect(result).toMatchObject({
         kind: 'handled',
         reply:
-          'Su carrito:\n• Product: 2 × $15.00 MXN; importe $30.00 MXN\nTotal de productos: $30.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
+          '*Su carrito*\n• Product\n   2 × $15.00 = *$30.00*\n\n*Total de productos: $30.00*\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
       });
       const state = await f.store.get(SENDER);
       expect(state?.data.minimalCart).toEqual({
@@ -436,7 +436,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     expect(result).toMatchObject({
       kind: 'handled',
       reply:
-        'Su carrito:\n• Product: 2 × $15.00 MXN; importe $30.00 MXN\nTotal de productos: $30.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
+        '*Su carrito*\n• Product\n   2 × $15.00 = *$30.00*\n\n*Total de productos: $30.00*\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
     });
   });
 
@@ -466,7 +466,7 @@ describe('Checkout preflight reply when the checkout flow is available', () => {
     expect(
       minimalCheckoutReply(incomplete, { checkout: true, shipping: false }),
     ).toBe(
-      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.',
+      'Revisión de compra: subtotal de productos $45.00. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.',
     );
   });
 
@@ -474,13 +474,13 @@ describe('Checkout preflight reply when the checkout flow is available', () => {
     expect(
       minimalCheckoutReply(incomplete, { checkout: true, shipping: true }),
     ).toBe(
-      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega, cotizar el envío o elegir recoger en tienda y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.',
+      'Revisión de compra: subtotal de productos $45.00. No incluye envío. Para continuar falta confirmar sus datos y dirección de entrega, cotizar el envío o elegir recoger en tienda y después confirmar su pedido. Si desea comprar, dígame «quiero comprar» y revisaré sus direcciones guardadas. No se creó ningún pedido ni se reservaron existencias.',
     );
   });
 
   it('keeps the previous wording without the checkout flow', () => {
     expect(minimalCheckoutReply(incomplete)).toBe(
-      'Revisión de compra: subtotal de productos $45.00 MXN. No incluye envío. Falta confirmar sus datos y dirección, cotizar el envío o elegir recoger en tienda y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
+      'Revisión de compra: subtotal de productos $45.00. No incluye envío. Falta confirmar sus datos y dirección, cotizar el envío o elegir recoger en tienda y confirmar explícitamente el total final. No se creó ningún pedido ni se reservaron existencias.',
     );
   });
 });

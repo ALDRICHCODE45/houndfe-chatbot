@@ -65,7 +65,7 @@ const adjust = (
 // S13: a search turn's reply is the application's options message.
 const KONG_OPTIONS = [
   'Encontré estas opciones:',
-  '• *Juguete Kong Classic para Perro*: Juguete de hule resistente rellenable con premios. Juguete Kong Classic para Perro Chico $249.00 MXN, Juguete Kong Classic para Perro Mediano $329.00 MXN, Juguete Kong Classic para Perro Grande $429.00 MXN (agotada)',
+  '• *Juguete Kong Classic para Perro*: Juguete de hule resistente rellenable con premios. Juguete Kong Classic para Perro Chico $249.00, Juguete Kong Classic para Perro Mediano $329.00, Juguete Kong Classic para Perro Grande $429.00 (agotada)',
   '',
   '¿Cuál le gustaría llevar?',
 ].join('\n');
@@ -308,7 +308,7 @@ describe('S5 cart change during checkout', () => {
       say(),
     ]);
     const summary = await h.turn('sí');
-    expect(summary.reply).toContain('Resumen de su pedido:');
+    expect(summary.reply).toContain('*Resumen de su pedido* 🧾');
     expect(summary.media).toBeUndefined();
     return summary;
   }
@@ -330,8 +330,8 @@ describe('S5 cart change during checkout', () => {
     ]);
     expect(changed.reply.startsWith('Listo, actualicé su carrito.')).toBe(true);
     expect(changed.reply).not.toContain('Su carrito:');
-    expect(changed.reply).toContain('Resumen de su pedido:');
-    expect(changed.reply).toContain(': 2 × $179.00 MXN');
+    expect(changed.reply).toContain('*Resumen de su pedido* 🧾');
+    expect(changed.reply).toContain('\n   2 × $179.00 = *$358.00*');
     expect(changed.media).toBeUndefined();
   });
 
@@ -350,7 +350,7 @@ describe('S5 cart change during checkout', () => {
     ]);
     expect(changed.reply.startsWith('Listo, actualicé su carrito.')).toBe(true);
     expect(changed.reply).not.toContain('Su carrito:');
-    expect(changed.reply).toContain('Resumen de su pedido:');
+    expect(changed.reply).toContain('*Resumen de su pedido* 🧾');
     expect(changed.media).toBeUndefined();
   });
 

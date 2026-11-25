@@ -349,7 +349,7 @@ describe('reschedule after an expiry', () => {
     );
     expect(backorderRescheduleKey(BO_ID)).toBe(`backorder-reschedule:${BO_ID}`);
     expect(textOf(turn)).toBe(
-      'Listo, quedó agendado su pedido BO-000020: 2 × Croquetas Adulto 18 kg a $1149.00 MXN c/u. Le aviso en cuanto llegue (aprox. el 27 de noviembre); no paga nada hasta entonces.',
+      'Listo, quedó agendado su pedido *BO-000020*:\n• Croquetas Adulto 18 kg\n   2 × $1,149.00 = *$2,298.00*\n\nLe aviso en cuanto llegue (aprox. el 27 de noviembre); no paga nada hasta entonces.',
     );
   });
 

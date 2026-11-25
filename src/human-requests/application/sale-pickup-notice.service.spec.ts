@@ -50,14 +50,15 @@ const LOCATION: CheckoutPickupLocation = {
     summary: 'Lunes a sábado: 09:00–18:00. Domingo: cerrado.',
   },
 };
+// Message formatting F3c: the shared store block (bold name, address, hours).
 const STORE =
-  'Sucursal Centro: Av. Juárez 123, Centro, Cuauhtémoc, Ciudad de México, C.P. 06000. Horario: Lunes a sábado: 09:00–18:00. Domingo: cerrado';
+  '*Sucursal Centro*\nAv. Juárez 123, Centro, Cuauhtémoc, Ciudad de México, C.P. 06000\n*Horario:* Lunes a sábado: 09:00–18:00. Domingo: cerrado.';
 
-const REMINDER = `Le recordamos que su pedido B-0042 está apartado hasta hoy a las 12:30 p. m. Páselo a recoger y pagar en ${STORE}.`;
+const REMINDER = `Le recordamos que su pedido *B-0042* está apartado hasta *hoy a las 12:30 p. m.*\n\nPáselo a recoger y pagar en ${STORE}`;
 const EXPIRED =
-  'Su pedido B-0042 se canceló porque venció el plazo para recogerlo y pagarlo en tienda. Si todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.';
+  'Su pedido *B-0042* se canceló porque venció el plazo para recogerlo y pagarlo en tienda.\n\nSi todavía lo quiere, con gusto le ayudo a pedirlo de nuevo.';
 const EXTENDED =
-  'Le ampliamos el plazo de su pedido B-0042: ahora puede recogerlo y pagarlo hasta el jueves 19 de noviembre a las 12:30 p. m.';
+  'Le ampliamos el plazo de su pedido *B-0042*: ahora puede recogerlo y pagarlo hasta el *jueves 19 de noviembre a las 12:30 p. m.*';
 
 type SaleType =
   | 'sale.pickup_reminder'
@@ -309,15 +310,15 @@ describe('pay in store sale notices (S3)', () => {
   it.each<[SaleType, string]>([
     [
       'sale.pickup_reminder',
-      `Te recordamos que tu pedido B-0042 está apartado hasta hoy a las 12:30 p. m. Pásalo a recoger y pagar en ${STORE}.`,
+      `Te recordamos que tu pedido *B-0042* está apartado hasta *hoy a las 12:30 p. m.*\n\nPásalo a recoger y pagar en ${STORE}`,
     ],
     [
       'sale.pickup_expired',
-      'Tu pedido B-0042 se canceló porque venció el plazo para recogerlo y pagarlo en tienda. Si todavía lo quieres, con gusto te ayudo a pedirlo de nuevo.',
+      'Tu pedido *B-0042* se canceló porque venció el plazo para recogerlo y pagarlo en tienda.\n\nSi todavía lo quieres, con gusto te ayudo a pedirlo de nuevo.',
     ],
     [
       'sale.pickup_extended',
-      'Te ampliamos el plazo de tu pedido B-0042: ahora puedes recogerlo y pagarlo hasta el jueves 19 de noviembre a las 12:30 p. m.',
+      'Te ampliamos el plazo de tu pedido *B-0042*: ahora puedes recogerlo y pagarlo hasta el *jueves 19 de noviembre a las 12:30 p. m.*',
     ],
   ])('%s in tú for a tú customer', async (type, text) => {
     const h = harness();
@@ -331,7 +332,7 @@ describe('pay in store sale notices (S3)', () => {
     h.state.record = { ...h.state.record!, pickupLocation: null };
     await h.service.accept(saleItem('1', 'sale.pickup_reminder'));
     expect(h.sent[0].text).toBe(
-      'Le recordamos que su pedido B-0042 está apartado hasta hoy a las 12:30 p. m. Páselo a recoger y pagar en la tienda.',
+      'Le recordamos que su pedido *B-0042* está apartado hasta *hoy a las 12:30 p. m.*\n\nPáselo a recoger y pagar en la tienda.',
     );
   });
 
@@ -500,9 +501,9 @@ describe('pay in store sale notices (S3)', () => {
   // ---------------------------------------------------------------------
 
   const UPDATED =
-    'Actualizamos el plazo de su pedido B-0042: ahora puede recogerlo y pagarlo hasta el jueves 19 de noviembre a las 12:30 p. m.';
+    'Actualizamos el plazo de su pedido *B-0042*: ahora puede recogerlo y pagarlo hasta el *jueves 19 de noviembre a las 12:30 p. m.*';
   const REVIEW =
-    'El plazo de su pedido B-0042 venció. Como tiene un pago registrado, alguien del equipo le va a contactar para cerrarlo.';
+    'El plazo de su pedido *B-0042* venció.\n\nComo tiene un pago registrado, alguien del equipo le va a contactar para cerrarlo.';
   const EARLIER = '2026-11-19T15:00:00.000Z';
   const LATER = '2026-11-20T18:30:00.000Z';
 
@@ -567,12 +568,12 @@ describe('pay in store sale notices (S3)', () => {
     [
       'sale.pickup_extended',
       { direction: 'SHORTENED' },
-      'Actualizamos el plazo de tu pedido B-0042: ahora puedes recogerlo y pagarlo hasta el jueves 19 de noviembre a las 12:30 p. m.',
+      'Actualizamos el plazo de tu pedido *B-0042*: ahora puedes recogerlo y pagarlo hasta el *jueves 19 de noviembre a las 12:30 p. m.*',
     ],
     [
       'sale.pickup_expired_review',
       {},
-      'El plazo de tu pedido B-0042 venció. Como tienes un pago registrado, alguien del equipo te va a contactar para cerrarlo.',
+      'El plazo de tu pedido *B-0042* venció.\n\nComo tienes un pago registrado, alguien del equipo te va a contactar para cerrarlo.',
     ],
   ])('%s in tú for a tú customer', async (type, payload, text) => {
     const h = harness();
@@ -615,7 +616,7 @@ describe('pay in store sale notices (S3)', () => {
       }),
     );
     expect(h.sent[0].text).toBe(
-      'Le recordamos que su pedido B-0042 está apartado hasta hoy a las 12:30 p. m. Páselo a recoger y pagar en Sucursal Norte.',
+      'Le recordamos que su pedido *B-0042* está apartado hasta *hoy a las 12:30 p. m.*\n\nPáselo a recoger y pagar en *Sucursal Norte*',
     );
   });
 

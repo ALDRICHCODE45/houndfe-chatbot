@@ -264,15 +264,21 @@ describe('T5a pet-less carts are byte-identical (item 3)', () => {
     const offer = await h.offer();
     expect(offer.reply).toBe(
       [
-        'Resumen de su pedido:',
-        '• Ibuprofeno: 2 × $15.00 MXN; importe $30.00 MXN',
-        '• Croquetas Adulto 18 kg: 1 × $1200.00 MXN; importe $1200.00 MXN',
-        'Total de productos: $1230.00 MXN',
-        'Datos del cliente: Ana',
-        'Recoge en tienda (sin costo de envío)',
-        'Total a pagar: $1230.00 MXN',
+        '*Resumen de su pedido* 🧾',
         '',
-        'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
+        '*Productos*',
+        '• Ibuprofeno',
+        '   2 × $15.00 = *$30.00*',
+        '• Croquetas Adulto 18 kg',
+        '   1 × $1,200.00 = *$1,200.00*',
+        '',
+        '*Datos del cliente*',
+        'Ana',
+        '',
+        '*Envío:* recoge en tienda — sin costo',
+        '*Total a pagar: $1,230.00*',
+        '',
+        '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.',
       ].join('\n'),
     );
     await h.settle();
@@ -325,12 +331,12 @@ describe('T5a R4/R5: petId per line and «(para Max)» (S16)', () => {
     });
     const offer = await h.offer();
     expect(offer.reply).toContain(
-      '• Ibuprofeno: 2 × $15.00 MXN; importe $30.00 MXN (para Max)\n• Croquetas Adulto 18 kg: 1 × $1200.00 MXN; importe $1200.00 MXN\n',
+      '• Ibuprofeno (para Max)\n   2 × $15.00 = *$30.00*\n• Croquetas Adulto 18 kg\n   1 × $1,200.00 = *$1,200.00*\n',
     );
     // The pending summary (with the pet) survives a restart.
     await h.restart();
     const placed = await h.yes();
-    expect(placed?.reply).toContain('folio B-0042');
+    expect(placed?.reply).toContain('*Folio:* B-0042');
     expect(calls(h)).toHaveLength(1);
     expect(JSON.stringify(calls(h)[0][0].sale.items)).toBe(
       `[{"productId":"${BO_PRODUCT}","variantId":null,"productName":"Ibuprofeno","variantName":null,"quantity":2,"unitPriceCents":1500,"petId":"${MAX.id}"},{"productId":"${BO_CROQUETAS}","variantId":null,"productName":"Croquetas Adulto 18 kg","variantName":null,"quantity":1,"unitPriceCents":120000}]`,
@@ -349,7 +355,7 @@ describe('T5a R4/R5: petId per line and «(para Max)» (S16)', () => {
     const offer = await h.offer();
     expect(offer.reply).toContain('(pedido apartado BO-000012)');
     expect(offer.reply).toContain(
-      '• Croquetas Adulto 18 kg: 1 × $1200.00 MXN; importe $1200.00 MXN (para Max)',
+      '• Croquetas Adulto 18 kg (para Max)\n   1 × $1,200.00 = *$1,200.00*',
     );
     await h.yes();
     const items = calls(h)[0][0].sale.items;
@@ -382,7 +388,7 @@ describe('T5a R4/R5: petId per line and «(para Max)» (S16)', () => {
     expect(sameMinimalOrder(tagged, structuredClone(tagged))).toBe(true);
     expect(sameMinimalOrder(base, tagged)).toBe(false);
     expect(renderMinimalOrderSummary(tagged)).toContain(
-      '• Ibuprofeno: 2 × $15.00 MXN; importe $30.00 MXN (para Max)',
+      '• Ibuprofeno (para Max)\n   2 × $15.00 = *$30.00*',
     );
   });
 
@@ -401,7 +407,7 @@ describe('T5a R4/R5: petId per line and «(para Max)» (S16)', () => {
       await h.offer();
       h.api.createCheckout.mockRejectedValueOnce(refusal(status, code));
       const placed = await h.yes();
-      expect(placed?.reply).toContain('folio B-0042');
+      expect(placed?.reply).toContain('*Folio:* B-0042');
       const [first, second] = calls(h);
       expect(calls(h)).toHaveLength(2);
       expect(first[0].sale.items[0]).toMatchObject({ petId: MAX.id });
@@ -436,7 +442,7 @@ describe('T5a R4/R5: petId per line and «(para Max)» (S16)', () => {
     await h.offer('wamid.o3');
     h.api.createCheckout.mockRejectedValueOnce(refusal(422, 'PET_ARCHIVED'));
     const placed = await h.yes('wamid.o4');
-    expect(placed?.reply).toContain('folio B-0042');
+    expect(placed?.reply).toContain('*Folio:* B-0042');
     expect(calls(h)).toHaveLength(3);
     expect(calls(h)[1][1]).toBe(calls(h)[0][1]);
     expect(calls(h)[2][1]).not.toBe(calls(h)[1][1]);

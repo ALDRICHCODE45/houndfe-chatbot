@@ -106,7 +106,7 @@ const scenarioTurns = (id: string, withConditional = false): string[] => {
   });
 };
 
-const ORDER_ENDING = /Respond[ae] "SÍ" para crear el pedido/;
+const ORDER_ENDING = /Respond[ae] \*SÍ\* para crear el pedido/;
 const NO_CHANGE = /No modifiqué el carrito/;
 
 function harness(customer: 'new' | '03100' | '04000' = '03100') {
@@ -765,7 +765,7 @@ describe('eval purchase scenarios with scripted tool calls → exactly one order
     const summary = await h.turn(t4, [call('chooseStorePickup'), say()]);
     expect(summary).toMatch(ORDER_ENDING);
     const placed = await h.turn(t5);
-    expect(placed).toContain('folio EV-0001');
+    expect(placed).toContain('*Folio:* EV-0001');
     await h.turn(t6, [say('Gracias por su compra.')]);
     expect(h.api.orders.size).toBe(1);
   });
@@ -793,7 +793,7 @@ describe('eval purchase scenarios with scripted tool calls → exactly one order
     expect(await h.turn(t4, [call('chooseStorePickup'), say()])).toMatch(
       ORDER_ENDING,
     );
-    expect(await h.turn(t5)).toContain('folio EV-0001');
+    expect(await h.turn(t5)).toContain('*Folio:* EV-0001');
     expect(h.api.orders.size).toBe(1);
   });
 
@@ -834,7 +834,7 @@ describe('eval purchase scenarios with scripted tool calls → exactly one order
         quantity: 2,
       },
     ]);
-    expect(await h.turn(t8)).toContain('folio EV-0001');
+    expect(await h.turn(t8)).toContain('*Folio:* EV-0001');
     await h.turn(t9, [say('Gracias por su compra.')]);
     expect(h.api.orders.size).toBe(1);
   });

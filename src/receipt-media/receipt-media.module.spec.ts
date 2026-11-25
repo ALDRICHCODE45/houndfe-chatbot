@@ -1043,7 +1043,7 @@ describe('ReceiptMediaModule composition (WU14C)', () => {
         expect(sendText).toHaveBeenCalledTimes(1);
         expect(sendText).toHaveBeenCalledWith({
           to: '+525500000000',
-          text: 'Confirmamos un pago de su pedido F-1. Queda un saldo pendiente de $1,234.56 MXN; puede enviarnos el comprobante del resto cuando lo tenga.',
+          text: 'Confirmamos un pago de su pedido *F-1*.\n*Saldo pendiente:* $1,234.56\n\nPuede enviarnos el comprobante del resto cuando lo tenga.',
         });
         // The fenced CAS marks the provider wamid exactly once.
         expect(outbox.marks).toEqual(['wamid.OK']);

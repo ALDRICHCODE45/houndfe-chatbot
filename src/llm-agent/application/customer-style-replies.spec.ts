@@ -22,9 +22,11 @@ import {
 import {
   MINIMAL_ORDER_AMBIGUOUS_REPLY,
   MINIMAL_ORDER_DECLINED_REPLY,
+  MINIMAL_ORDER_SUMMARY_HEADING,
   renderMinimalOrderSummary,
   type MinimalOrderSnapshot,
 } from '../domain/minimal-order-confirmation';
+import { TITLE_EMOJI_LINE } from '../domain/whatsapp-format';
 import {
   CART_OPERATION_CLARIFICATION,
   CART_PRESENTATION_QUESTION,
@@ -650,15 +652,38 @@ describe('customer style over every fixed customer reply (S2)', () => {
   );
 
   it.each(Object.entries(REPLIES))(
-    '%s carries no emoji for a customer who uses none',
+    '%s carries no body emoji for a customer who uses none (message-formatting S3: title emojis kept)',
     (_name, reply) => {
       for (const register of ['usted', 'tu'] as const) {
+        const styled = applyCustomerStyle(reply, {
+          register,
+          emojis: false,
+          tone: 'formal',
+        });
+        const titleEmojis = styled
+          .split('\n')
+          .map((line) => TITLE_EMOJI_LINE.exec(line)?.[1])
+          .filter((emoji) => emoji !== undefined);
+        // Message formatting F3b: the shipping quote (🚚) and the order
+        // created (✅) titles join the summary title (🧾).
+        expect(titleEmojis).toEqual(
+          reply.startsWith(MINIMAL_ORDER_SUMMARY_HEADING)
+            ? [' 🧾']
+            : reply.startsWith('*Envío a domicilio*')
+              ? [' 🚚']
+              : reply.startsWith('*¡Pedido registrado!*')
+                ? [' ✅']
+                : [],
+        );
         expect(
-          applyCustomerStyle(reply, {
-            register,
-            emojis: false,
-            tone: 'formal',
-          }),
+          styled
+            .split('\n')
+            .map((line) =>
+              line.replace(TITLE_EMOJI_LINE, (_l, emoji: string) =>
+                line.slice(0, -emoji.length),
+              ),
+            )
+            .join('\n'),
         ).not.toMatch(/\p{Extended_Pictographic}/u);
       }
     },
@@ -672,13 +697,16 @@ describe('customer style over every fixed customer reply (S2)', () => {
       ),
     ).toBe(
       [
-        'Tu pedido quedó registrado con folio A-12. Total a pagar: $899.00 MXN (envío incluido).',
+        '*¡Pedido registrado!* ✅',
+        '*Folio:* A-12',
+        '*Total a pagar:* $899.00 (envío incluido)',
         '',
-        'Para pagar por transferencia:',
-        'Banco: Banco',
-        'Beneficiario: HoundFe',
-        'CLABE: 012345678901234567',
-        'Cuenta: 1234567890',
+        '*Pago por transferencia*',
+        '*Banco:* Banco',
+        '*Beneficiario:* HoundFe',
+        '*CLABE:* 012345678901234567',
+        '*Cuenta:* 1234567890',
+        '',
         'Cuando hagas la transferencia, envía aquí la foto de tu comprobante.',
       ].join('\n'),
     );
@@ -709,7 +737,7 @@ describe('customer style over every fixed customer reply (S2)', () => {
 describe('restock backorder copy in tú (S1/S14)', () => {
   it('pins the confirmation, the offer and the questions', () => {
     expect(applyCustomerStyle(REPLIES.backorderScheduled, tu)).toBe(
-      'Listo, quedó agendado tu pedido BO-000012: 2 × Collar a $1149.00 MXN c/u. Te aviso en cuanto llegue (aprox. el 27 de noviembre); no pagas nada hasta entonces.',
+      'Listo, quedó agendado tu pedido *BO-000012*:\n• Collar\n   2 × $1,149.00 = *$2,298.00*\n\nTe aviso en cuanto llegue (aprox. el 27 de noviembre); no pagas nada hasta entonces.',
     );
     expect(applyCustomerStyle(REPLIES.backorderOfferPrompt, tu)).toBe(
       '¿Quieres que te lo apartemos?',
@@ -771,7 +799,7 @@ describe('restock backorder copy in tú (S8 cancel and status)', () => {
 describe('restock backorder copy in tú (T5b confirm, checkout and reschedule)', () => {
   it('pins the confirmation lead, the refusals and the reschedule question', () => {
     expect(applyCustomerStyle(REPLIES.backorderAdded, tu)).toBe(
-      'Listo, tu pedido apartado BO-000012 (2 × Collar) ya está en tu carrito a $1099.00 MXN c/u. Te lo tenemos apartado hasta el 21 de noviembre a las 9:00 a. m.',
+      'Listo, tu pedido apartado *BO-000012* ya está en tu carrito:\n• Collar\n   2 × $1,099.00 = *$2,198.00*\n\nTe lo tenemos apartado hasta *el 21 de noviembre a las 9:00 a. m.*',
     );
     expect(applyCustomerStyle(REPLIES.backorderExpired, tu)).toBe(
       'Se venció el apartado de tu pedido BO-000012.',

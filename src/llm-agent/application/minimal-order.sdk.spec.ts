@@ -347,9 +347,9 @@ function setup(
 
 describe('checkout next-step guidance through the SDK route', () => {
   const deliveryEnding =
-    'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.';
+    'Responda *SÍ* para confirmar estos datos, o dígame qué quiere cambiar.';
   const orderEnding =
-    'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.';
+    '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
 
   it('lookup → select → prepareOrder presents delivery in the same turn, then needs two separate sent-summary consents for one sale', async () => {
     const h = setup();
@@ -381,8 +381,8 @@ describe('checkout next-step guidance through the SDK route', () => {
       EVENT('delivery-offer'),
     );
     const reply = (delivery as { reply: string }).reply;
-    expect(reply).toMatch(/^Confirme sus datos de entrega:/);
-    expect(reply).toContain('Calle: Av. Juárez 10, int. 130');
+    expect(reply).toMatch(/^\*Confirme sus datos de entrega\*/);
+    expect(reply).toContain('*Calle:* Av. Juárez 10, int. 130');
     expect(reply.endsWith(deliveryEnding)).toBe(true);
     expect(reply).not.toContain('no crea un pedido');
     expect(reply).not.toContain('Antes de crear el pedido necesito');
@@ -460,7 +460,7 @@ describe('checkout next-step guidance through the SDK route', () => {
         EVENT('fallback-offer'),
       );
       expect((offer as { reply: string }).reply).toMatch(
-        /^Confirme sus datos de entrega:/,
+        /^\*Confirme sus datos de entrega\*/,
       );
       if (sent) (offer as { onSent: () => void }).onSent();
       await h.turn(
@@ -535,7 +535,7 @@ describe('checkout next-step guidance through the SDK route', () => {
       );
       // F1: confirmed, unchanged delivery data are never re-presented.
       expect((result as { reply: string }).reply).toMatch(
-        /^Resumen de su pedido:/,
+        /^\*Resumen de su pedido\* 🧾\n/,
       );
       expect((result as { reply: string }).reply).not.toContain(
         'Revisión de compra',
@@ -553,7 +553,7 @@ describe('checkout next-step guidance through the SDK route', () => {
       EVENT('review-order'),
     );
     expect((result as { reply: string }).reply).toMatch(
-      /^Resumen de su pedido:/,
+      /^\*Resumen de su pedido\* 🧾\n/,
     );
     expect((result as { reply: string }).reply).not.toContain(
       'Revisión de compra',
@@ -613,7 +613,7 @@ describe('minimal order placement through the SDK route', () => {
         address: { street: 'Calle 5', state: 'Ciudad de México' },
       },
     });
-    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect((placed as { reply: string }).reply).toContain('*Folio:* B-0042');
     expect((placed as { reply: string }).reply).toContain('¿Cómo desea pagar?');
     expect(h.api.upsertCustomer).not.toHaveBeenCalled();
     expect(h.api.createSale).not.toHaveBeenCalled();
@@ -629,7 +629,7 @@ describe('minimal order placement through the SDK route', () => {
       EVENT('wamid.checkout1'),
     );
     expect((offer as { reply: string }).reply).toContain(
-      'Total a pagar: $80.00 MXN',
+      '*Total a pagar: $80.00*',
     );
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     (offer as { onSent: () => void }).onSent();
@@ -658,7 +658,7 @@ describe('minimal order placement through the SDK route', () => {
         shipping: { quoteId: 'quote-1' },
       },
     });
-    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect((placed as { reply: string }).reply).toContain('*Folio:* B-0042');
     expect((placed as { reply: string }).reply).toContain('¿Cómo desea pagar?');
     expect((placed as { reply: string }).reply).not.toContain(
       'no está incluido',
@@ -690,7 +690,7 @@ describe('minimal order placement through the SDK route', () => {
     );
     expect(offer).toMatchObject({ kind: 'handled' });
     const reply = (offer as { reply: string }).reply;
-    expect(reply).toContain('Resumen de su pedido:');
+    expect(reply).toContain('*Resumen de su pedido* 🧾');
     expect(reply).not.toContain('Su pedido ya quedó creado.');
     expect(h.api.createCheckout).not.toHaveBeenCalled();
     (offer as { onSent: () => void }).onSent();
@@ -703,7 +703,7 @@ describe('minimal order placement through the SDK route', () => {
     );
     expect(h.seen.length).toBe(calls);
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
-    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect((placed as { reply: string }).reply).toContain('*Folio:* B-0042');
     expect(h.api.upsertCustomer).not.toHaveBeenCalled();
   });
 
@@ -755,7 +755,7 @@ describe('minimal order placement through the SDK route', () => {
     );
     (offer as { onSent: () => void }).onSent();
     const placed = await h.turn('SÍ', [say('x')], EVENT('wamid.pets4'));
-    expect((placed as { reply: string }).reply).toContain('folio B-0042');
+    expect((placed as { reply: string }).reply).toContain('*Folio:* B-0042');
     expect(afterCheckout).toHaveBeenCalledTimes(1);
   });
 
@@ -907,7 +907,7 @@ describe('minimal order placement through the SDK route', () => {
     release();
     const offer = await running;
     expect((offer as { reply: string }).reply).toContain(
-      'Resumen de su pedido:',
+      '*Resumen de su pedido* 🧾',
     );
     (offer as { onSent?: () => void }).onSent?.();
     await h.turn('SÍ', [say('¿En qué le ayudo?')], EVENT('wamid.o2'));

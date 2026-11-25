@@ -197,23 +197,26 @@ describe('S2 reorder: presenting the last order', () => {
     );
 
     expect(history).toHaveBeenCalledWith('5550001111', '52');
-    expect(offer.reply).toMatch(
-      new RegExp(`^Su último pedido \\(folio EV-0099, ${DATE.source}\\) fue:`),
-    );
-    expect(offer.reply).toContain(
-      '• Croquetas Naturales Sin Grano de Salmón y Camote para Perros Adultos de Raza Grande 18 kg: 1',
-    );
-    expect(offer.reply).toContain(
-      '• Croquetas Royal Canin Mini Adult para Perro — 2 kg: 2',
+    // Message formatting F3a: bold title, the shared item lines with
+    // today's prices, «$1,250.00» amounts and the closing question apart.
+    expect(offer.reply.replace(DATE, '20 oct')).toBe(
+      [
+        '*Su último pedido* (folio EV-0099, 20 oct)',
+        '• Croquetas Naturales Sin Grano de Salmón y Camote para Perros Adultos de Raza Grande 18 kg',
+        '   1 × $1,599.00 = *$1,599.00*',
+        '• Croquetas Royal Canin Mini Adult para Perro — 2 kg',
+        '   2 × $529.00 = *$1,058.00*',
+        '',
+        'El total de esa vez fue $2,597.00.',
+        '*Total con precios de hoy: $2,657.00*',
+        'Algunos precios cambiaron.',
+        '',
+        '¿Lo agrego igual a su carrito?',
+      ].join('\n'),
     );
     // What was paid is the sale total only; never historical unit × qty.
-    expect(offer.reply).toContain('$2597.00 MXN');
     expect(offer.reply).not.toContain('$499.00');
     expect(offer.reply).not.toContain('$998.00');
-    // 2 kg went from $499 to $529: today's total, said as today's prices.
-    expect(offer.reply).toContain('$2657.00 MXN');
-    expect(offer.reply).toMatch(/con precios de hoy/);
-    expect(offer.reply).toMatch(/¿Lo agrego igual a su carrito\?$/);
     expect(offer.reply).not.toContain('Nombre histórico');
     expect(buttons(offer)).toEqual([
       {
@@ -235,8 +238,8 @@ describe('S2 reorder: presenting the last order', () => {
     ];
     const offer = await h.turn('lo de siempre', REORDER);
     expect(offer.reply).toContain('• Croquetas Naturales');
-    expect(offer.reply).toContain(': 2\n');
-    expect(offer.reply).toContain('Precio de hoy: $3727.00 MXN.');
+    expect(offer.reply).toContain('\n   2 × $1,599.00 = *$3,198.00*\n');
+    expect(offer.reply).toContain('\n*Precio de hoy: $3,727.00*\n');
     expect(offer.reply).not.toMatch(/con precios de hoy/);
   });
 
@@ -250,9 +253,9 @@ describe('S2 reorder: presenting the last order', () => {
     ];
     const offer = await h.turn('repetir mi último pedido', REORDER);
     expect(offer.reply).toContain(
-      '• Croquetas Dog Chow Cachorro Raza Pequeña 4 kg: 3 (agotado por ahora; no lo incluyo)',
+      '\n• Croquetas Dog Chow Cachorro Raza Pequeña 4 kg\n   Cantidad: 3 — agotado por ahora; no lo incluyo\n',
     );
-    expect(offer.reply).toContain('Precio de hoy: $1599.00 MXN.');
+    expect(offer.reply).toContain('\n*Precio de hoy: $1,599.00*\n');
     expect(offer.reply).toMatch(/¿Agrego los disponibles a su carrito\?$/);
 
     await h.turn('SÍ', [say('no se usa')], buttons(offer)[0].id);
@@ -272,7 +275,7 @@ describe('S2 reorder: presenting the last order', () => {
       );
     const offer = await h.turn('otra vez lo mismo', REORDER);
     expect(offer.reply).toContain(
-      '• Nombre histórico: 1 (ya no está disponible; no lo incluyo)',
+      '\n• Nombre histórico\n   Cantidad: 1 — ya no está disponible; no lo incluyo\n',
     );
     expect(buttons(offer)).toHaveLength(2);
   });
@@ -281,8 +284,10 @@ describe('S2 reorder: presenting the last order', () => {
     const h = harness();
     h.api.history = [orderWith([historyItem(DOG_CHOW, 1, 38900)])];
     const offer = await h.turn('mi pedido anterior', REORDER);
-    expect(offer.reply).toContain('(agotado por ahora; no lo incluyo)');
-    expect(offer.reply).toMatch(/¿Qué producto busca\?$/);
+    expect(offer.reply).toContain('agotado por ahora; no lo incluyo');
+    expect(offer.reply).toMatch(
+      /\n\nPor ahora ninguno está disponible\. ¿Qué producto busca\?$/,
+    );
     expect(offer.interactive).toBeUndefined();
     await h.turn('sí');
     expect(await h.lines()).toEqual([]);
@@ -314,8 +319,10 @@ describe('S2 reorder: presenting the last order', () => {
   it('mirrors tú in the copy and the button title', async () => {
     const h = harness();
     const offer = await h.turn('oye, dame lo mismo de la vez pasada', REORDER);
-    expect(offer.reply).toMatch(/^Tu último pedido/);
-    expect(offer.reply).toMatch(/¿Lo agrego igual a tu carrito\?$/);
+    expect(offer.reply).toMatch(/^\*Tu último pedido\* \(folio EV-0099/);
+    expect(offer.reply).toContain('\n*Total con precios de hoy: $2,657.00*\n');
+    expect(offer.reply).toContain('\n   2 × $529.00 = *$1,058.00*\n');
+    expect(offer.reply).toMatch(/\n\n¿Lo agrego igual a tu carrito\?$/);
     expect(buttons(offer)[0].title).toBe('✅ Sí, agrégalo');
   });
 });
@@ -335,8 +342,8 @@ describe('S2 reorder: accepting or declining', () => {
     const added = await h.turn('SÍ', [say('no se usa')], confirm);
     expect(h.seen).toHaveLength(calls);
     expect(await h.lines()).toEqual(expected);
-    expect(added.reply).toContain('Su carrito:');
-    expect(added.reply).toContain('Total de productos: $2657.00 MXN.');
+    expect(added.reply).toContain('*Su carrito*');
+    expect(added.reply).toContain('*Total de productos: $2,657.00*');
     expect(added.reply).toMatch(
       /¿Desea agregar algo más o seguimos con su compra\?$/,
     );
@@ -361,7 +368,7 @@ describe('S2 reorder: accepting or declining', () => {
     const added = await h.turn('sí');
     expect(h.seen).toHaveLength(calls);
     expect(await h.lines()).toEqual(expected);
-    expect(added.reply).toContain('Su carrito:');
+    expect(added.reply).toContain('*Su carrito*');
     // The offer is spent: another yes goes to the normal flow.
     await h.turn('sí', [say('¿Qué más necesita?')]);
     expect(await h.lines()).toEqual(expected);
@@ -437,13 +444,13 @@ describe('S2 reorder: accepting or declining', () => {
       [call('confirmCheckoutDetails'), say()],
       buttons(asked).find((button) => button.title === 'Envío a domicilio')?.id,
     );
-    expect(delivery.reply).toContain('Confirme sus datos de entrega:');
+    expect(delivery.reply).toContain('*Confirme sus datos de entrega*');
     const summary = await h.turn('sí');
-    expect(summary.reply).toContain('Resumen de su pedido:');
-    expect(summary.reply).toContain('$2657.00 MXN');
+    expect(summary.reply).toContain('*Resumen de su pedido* 🧾');
+    expect(summary.reply).toContain('$2,657.00');
     const create = jest.spyOn(h.api, 'createCheckout');
     const placed = await h.turn('sí');
-    expect(placed.reply).toMatch(/folio EV-0001/);
+    expect(placed.reply).toMatch(/\*Folio:\* EV-0001/);
     expect(h.api.orders.size).toBe(1);
     expect(create.mock.calls[0][0].sale.items).toEqual([
       expect.objectContaining({ productId: NUPEC, quantity: 1 }),

@@ -239,7 +239,10 @@ export const SCENARIOS: Scenario[] = [
       // Natural answer if the bot asks how to receive it again, then the summary.
       deliveryAnswer('Envío a domicilio'),
       'sí',
-      { text: 'sí', onlyIfPreviousReply: /^Resumen de su pedido/m },
+      {
+        text: 'sí',
+        onlyIfPreviousReply: /^\*?Resumen de (?:su|tu) pedido/m,
+      },
     ],
   },
   {

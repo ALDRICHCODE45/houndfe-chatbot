@@ -27,7 +27,7 @@ const EVENT = (messageId: string) => ({
   messageId,
 });
 
-const LEAD = 'Pedido con folio B-0042. Total a pagar: $30.00 MXN.';
+const LEAD = 'Pedido con folio B-0042. Total a pagar: $30.00.';
 
 const step = (content: unknown[], finish = 'tool-calls') => ({
   content,
@@ -398,8 +398,8 @@ describe('order summary vs previous order (S5)', () => {
         inboundEvent: EVENT('wamid.s1'),
       });
       // «Muéstrame» is a tú signal, so the reply is styled de tú.
-      expect(reply(decision)).toMatch(/Resumen de (?:su|tu) pedido:/);
-      expect(reply(decision)).toContain('Total a pagar: $30.00 MXN');
+      expect(reply(decision)).toMatch(/^\*Resumen de (?:su|tu) pedido\* 🧾$/m);
+      expect(reply(decision)).toContain('*Total a pagar: $30.00*');
       expect(
         interactiveOf(decision)?.buttons?.map((button) => button.id),
       ).toEqual([expect.stringMatching(/^order_confirm:/), 'order_change']);
@@ -436,7 +436,7 @@ describe('order summary vs previous order (S5)', () => {
       },
     });
     const decision = await h.turn('ver mi pedido', [say('Inventado')]);
-    expect(reply(decision)).toContain('Su carrito:');
+    expect(reply(decision)).toContain('*Su carrito*');
     expect(reply(decision)).toContain('¿Desea agregar algo más');
     expect(
       interactiveOf(decision)?.buttons?.map((button) => button.id),
@@ -460,7 +460,7 @@ describe('order summary vs previous order (S5)', () => {
     expect(h.api.getOrderHistory).not.toHaveBeenCalled();
     // The offer stays bound to this sale: a yes sends the details.
     const after = await h.turn('transferencia');
-    expect(reply(after)).toContain('CLABE: 012180001234567891');
+    expect(reply(after)).toContain('*CLABE:* 012180001234567891');
   });
 
   it('with a paid placed sale, shows folio and total and that it is paid', async () => {
@@ -468,7 +468,7 @@ describe('order summary vs previous order (S5)', () => {
     await h.seedPlacedSale({ paid: true });
     const decision = await h.turn('mi resumen');
     expect(reply(decision)).toBe(
-      `Pedido con folio B-0042. Total: $30.00 MXN.\n${PAID_REPLY}`,
+      `Pedido con folio B-0042. Total: $30.00.\n${PAID_REPLY}`,
     );
     expect(interactiveOf(decision)).toBeUndefined();
     expect(h.seen).toHaveLength(0);
@@ -573,7 +573,7 @@ describe('paid placed sale (S6)', () => {
       say('Inventado'),
     ]);
     expect(Object.keys(h.seen[0].tools ?? {})).toContain('getPaymentDetails');
-    expect(reply(decision)).toContain('CLABE: 012180001234567891');
+    expect(reply(decision)).toContain('*CLABE:* 012180001234567891');
   });
 
   it('a paid sale with a leftover pending marker still answers it is paid', async () => {
@@ -609,7 +609,7 @@ describe('paid placed sale (S6)', () => {
       },
     });
     const cart = await h.turn('ver mi pedido');
-    expect(reply(cart)).toContain('Su carrito:');
+    expect(reply(cart)).toContain('*Su carrito*');
     const question = await h.turn('¿cómo pago?', [say('Con gusto.')]);
     expect(reply(question)).not.toBe(PAID_REPLY);
   });

@@ -15,6 +15,16 @@ import type { MinimalCheckoutDraft } from '../../conversation/domain/minimal-che
 import { bindRestockInboundEvent } from '../../human-decisions/domain/restock-source-identity';
 import { classifyConfirmationReply } from './confirmation-reply';
 import { minimalShippingEtaLine } from './minimal-shipping';
+import {
+  TITLE_EMOJI,
+  bold,
+  italic,
+  itemDetail,
+  itemLine,
+  money,
+  plain,
+  sectionTitle,
+} from './whatsapp-format';
 
 /** Pending-offer TTL; mirrors the checkout and RESTOCK volatile lifecycles. */
 export const MINIMAL_ORDER_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
@@ -272,8 +282,6 @@ export function sameMinimalOrder(
   }
 }
 
-const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
-
 /**
  * "Producto — Presentación" for one line. Backend presentation labels may
  * already start with the product name ("Collar … Mediana"); only the
@@ -299,25 +307,49 @@ export function minimalLineLabel(
   return `${name} — ${presentation}`;
 }
 
-/** Server-owned display of validated backend savings, never a price calculation. */
-export function minimalPromotionSuffix(
+/**
+ * True when a backend promotion title already starts with the word
+ * «Promoción», «Promociones» or «Promo» (case- and accent-blind), so the
+ * label never doubles it («Promoción Promociones de invierno»).
+ */
+function namesItsPromotion(title: string): boolean {
+  return /^promo(?:cion(?:es)?)?(?![a-z0-9])/.test(
+    title
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase(),
+  );
+}
+
+/**
+ * Message formatting F2-fix G2: the single source of the savings label of a
+ * line — «Promoción Buen Fin: ahorra $125.00», the backend title alone when
+ * it already names the promotion, «Descuento: ahorra $3.00» without a title
+ * — or `null` without a discount. Server-owned display of validated backend
+ * savings, never a price calculation; the title is `plain` (G1).
+ */
+export function minimalPromotionLabel(
   item: Pick<MinimalOrderLine, 'appliedPromotionTitle' | 'discountAmountCents'>,
-): string {
+): string | null {
   const discount = item.discountAmountCents ?? 0;
-  if (discount <= 0) return '';
-  const label = item.appliedPromotionTitle?.trim()
-    ? `promoción: ${item.appliedPromotionTitle}, ahorro`
-    : 'descuento: ahorro';
-  return ` (${label} ${mxn(discount)})`;
+  if (discount <= 0) return null;
+  const title = plain(item.appliedPromotionTitle ?? '');
+  const promotion =
+    title === ''
+      ? 'Descuento'
+      : namesItsPromotion(title)
+        ? title
+        : `Promoción ${title}`;
+  return `${promotion}: ahorra ${money(discount)}`;
 }
 
 /**
  * Restock backorder T5b: « (pedido apartado BO-000012)» after the line of a
  * confirmed backorder; empty for every ordinary line.
  */
-export function minimalBackorderSuffix(
-  item: Pick<MinimalOrderLine, 'backorder'>,
-): string {
+export function minimalBackorderSuffix(item: {
+  readonly backorder?: { readonly folio: string };
+}): string {
   return item.backorder === undefined
     ? ''
     : ` (pedido apartado ${item.backorder.folio})`;
@@ -325,99 +357,193 @@ export function minimalBackorderSuffix(
 
 /**
  * Multi-pet T5a R5 (S16): « (para Max)» after a line for a pet; empty for
- * every other line.
+ * every other line and for a name `plain` empties (only markup characters),
+ * so no bare «(para )» is shown.
  */
-export function minimalPetSuffix(item: Pick<MinimalOrderLine, 'pet'>): string {
-  return item.pet === undefined ? '' : ` (para ${item.pet.name})`;
+export function minimalPetSuffix(item: {
+  readonly pet?: { readonly name: string };
+}): string {
+  const name = item.pet === undefined ? '' : plain(item.pet.name);
+  return name === '' ? '' : ` (para ${name})`;
 }
 
-function deliveryLine(snapshot: MinimalOrderSnapshot): string {
+const present = (part: string | null | undefined): part is string =>
+  typeof part === 'string' && plain(part) !== '';
+
+/** The present parts, each `plain` (G1), joined. */
+const joinPresent = (
+  parts: ReadonlyArray<string | null | undefined>,
+  separator: string,
+): string => parts.filter(present).map(plain).join(separator);
+
+/**
+ * Message formatting S2: the people/address lines of the summary, one piece
+ * per line (name; street + numbers; colonia, C.P., city, state). Store
+ * pickup (no draft) shows the customer name only.
+ */
+function deliveryLines(snapshot: MinimalOrderSnapshot): string[] {
   const draft = snapshot.draft;
-  if (draft === null)
-    return [snapshot.customer?.firstName, snapshot.customer?.lastName]
-      .filter((part): part is string => typeof part === 'string' && part !== '')
-      .join(' ');
+  if (draft === null) {
+    const name = joinPresent(
+      [snapshot.customer?.firstName, snapshot.customer?.lastName],
+      ' ',
+    );
+    return name === '' ? [] : [name];
+  }
   const address =
     draft.address.kind === 'saved'
       ? draft.address.snapshot
       : draft.address.fields;
-  const name = [draft.customer.firstName, draft.customer.lastName]
-    .filter((part): part is string => typeof part === 'string' && part !== '')
-    .join(' ');
-  if (address === null) return name;
+  const name = joinPresent(
+    [draft.customer.firstName, draft.customer.lastName],
+    ' ',
+  );
+  if (address === null) return [name].filter(present);
   return [
     name,
-    [address.street, address.exteriorNumber].filter(Boolean).join(' '),
-    address.interiorNumber === null ? null : `int. ${address.interiorNumber}`,
-    address.neighborhood,
-    address.zipCode === null ? null : `C.P. ${address.zipCode}`,
-    address.city ?? address.municipality,
-    address.state,
-  ]
-    .filter((part): part is string => typeof part === 'string' && part !== '')
-    .join(', ');
+    [
+      joinPresent([address.street, address.exteriorNumber], ' '),
+      present(address.interiorNumber)
+        ? `int. ${plain(address.interiorNumber)}`
+        : null,
+    ]
+      .filter(present)
+      .join(', '),
+    joinPresent(
+      [
+        address.neighborhood,
+        present(address.zipCode) ? `C.P. ${address.zipCode}` : null,
+        address.city ?? address.municipality,
+        address.state,
+      ],
+      ', ',
+    ),
+  ].filter(present);
 }
 
 /**
  * Shipping block of the summary: carrier, charge, credit and ETA (S3/S7),
- * always closed by «Total a pagar» (products + the customer's shipping
- * charge; free shipping and store pickup included).
+ * always closed by the bold «Total a pagar» (products + the customer's
+ * shipping charge; free shipping and store pickup included). «Total de
+ * productos» is shown only when it differs from the total to pay (a
+ * shipping charge), so the same amount is never listed twice; it is always
+ * bold, as in the cart (F2-fix G4).
  */
 function shippingLines(snapshot: MinimalOrderSnapshot): string[] {
   const shipping = snapshot.shipping;
-  // Every presented snapshot carries a quote or pickup (`freshOrder`).
-  if (shipping === undefined) return [];
+  // Every presented snapshot carries a quote or pickup (`freshOrder`); an
+  // older snapshot without one still shows its products total.
+  if (shipping === undefined)
+    return [bold(`Total de productos: ${money(snapshot.totalCents)}`)];
   if (!('quoteId' in shipping))
     return [
-      'Recoge en tienda (sin costo de envío)',
-      `Total a pagar: ${mxn(snapshot.totalCents)}`,
+      `${bold('Envío:')} recoge en tienda — sin costo`,
+      bold(`Total a pagar: ${money(snapshot.totalCents)}`),
     ];
   const carrier = shipping.option
-    ? ` con ${shipping.option.carrier} (${shipping.option.service})`
+    ? `${shipping.option.carrier} ${shipping.option.service} — `
     : '';
+  const charge = shipping.customerChargeCents;
   const eta = minimalShippingEtaLine(shipping.eta);
   return [
-    shipping.customerChargeCents === 0
-      ? `Envío${carrier}: sin costo para usted`
-      : `Envío${carrier}: ${mxn(shipping.customerChargeCents)}`,
+    ...(charge > 0
+      ? [bold(`Total de productos: ${money(snapshot.totalCents)}`)]
+      : []),
+    `${bold('Envío:')} ${carrier}${charge === 0 ? 'sin costo' : money(charge)}`,
     ...((shipping.creditCents ?? 0) > 0
       ? [
-          `Usted tiene un crédito de ${mxn(shipping.creditCents ?? 0)} por sus productos (ya descontado del envío)`,
+          `Usted tiene un crédito de ${money(shipping.creditCents ?? 0)} por sus productos (ya descontado del envío)`,
         ]
       : []),
     ...(eta === null ? [] : [eta]),
-    `Total a pagar: ${mxn(snapshot.totalCents + shipping.customerChargeCents)}`,
+    bold(`Total a pagar: ${money(snapshot.totalCents + charge)}`),
   ];
 }
 
-/** First line of the server-owned order summary. */
-export const MINIMAL_ORDER_SUMMARY_HEADING = 'Resumen de su pedido:';
+/** The fields of a cart or order line its customer-facing lines show. */
+export interface MinimalItemLineInput {
+  readonly name: string;
+  readonly variantName?: string | null;
+  readonly quantity: number;
+  readonly unitPriceCents: number;
+  readonly finalPriceCents: number;
+  readonly appliedPromotionTitle?: string | null;
+  readonly discountAmountCents?: number;
+  readonly backorder?: { readonly folio: string };
+  readonly pet?: { readonly name: string };
+}
 
-/** Server-owned order summary; the model never authors it. */
+/**
+ * Message formatting S2: the lines of one item, shared by the order summary
+ * and the cart — the bullet with the product label and its backorder (T5b)
+ * and pet (T5a) suffixes, then the indented quantity × price = *amount*
+ * line and, with a backend discount, the indented italic promotion line.
+ * Catalog and pet names are `plain` (F2-fix G1).
+ */
+export function minimalItemLines(item: MinimalItemLineInput): string[] {
+  const promotion = minimalPromotionLabel(item);
+  const label = minimalLineLabel(
+    plain(item.name),
+    item.variantName == null ? item.variantName : plain(item.variantName),
+  );
+  const pet =
+    item.pet === undefined ? {} : { pet: { name: plain(item.pet.name) } };
+  return [
+    itemLine(`${label}${minimalBackorderSuffix(item)}${minimalPetSuffix(pet)}`),
+    itemDetail(
+      `${item.quantity} × ${money(item.unitPriceCents)} = ${bold(money(item.finalPriceCents))}`,
+    ),
+    ...(promotion === null ? [] : [itemDetail(italic(promotion))]),
+  ];
+}
+
+/**
+ * First line of the server-owned order summary, without its title emoji:
+ * every `.includes(MINIMAL_ORDER_SUMMARY_HEADING)` check (and its tú form
+ * via `applyCustomerRegister`) finds it in the styled reply.
+ */
+export const MINIMAL_ORDER_SUMMARY_HEADING = bold('Resumen de su pedido');
+
+/** Last line of the order summary: the SÍ/change question. */
+export const MINIMAL_ORDER_SUMMARY_CLOSING =
+  '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
+
+/**
+ * Server-owned order summary in the message-formatting S2 layout; the model
+ * never authors it.
+ */
 export function renderMinimalOrderSummary(
   snapshot: MinimalOrderSnapshot,
 ): string {
   const pickup =
     snapshot.shipping !== undefined && !('quoteId' in snapshot.shipping);
-  return [
-    MINIMAL_ORDER_SUMMARY_HEADING,
-    ...snapshot.items.map(
-      (item) =>
-        `• ${minimalLineLabel(item.name, item.variantName)}: ${item.quantity} × ${mxn(item.unitPriceCents)}; importe ${mxn(item.finalPriceCents)}${minimalPromotionSuffix(item)}${minimalBackorderSuffix(item)}${minimalPetSuffix(item)}`,
-    ),
-    `Total de productos: ${mxn(snapshot.totalCents)}`,
-    pickup
-      ? `Datos del cliente: ${deliveryLine(snapshot)}`
-      : `Entrega a: ${deliveryLine(snapshot)}`,
+  const people = [
+    ...deliveryLines(snapshot),
     ...(snapshot.draft?.address.kind === 'new'
       ? ['Guardaremos esta dirección con su pedido.']
       : []),
     ...(snapshot.draft?.address.kind === 'savedCorrected'
       ? ['Actualizaremos su dirección guardada con estos datos.']
       : []),
+  ];
+  return [
+    sectionTitle('Resumen de su pedido', TITLE_EMOJI.summary),
+    '',
+    sectionTitle('Productos'),
+    ...snapshot.items.flatMap(minimalItemLines),
+    '',
+    // F2-fix G4: a section with nothing to show (a pickup without a
+    // customer name) is left out, never rendered as an empty title.
+    ...(people.length === 0
+      ? []
+      : [
+          sectionTitle(pickup ? 'Datos del cliente' : 'Entrega'),
+          ...people,
+          '',
+        ]),
     ...shippingLines(snapshot),
     '',
-    'Responda "SÍ" para crear el pedido, o dígame qué quiere cambiar.',
+    MINIMAL_ORDER_SUMMARY_CLOSING,
   ].join('\n');
 }
 

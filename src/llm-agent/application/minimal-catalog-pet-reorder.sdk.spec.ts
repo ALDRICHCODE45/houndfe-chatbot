@@ -25,6 +25,7 @@ import {
   PREVIOUS_ORDER,
 } from '../../../scripts/eval/fixtures/fake-api';
 import type { CustomerReplyInteractive } from '../domain/customer-reply';
+import { applyCustomerStyle } from '../domain/customer-style';
 import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
 import type { GenerateTextFn } from '../infrastructure/generate-text.provider';
 import { CostGuardService } from './cost-guard.service';
@@ -352,9 +353,12 @@ describe('T5b: «lo mismo de siempre para Max» (S4, S14, S15)', () => {
     expect(offer.reply).toMatch(
       new RegExp(
         [
-          '^Lo último que pidió para Max \\(folio EV-0100, 1 nov(?: 2026)?\\) fue:',
-          `• ${NUPEC_NAME}: 2`,
-          'Precio de hoy: \\$3198\\.00 MXN\\.',
+          '^\\*Lo último que pidió para Max\\* \\(folio EV-0100, 1 nov(?: 2026)?\\)',
+          `• ${NUPEC_NAME}`,
+          '   2 × \\$1,599\\.00 = \\*\\$3,198\\.00\\*',
+          '',
+          '\\*Precio de hoy: \\$3,198\\.00\\*',
+          '',
           '¿Lo agrego igual a su carrito\\?$',
         ].join('\\n'),
       ),
@@ -363,6 +367,15 @@ describe('T5b: «lo mismo de siempre para Max» (S4, S14, S15)', () => {
     expect(offer.reply).not.toContain('Royal Canin');
     expect(offer.reply).not.toContain('sílice');
     expect(offer.reply).not.toContain('El total de esa vez');
+    // Message formatting F3a: the tú render of the per-pet offer.
+    const tu = applyCustomerStyle(offer.reply, {
+      register: 'tu',
+      emojis: false,
+      tone: 'neutral',
+    });
+    expect(tu).toMatch(/^\*Lo último que pediste para Max\* \(folio EV-0100/);
+    expect(tu).toContain('\n   2 × $1,599.00 = *$3,198.00*\n');
+    expect(tu).toMatch(/\n\n¿Lo agrego igual a tu carrito\?$/);
     expect(buttons(offer)).toEqual([
       {
         id: expect.stringMatching(/^reorder_confirm:.+/) as string,
@@ -491,7 +504,7 @@ describe('T5b: «lo mismo de siempre para Max» (S4, S14, S15)', () => {
     expect(w.history).toHaveBeenCalledWith('5550001111', '52', {
       petId: MAX_ID,
     });
-    expect(offer.reply).toMatch(/^Lo último que pidió para Max/);
+    expect(offer.reply).toMatch(/^\*Lo último que pidió para Max\*/);
   });
 
   it('a pet that is not a backend pet (prospect) → the per-pet empty reply without a history read', async () => {
@@ -601,10 +614,10 @@ describe('T5b risk item 3: «lo de la vez pasada» without a pet is unchanged', 
     for (const h of [plain.w.history, withPet.w.history])
       for (const args of h.mock.calls) expect(args).toHaveLength(2);
     expect((plain.offer as { reply: string }).reply).toMatch(
-      /^Su último pedido \(folio EV-0101, 10 nov(?: 2026)?\) fue:/,
+      /^\*Su último pedido\* \(folio EV-0101, 10 nov(?: 2026)?\)\n/,
     );
     expect((plain.offer as { reply: string }).reply).toContain(
-      'El total de esa vez fue $9999.00 MXN.',
+      'El total de esa vez fue $9,999.00.',
     );
   });
 });

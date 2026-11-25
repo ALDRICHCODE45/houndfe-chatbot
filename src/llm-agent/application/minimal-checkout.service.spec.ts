@@ -477,13 +477,13 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
     );
     expect(h.outputs[0]).toEqual({ ok: true, ready: true, missing: [] });
     expect((corrected as { reply: string }).reply).toContain(
-      'Código postal: 55635',
+      '*Código postal:* 55635',
     );
     expect((corrected as { reply: string }).reply).toMatch(
-      /^Confirme sus datos de entrega:/,
+      /^\*Confirme sus datos de entrega\*/,
     );
     expect((corrected as { reply: string }).reply).toContain(
-      'Calle: Av. Juárez 10',
+      '*Calle:* Av. Juárez 10',
     );
     expect((corrected as { reply: string }).reply).not.toContain('05635');
     const { id: _id, version: _version, ...fields } = snapshot;
@@ -628,7 +628,7 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
     expect(reply.startsWith(`${MINIMAL_CHECKOUT_CHANGED_REPLY}\n\n`)).toBe(
       true,
     );
-    expect(reply).toContain('Calle: Calle 6 S/N');
+    expect(reply).toContain('*Calle:* Calle 6 S/N');
     expect(h.checkout().confirmationStatus(SENDER)).toMatchObject({
       stage: 'pending',
       armed: false,
@@ -758,7 +758,7 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
     expect(
       reply.startsWith(`${MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY}\n\n`),
     ).toBe(true);
-    expect(reply).toContain('Calle: Calle 5 S/N');
+    expect(reply).toContain('*Calle:* Calle 5 S/N');
     expect(await h.draft()).toEqual(before);
     expect(h.checkout().confirmationStatus(SENDER)).toMatchObject({
       stage: 'pending',
@@ -811,7 +811,7 @@ describe('MinimalCheckoutService through the minimal SDK route', () => {
       tone: 'neutral',
     });
     expect(reply.startsWith(`${clarification}\n\n`)).toBe(true);
-    expect(reply).toContain('Calle: Calle 5 S/N');
+    expect(reply).toContain('*Calle:* Calle 5 S/N');
     expect(typeof (result as { onSent?: unknown }).onSent).toBe('function');
   });
 
