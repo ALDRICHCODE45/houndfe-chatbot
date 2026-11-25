@@ -12,7 +12,7 @@ export const CONVERSATION_GATE_STORE = Symbol('CONVERSATION_GATE_STORE');
 /**
  * Closed gate kinds; migration 4200 mirrors this list in a CHECK (5400
  * widens it with `payment_offer`, 5500 with `backorder_offer` and
- * `backorder_quantity`).
+ * `backorder_quantity`, 5800 with `pet_choice`).
  */
 export const CONVERSATION_GATE_KINDS = [
   'order_confirmation',
@@ -23,6 +23,7 @@ export const CONVERSATION_GATE_KINDS = [
   'payment_offer',
   'backorder_offer',
   'backorder_quantity',
+  'pet_choice',
 ] as const;
 export type ConversationGateKind = (typeof CONVERSATION_GATE_KINDS)[number];
 
