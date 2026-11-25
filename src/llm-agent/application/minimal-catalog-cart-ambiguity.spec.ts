@@ -253,7 +253,7 @@ describe('reported quantity-before-presentation flow', () => {
     expect(pendingContext).toContain(`selectionRef: ${f.refs.parent}`);
     expect(reply.kind).toBe('handled');
     if (reply.kind !== 'handled') throw new Error('Expected handled reply');
-    expect(reply.reply).toContain('$560.00 MXN');
+    expect(reply.reply).toContain('$560.00*');
     expect(adjust).toHaveBeenCalledTimes(1);
     const after = await f.cart.view(SENDER);
     expect(after).toMatchObject({ ok: true, totalCents: 56000 });

@@ -6,7 +6,17 @@ import { NotFoundError } from '../../chatbot-api/domain/errors';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
 import type { CartPet } from '../../sale-flow/domain/cart-state';
 import type { ReorderOfferContext } from '../domain/minimal-catalog-session.store';
-import { minimalLineLabel } from '../domain/minimal-order-confirmation';
+import {
+  minimalItemLines,
+  minimalLineLabel,
+} from '../domain/minimal-order-confirmation';
+import {
+  bold,
+  itemDetail,
+  itemLine,
+  money,
+  plain,
+} from '../domain/whatsapp-format';
 import type { MinimalCartService } from './minimal-cart.service';
 
 /**
@@ -64,7 +74,6 @@ const UNAVAILABLE_SUFFIX: Record<Unavailable, string> = {
   unverified: 'no puedo confirmar existencias',
 };
 
-const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
 const empty = (reply: string): MinimalReorderPresentation => ({
   reply,
   offer: null,
@@ -240,17 +249,20 @@ export async function prepareMinimalReorder(
     last.folio === null ? null : `folio ${last.folio}`,
     shortOrderDate(last.confirmedAt, now),
   ].filter((part): part is string => part !== null);
+  // Message formatting F3a (S2/S4): an available line uses the cart's item
+  // lines with today's price; an unavailable one keeps its quantity and
+  // reason on an indented detail line.
   const lines: string[] = [];
   let next = 0;
   for (const entry of checked) {
     if (entry.status === 'available') {
-      const item = quoted[next++];
-      lines.push(
-        `• ${minimalLineLabel(item.name, item.variantName)}: ${entry.line.quantity}`,
-      );
+      lines.push(...minimalItemLines(quoted[next++]));
     } else {
       lines.push(
-        `• ${entry.label}: ${entry.line.quantity} (${UNAVAILABLE_SUFFIX[entry.status]}; no lo incluyo)`,
+        itemLine(plain(entry.label)),
+        itemDetail(
+          `Cantidad: ${entry.line.quantity} — ${UNAVAILABLE_SUFFIX[entry.status]}; no lo incluyo`,
+        ),
       );
     }
   }
@@ -258,16 +270,21 @@ export async function prepareMinimalReorder(
   // T5b: the sale total covers every pet's lines, so a per-pet offer omits it.
   const parts =
     pet === undefined
-      ? [
-          `Su último pedido${when} fue:`,
+      ? [`${bold('Su último pedido')}${when}`, ...lines]
+      : [
+          `${bold(`Lo último que pidió para ${plain(pet.name)}`)}${when}`,
           ...lines,
-          `El total de esa vez fue ${mxn(last.totalCents)}.`,
-        ]
-      : [`Lo último que pidió para ${pet.name}${when} fue:`, ...lines];
+        ];
+  const paid =
+    pet === undefined
+      ? [`El total de esa vez fue ${money(last.totalCents)}.`]
+      : [];
   if (quote === null || !quote.ok)
     return empty(
       [
         ...parts,
+        ...(paid.length === 0 ? [] : ['', ...paid]),
+        '',
         'Por ahora ninguno está disponible. ¿Qué producto busca?',
       ].join('\n'),
     );
@@ -276,13 +293,19 @@ export async function prepareMinimalReorder(
       item.unitPriceCents !== available[index].historicalUnitCents,
   );
   parts.push(
-    changed
-      ? `Total con precios de hoy: ${mxn(quote.totalCents)}; algunos precios cambiaron.`
-      : `Precio de hoy: ${mxn(quote.totalCents)}.`,
+    '',
+    ...paid,
+    ...(changed
+      ? [
+          bold(`Total con precios de hoy: ${money(quote.totalCents)}`),
+          'Algunos precios cambiaron.',
+        ]
+      : [bold(`Precio de hoy: ${money(quote.totalCents)}`)]),
   );
   if (quote.promotionEvaluationStatus === 'needs_human_review')
     parts.push('Las promociones requieren revisión del equipo.');
   parts.push(
+    '',
     available.length < checked.length
       ? '¿Agrego los disponibles a su carrito?'
       : '¿Lo agrego igual a su carrito?',

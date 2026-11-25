@@ -1848,8 +1848,8 @@ describe('MinimalOrderService', () => {
       useNewAddress: false,
     });
     const result = await yes(h);
-    expect(result?.reply).toMatch(/^Confirme sus datos de entrega:/);
-    expect(result?.reply).toContain('Nombre: Ana María');
+    expect(result?.reply).toMatch(/^\*Confirme sus datos de entrega\*/);
+    expect(result?.reply).toContain('*Nombre:* Ana María');
     expect(result?.onSent).toEqual(expect.any(Function));
     expect(h.api.createCheckout).not.toHaveBeenCalled();
   });

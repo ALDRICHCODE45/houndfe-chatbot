@@ -6,6 +6,7 @@ import {
   itemDetail,
   itemLine,
   money,
+  plain,
   sectionTitle,
 } from './whatsapp-format';
 
@@ -54,4 +55,19 @@ describe('whatsapp-format (message formatting F2a)', () => {
       created: '✅',
     });
   });
+
+  it.each([
+    ['Croquetas *Premium* _Light_', 'Croquetas Premium Light'],
+    ['2x1_Mayo', '2x1 Mayo'],
+    ['~Oferta~ `code`', 'Oferta code'],
+    ['Max', 'Max'],
+    ['  Ana  _ López ', 'Ana López'],
+    ['***', ''],
+  ])(
+    '[F2-fix G1] plain(%j) is %j: no WhatsApp markers survive in a value',
+    (value, text) => {
+      expect(plain(value)).toBe(text);
+      expect(bold(`Total ${plain(value)}`)).not.toMatch(/\*.*\*.*\*/);
+    },
+  );
 });

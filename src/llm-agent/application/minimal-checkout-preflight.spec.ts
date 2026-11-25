@@ -363,7 +363,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
       expect(result).toMatchObject({
         kind: 'handled',
         reply:
-          'Su carrito:\n• Product: 2 × $15.00 MXN; importe $30.00 MXN\nTotal de productos: $30.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
+          '*Su carrito*\n• Product\n   2 × $15.00 = *$30.00*\n\n*Total de productos: $30.00*\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
       });
       const state = await f.store.get(SENDER);
       expect(state?.data.minimalCart).toEqual({
@@ -436,7 +436,7 @@ describe('Read-only checkout preflight through the public minimal SDK route', ()
     expect(result).toMatchObject({
       kind: 'handled',
       reply:
-        'Su carrito:\n• Product: 2 × $15.00 MXN; importe $30.00 MXN\nTotal de productos: $30.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
+        '*Su carrito*\n• Product\n   2 × $15.00 = *$30.00*\n\n*Total de productos: $30.00*\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.\n\n¿Desea agregar algo más o seguimos con su compra?',
     });
   });
 

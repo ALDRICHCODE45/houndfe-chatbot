@@ -293,6 +293,12 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
     '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.',
     '¿Está todo bien? Responde *SÍ* para crear el pedido, o dime qué cambiar.',
   ],
+  // Message formatting F3a: the delivery-data SÍ line (before the short
+  // «Responda *SÍ*» pair, which it contains).
+  [
+    'Responda *SÍ* para confirmar estos datos, o dígame qué quiere cambiar.',
+    'Responde *SÍ* para confirmar estos datos, o dime qué quieres cambiar.',
+  ],
   ['Responda *SÍ*', 'Responde *SÍ*'],
   ['dígame qué cambiar', 'dime qué cambiar'],
   ['Claro, ¿qué desea cambiar?', 'Claro, ¿qué quieres cambiar?'],
@@ -468,7 +474,8 @@ const TU_PHRASES: ReadonlyArray<readonly [string, string]> = [
   ['después deberá confirmar', 'después deberás confirmar'],
   ['necesito que confirme', 'necesito que confirmes'],
   ['para que lo confirme de nuevo', 'para que lo confirmes de nuevo'],
-  ['Confirme sus datos de entrega:', 'Confirma tus datos de entrega:'],
+  // Message formatting F3a: the bold delivery-data heading (no colon).
+  ['Confirme sus datos de entrega', 'Confirma tus datos de entrega'],
   ['Usted tiene un crédito de', 'Tienes un crédito de'],
   ['sin costo para usted', 'sin costo para ti'],
   ['Usted paga', 'Pagas'],
@@ -571,16 +578,24 @@ function toTu(text: string): string {
 }
 
 /**
- * Keeps the first `keep` emojis and drops the rest. Message formatting S3: a
- * title emoji closing a bold title line (`TITLE_EMOJI_LINE`) is never
- * dropped nor counted. S2: only the whitespace a removed leading emoji left
- * at the start of its own line is trimmed, so item indentation survives.
+ * Keeps the first `keep` emojis and drops the rest. Message formatting S3:
+ * with `keepTitleEmojis` (server-owned copy only, F2-fix G3) a title emoji
+ * closing a bold title line (`TITLE_EMOJI_LINE`) is never dropped nor
+ * counted; model text never gets that exemption. S2: only the whitespace a
+ * removed leading emoji left at the start of its own line is trimmed, so
+ * item indentation survives.
  */
-function limitEmojis(text: string, keep: number): string {
+function limitEmojis(
+  text: string,
+  keep: number,
+  keepTitleEmojis: boolean,
+): string {
   let seen = 0;
   let changed = false;
   const lines = text.split('\n').map((line) => {
-    const titleEmoji = TITLE_EMOJI_LINE.exec(line)?.[1] ?? '';
+    const titleEmoji = keepTitleEmojis
+      ? (TITLE_EMOJI_LINE.exec(line)?.[1] ?? '')
+      : '';
     const body = line.slice(0, line.length - titleEmoji.length);
     let leadingRemoved = false;
     const out = body.replace(EMOJI_SEQUENCE, (emoji, offset: number) => {
@@ -603,7 +618,7 @@ function limitEmojis(text: string, keep: number): string {
  */
 export function applyCustomerStyle(text: string, style: CustomerStyle): string {
   const registered = style.register === 'tu' ? toTu(text) : text;
-  return limitEmojis(registered, style.emojis ? 1 : 0);
+  return limitEmojis(registered, style.emojis ? 1 : 0, true);
 }
 
 /**
@@ -617,10 +632,14 @@ export function applyCustomerRegister(
   return style.register === 'tu' ? toTu(text) : text;
 }
 
-/** Emoji guard only, for model-authored text the prompt already styled. */
+/**
+ * Emoji guard only, for model-authored text the prompt already styled. The
+ * S3 title-emoji exemption is server copy only (F2-fix G3): a model line
+ * «*Listo* ✅» loses its ✅ for a customer who uses no emojis.
+ */
 export function limitCustomerEmojis(
   text: string,
   style: CustomerStyle,
 ): string {
-  return style.emojis ? text : limitEmojis(text, 0);
+  return style.emojis ? text : limitEmojis(text, 0, false);
 }

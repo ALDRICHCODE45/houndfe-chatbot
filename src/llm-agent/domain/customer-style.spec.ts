@@ -161,6 +161,24 @@ describe('detectCustomerStyle', () => {
         expected,
       );
     });
+
+    it('[message-formatting F2-fix G3] model text shaped like a title loses its title emoji for a customer without emojis, as before F2', () => {
+      const noEmojis = detectCustomerStyle(['ok']);
+      expect(limitCustomerEmojis('*Listo* ✅', noEmojis)).toBe('*Listo*');
+      expect(
+        limitCustomerEmojis(
+          '*Resumen de su pedido* 🧾\nTodo en orden',
+          noEmojis,
+        ),
+      ).toBe('*Resumen de su pedido*\nTodo en orden');
+      expect(limitCustomerEmojis('*Envío* 🚚', noEmojis)).toBe('*Envío*');
+      // A customer who uses emojis keeps the model text untouched.
+      expect(
+        limitCustomerEmojis('*Listo* ✅', detectCustomerStyle(['va 👍'])),
+      ).toBe('*Listo* ✅');
+      // Server copy (applyCustomerStyle) still keeps the title emoji.
+      expect(applyCustomerStyle('*Listo* ✅', noEmojis)).toBe('*Listo* ✅');
+    });
   });
 
   describe('tone', () => {

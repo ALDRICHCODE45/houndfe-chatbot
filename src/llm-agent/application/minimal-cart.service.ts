@@ -21,12 +21,12 @@ import {
   minimalPickupSchema,
   minimalShippingQuoteSchema,
 } from '../domain/minimal-shipping';
+import { minimalItemLines } from '../domain/minimal-order-confirmation';
 import {
-  minimalBackorderSuffix,
-  minimalLineLabel,
-  minimalPetSuffix,
-  minimalPromotionSuffix,
-} from '../domain/minimal-order-confirmation';
+  bold,
+  money as formatMoney,
+  sectionTitle,
+} from '../domain/whatsapp-format';
 
 // Restock backorder T5b: what a backorder line remembers of its reservation.
 const backorderRefSchema = z.strictObject({
@@ -1006,12 +1006,21 @@ export function minimalCartReply(result: MinimalCartResult): string {
   }
   const kept = removedBackorderNote(result.removedBackorders);
   if (result.items.length === 0) return `Su carrito está vacío.${kept}`;
-  const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
-  const lines = result.items.map(
-    (i) =>
-      `• ${minimalLineLabel(i.name, i.variantName)}: ${i.quantity} × ${mxn(i.unitPriceCents)}; importe ${mxn(i.finalPriceCents)}${minimalPromotionSuffix(i)}${minimalBackorderSuffix(i)}${minimalPetSuffix(i)}`,
+  // Message formatting F3a (S2/S4): the order summary's item lines, so the
+  // cart and the summary read the same; the tail stays last (before any
+  // removed-backorder note) because callers detect a cart summary by it.
+  return (
+    [
+      sectionTitle('Su carrito'),
+      ...result.items.flatMap(minimalItemLines),
+      '',
+      bold(`Total de productos: ${formatMoney(result.totalCents)}`),
+      ...(result.promotionEvaluationStatus === 'needs_human_review'
+        ? ['Las promociones requieren revisión del equipo.']
+        : []),
+      MINIMAL_CART_SUMMARY_TAIL,
+    ].join('\n') + kept
   );
-  return `Su carrito:\n${lines.join('\n')}\nTotal de productos: ${mxn(result.totalCents)}.${result.promotionEvaluationStatus === 'needs_human_review' ? '\nLas promociones requieren revisión del equipo.' : ''}\n${MINIMAL_CART_SUMMARY_TAIL}${kept}`;
 }
 
 /** The result of a write, naming the backorder lines it removed (if any). */

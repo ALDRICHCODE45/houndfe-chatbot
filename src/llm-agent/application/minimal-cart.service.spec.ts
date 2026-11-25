@@ -2,10 +2,16 @@ import { InMemoryConversationStore } from '../../conversation/infrastructure/in-
 import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
 import { NotFoundError, UpstreamError } from '../../chatbot-api/domain/errors';
 import {
+  MINIMAL_CART_SUMMARY_TAIL,
   MinimalCartService,
   minimalCartReply,
   parseMinimalCart,
+  type MinimalCartResult,
 } from './minimal-cart.service';
+import {
+  applyCustomerStyle,
+  type CustomerStyle,
+} from '../domain/customer-style';
 
 const PRODUCT = '11111111-1111-4111-8111-111111111111';
 const VARIANT = '22222222-2222-4222-8222-222222222222';
@@ -139,9 +145,12 @@ describe('Minimal cart public operations', () => {
     );
     expect(minimalCartReply(result)).toBe(
       [
-        'Su carrito:',
-        '• Product: 2 × $8.00 MXN; importe $15.00 MXN (promoción: Discount, ahorro $1.00 MXN)',
-        'Total de productos: $15.00 MXN.',
+        '*Su carrito*',
+        '• Product',
+        '   2 × $8.00 = *$15.00*',
+        '   _Promoción Discount: ahorra $1.00_',
+        '',
+        '*Total de productos: $15.00*',
         'No incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
       ].join('\n'),
     );
@@ -351,10 +360,10 @@ describe('Minimal cart public operations', () => {
   );
 
   it.each([
-    ['Discount', 'promoción: Discount, ahorro'],
-    [null, 'descuento: ahorro'],
-    ['', 'descuento: ahorro'],
-    ['   ', 'descuento: ahorro'],
+    ['Discount', 'Promoción Discount: ahorra'],
+    [null, 'Descuento: ahorra'],
+    ['', 'Descuento: ahorra'],
+    ['   ', 'Descuento: ahorra'],
   ])(
     '[S5] renders a discounted and a normal cart line (title %j)',
     async (title, label) => {
@@ -399,10 +408,14 @@ describe('Minimal cart public operations', () => {
       const result = await f.service.view(SENDER);
       expect(minimalCartReply(result)).toBe(
         [
-          'Su carrito:',
-          `• Product: 2 × $10.00 MXN; importe $19.00 MXN (${label} $1.00 MXN)`,
-          '• Normal: 1 × $10.00 MXN; importe $10.00 MXN',
-          'Total de productos: $29.00 MXN.',
+          '*Su carrito*',
+          '• Product',
+          '   2 × $10.00 = *$19.00*',
+          `   _${label} $1.00_`,
+          '• Normal',
+          '   1 × $10.00 = *$10.00*',
+          '',
+          '*Total de productos: $29.00*',
           'No incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
         ].join('\n'),
       );
@@ -998,5 +1011,104 @@ describe('Minimal cart public operations', () => {
       expect(commit).not.toHaveBeenCalled();
       expect((await f.store.get(SENDER))?.data.minimalCart).toEqual(before);
     });
+  });
+});
+
+describe('cart reply S2 layout (message formatting F3a)', () => {
+  const USTED: CustomerStyle = {
+    register: 'usted',
+    emojis: false,
+    tone: 'neutral',
+  };
+  const TU: CustomerStyle = { ...USTED, register: 'tu' };
+  const cart = (): Extract<MinimalCartResult, { ok: true }> => ({
+    ok: true,
+    items: [
+      {
+        productId: PRODUCT,
+        quantity: 1,
+        unitPriceCents: 125000,
+        name: 'Croquetas Nupec Adulto',
+        variantName: '15 kg',
+        finalPriceCents: 112500,
+        appliedPromotionTitle: 'Buen Fin',
+        discountAmountCents: 12500,
+        pet: { id: 'pet-1', name: 'Max' },
+      },
+      {
+        productId: OTHER,
+        quantity: 1,
+        unitPriceCents: 48000,
+        name: 'Arena',
+        variantName: '10 kg',
+        finalPriceCents: 48000,
+        appliedPromotionTitle: null,
+        discountAmountCents: 0,
+        backorder: {
+          id: 'bo-1',
+          folio: 'BO-000012',
+          productName: 'Arena',
+          variantName: '10 kg',
+          reservedUntil: '2026-12-01T00:00:00.000Z',
+        },
+      },
+    ],
+    totalCents: 160500,
+    promotionEvaluationStatus: 'fully_evaluated',
+  });
+  const usted = [
+    '*Su carrito*',
+    '• Croquetas Nupec Adulto — 15 kg (para Max)',
+    '   1 × $1,250.00 = *$1,125.00*',
+    '   _Promoción Buen Fin: ahorra $125.00_',
+    '• Arena — 10 kg (pedido apartado BO-000012)',
+    '   1 × $480.00 = *$480.00*',
+    '',
+    '*Total de productos: $1,605.00*',
+    'No incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+  ].join('\n');
+
+  it('[S2,S4] renders the usted cart with the shared item lines, bold title and bold total', () => {
+    expect(minimalCartReply(cart())).toBe(usted);
+    expect(applyCustomerStyle(minimalCartReply(cart()), USTED)).toBe(usted);
+  });
+
+  it('[S2] the tú cart converts the title and keeps the item indentation', () => {
+    expect(applyCustomerStyle(minimalCartReply(cart()), TU)).toBe(
+      usted.replace('*Su carrito*', '*Tu carrito*'),
+    );
+  });
+
+  it('[S2] still ends with the summary tail so the closing question and buttons attach', () => {
+    expect(minimalCartReply(cart()).endsWith(MINIMAL_CART_SUMMARY_TAIL)).toBe(
+      true,
+    );
+  });
+
+  it('[S2] promotion review note sits under the total; empty cart is unchanged', () => {
+    expect(
+      minimalCartReply({
+        ...cart(),
+        promotionEvaluationStatus: 'needs_human_review',
+      }),
+    ).toContain(
+      '\n*Total de productos: $1,605.00*\nLas promociones requieren revisión del equipo.\nNo incluye envío',
+    );
+    expect(
+      minimalCartReply({
+        ok: true,
+        items: [],
+        totalCents: 0,
+        promotionEvaluationStatus: 'fully_evaluated',
+      }),
+    ).toBe('Su carrito está vacío.');
+  });
+
+  it('[F2-fix G1] catalog names with markup characters stay plain in the cart', () => {
+    const result = cart();
+    result.items[0].name = '*Croquetas* _Nupec_';
+    expect(minimalCartReply(result)).toContain(
+      '\n• Croquetas Nupec — 15 kg (para Max)\n',
+    );
   });
 });

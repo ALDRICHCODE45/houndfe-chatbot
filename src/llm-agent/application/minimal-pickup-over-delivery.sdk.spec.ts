@@ -57,7 +57,8 @@ const freeQuote = (): ShippingQuoteResponse => ({
   currency: 'MXN',
   eta: { days: 1, reason: null },
 });
-const DELIVERY_SUMMARY = /^Confirm[ae] (sus|tus) datos de entrega:/m;
+// Message formatting F3a: the bold heading line, usted or tú.
+const DELIVERY_SUMMARY = /^\*Confirm[ae] (sus|tus) datos de entrega\*$/m;
 const ORDER_ENDING =
   '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
 

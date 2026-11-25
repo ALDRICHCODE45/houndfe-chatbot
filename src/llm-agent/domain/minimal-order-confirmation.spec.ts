@@ -174,7 +174,7 @@ describe('shipping summary and exact binding', () => {
     expect(summary.split('\n').slice(-9)).toEqual([
       'Centro, C.P. 06000, Cuauhtémoc, Ciudad de México',
       '',
-      'Total de productos: $27.00',
+      '*Total de productos: $27.00*',
       '*Envío:* Envíos Perros Estándar — $30.00',
       'Usted tiene un crédito de $120.00 por sus productos (ya descontado del envío)',
       'Llega en aproximadamente 3 días hábiles.',
@@ -500,7 +500,7 @@ describe('order summary S2 layout (message formatting F2b)', () => {
     'Av. Juárez 10, int. 4',
     'Centro, C.P. 06000, Cuauhtémoc, Ciudad de México',
     '',
-    'Total de productos: $1,905.00',
+    '*Total de productos: $1,905.00*',
     '*Envío:* DHL Express — $50.00',
     'Usted tiene un crédito de $120.00 por sus productos (ya descontado del envío)',
     'Llega en aproximadamente 2 días hábiles.',
@@ -626,8 +626,100 @@ describe('order summary S2 layout (message formatting F2b)', () => {
 
   it('[S2] a usual 3-item delivery summary stays under the 1024-char interactive body limit', () => {
     const summary = renderMinimalOrderSummary(threeItems());
-    expect(summary.length).toBe(645);
     expect(summary.length).toBeLessThan(1024);
+  });
+});
+
+describe('order summary fixes (message formatting F2-fix)', () => {
+  const withItem = (
+    item: Partial<MinimalOrderSnapshot['items'][number]>,
+  ): MinimalOrderSnapshot => {
+    const snapshot = eligible();
+    return {
+      ...snapshot,
+      items: snapshot.items.map((line) => ({ ...line, ...item })),
+    };
+  };
+
+  it('[F2-fix G1] catalog names and promotion titles with * _ ~ never break the bold/italic markup', () => {
+    const summary = renderMinimalOrderSummary(
+      withItem({
+        name: 'Croquetas *Premium* _Light_',
+        variantName: '~15 kg~',
+        appliedPromotionTitle: '2x1_Mayo',
+        discountAmountCents: 300,
+        pet: { id: 'pet-1', name: 'Max_*' },
+      }),
+    );
+    expect(summary).toContain(
+      [
+        '• Croquetas Premium Light — 15 kg (para Max)',
+        '   2 × $15.00 = *$27.00*',
+        '   _Promoción 2x1 Mayo: ahorra $3.00_',
+      ].join('\n'),
+    );
+  });
+
+  it('[F2-fix G1] customer and address values with markup characters are shown plain', () => {
+    const draft = savedDraft();
+    if (draft.address.kind !== 'saved') throw new Error('fixture');
+    draft.customer.firstName = '*Ana*';
+    draft.address.snapshot.street = 'Calle_Uno';
+    const summary = renderMinimalOrderSummary({ ...eligible(), draft });
+    expect(summary).toContain('\nAna Pérez\nCalle Uno 10\n');
+  });
+
+  it.each([
+    ['Promoción Buen Fin', '_Promoción Buen Fin: ahorra $3.00_'],
+    ['Promociones de invierno', '_Promociones de invierno: ahorra $3.00_'],
+    ['PROMOCION 2x1', '_PROMOCION 2x1: ahorra $3.00_'],
+    ['promo verano', '_promo verano: ahorra $3.00_'],
+    ['Promo', '_Promo: ahorra $3.00_'],
+    ['Promotores', '_Promoción Promotores: ahorra $3.00_'],
+    ['Buen Fin', '_Promoción Buen Fin: ahorra $3.00_'],
+  ])(
+    '[F2-fix G2] never doubles the promotion prefix (title %j)',
+    (title, line) => {
+      expect(
+        renderMinimalOrderSummary(
+          withItem({ appliedPromotionTitle: title, discountAmountCents: 300 }),
+        ),
+      ).toContain(`\n   ${line}\n`);
+    },
+  );
+
+  it('[F2-fix G4] «Total de productos» is bold whether or not shipping is charged', () => {
+    const charged = renderMinimalOrderSummary({
+      ...eligible(),
+      shipping: { quoteId: 'q', customerChargeCents: 5000 },
+    });
+    expect(charged).toContain('\n*Total de productos: $27.00*\n');
+    expect(renderMinimalOrderSummary(eligible())).toContain(
+      '\n*Total de productos: $27.00*\n',
+    );
+  });
+
+  it('[F2-fix G4] a pickup without a customer name leaves no empty «Datos del cliente» section', () => {
+    const pickup = evaluateMinimalPickupOrder({
+      quote: quote(),
+      customerId: CUSTOMER,
+      customer: { firstName: ' ', lastName: null },
+    });
+    if (!pickup.ok) throw new Error('fixture');
+    expect(renderMinimalOrderSummary(pickup.snapshot)).toBe(
+      [
+        '*Resumen de su pedido* 🧾',
+        '',
+        '*Productos*',
+        '• Ibuprofeno — 500 mg',
+        '   2 × $15.00 = *$27.00*',
+        '',
+        '*Envío:* recoge en tienda — sin costo',
+        '*Total a pagar: $27.00*',
+        '',
+        MINIMAL_ORDER_SUMMARY_CLOSING,
+      ].join('\n'),
+    );
   });
 });
 

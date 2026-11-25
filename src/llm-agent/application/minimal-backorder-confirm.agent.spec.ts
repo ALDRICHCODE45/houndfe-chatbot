@@ -335,7 +335,7 @@ describe('restock backorder confirm through the customer turn', () => {
       [
         ADDED,
         '',
-        'Su carrito:\n• Croquetas Adulto 18 kg: 2 × $1099.00 MXN; importe $2198.00 MXN (pedido apartado BO-000012)\nTotal de productos: $2198.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+        '*Su carrito*\n• Croquetas Adulto 18 kg (pedido apartado BO-000012)\n   2 × $1,099.00 = *$2,198.00*\n\n*Total de productos: $2,198.00*\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
         '',
         '¿Desea agregar algo más o seguimos con su compra?',
       ].join('\n'),
@@ -356,9 +356,9 @@ describe('restock backorder confirm through the customer turn', () => {
     const decision = await h.turn('Confirmo mi pedido apartado', [], {
       interactiveReplyId: TAP,
     });
-    expect(reply(decision)).toContain('• Ibuprofeno: 1 × $15.00 MXN');
+    expect(reply(decision)).toContain('• Ibuprofeno\n   1 × $15.00 = *$15.00*');
     expect(reply(decision)).toContain('(pedido apartado BO-000012)');
-    expect(reply(decision)).toContain('Total de productos: $2213.00 MXN.');
+    expect(reply(decision)).toContain('*Total de productos: $2,213.00*');
     expect((await h.slot())?.items).toHaveLength(2);
     expect(h.seen).toHaveLength(0);
   });

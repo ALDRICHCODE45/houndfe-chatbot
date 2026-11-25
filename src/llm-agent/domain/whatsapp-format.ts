@@ -31,6 +31,23 @@ export const TITLE_EMOJI_LINE = new RegExp(
 /** S2: indentation of the detail lines under an item bullet. */
 export const ITEM_DETAIL_INDENT = '   ';
 
+/**
+ * F2-fix G1: an interpolated catalog/customer value (product, variant, pet
+ * or customer name, promotion title, address field) made safe to place in
+ * or next to WhatsApp markup. The markers `*` and `~` and the monospace
+ * backtick are dropped, `_` becomes a space («2x1_Mayo» → «2x1 Mayo»), and
+ * runs of spaces collapse, so a value can never open or close a bold,
+ * italic, strike or monospace span of the surrounding copy. Display only:
+ * stored data and consent snapshots are never rewritten.
+ */
+export function plain(value: string): string {
+  return value
+    .replace(/[*~`]/g, '')
+    .replace(/_/g, ' ')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
 /** `*text*`, trimmed; empty text stays empty. */
 export function bold(text: string): string {
   const trimmed = text.trim();

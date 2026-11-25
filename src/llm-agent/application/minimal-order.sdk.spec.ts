@@ -347,7 +347,7 @@ function setup(
 
 describe('checkout next-step guidance through the SDK route', () => {
   const deliveryEnding =
-    'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.';
+    'Responda *SÍ* para confirmar estos datos, o dígame qué quiere cambiar.';
   const orderEnding =
     '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
 
@@ -381,8 +381,8 @@ describe('checkout next-step guidance through the SDK route', () => {
       EVENT('delivery-offer'),
     );
     const reply = (delivery as { reply: string }).reply;
-    expect(reply).toMatch(/^Confirme sus datos de entrega:/);
-    expect(reply).toContain('Calle: Av. Juárez 10, int. 130');
+    expect(reply).toMatch(/^\*Confirme sus datos de entrega\*/);
+    expect(reply).toContain('*Calle:* Av. Juárez 10, int. 130');
     expect(reply.endsWith(deliveryEnding)).toBe(true);
     expect(reply).not.toContain('no crea un pedido');
     expect(reply).not.toContain('Antes de crear el pedido necesito');
@@ -460,7 +460,7 @@ describe('checkout next-step guidance through the SDK route', () => {
         EVENT('fallback-offer'),
       );
       expect((offer as { reply: string }).reply).toMatch(
-        /^Confirme sus datos de entrega:/,
+        /^\*Confirme sus datos de entrega\*/,
       );
       if (sent) (offer as { onSent: () => void }).onSent();
       await h.turn(

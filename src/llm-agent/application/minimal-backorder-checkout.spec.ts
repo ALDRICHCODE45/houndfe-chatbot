@@ -349,7 +349,7 @@ describe('summary and createCheckout with a backorder line (S2, S6, S11)', () =>
     const offer = await h.offer();
     // The promotion applies to the ordinary line only.
     expect(offer.reply).toContain(
-      '• Ibuprofeno\n   2 × $15.00 = *$27.00*\n   _Promoción Promo orden: ahorra $3.00_',
+      '• Ibuprofeno\n   2 × $15.00 = *$27.00*\n   _Promo orden: ahorra $3.00_',
     );
     expect(offer.reply).toContain(
       '• Croquetas Adulto 18 kg (pedido apartado BO-000012)\n   2 × $1,099.00 = *$2,198.00*',

@@ -320,6 +320,14 @@ describe('G2 a cart change after the order summary continues to the updated summ
       'only the bold SÍ closing',
       'Listo:\n• Collar 1 × $999.00\n\n¿Está todo bien? Responde *SÍ* para crear el pedido.',
     ],
+    [
+      'the bold F3a delivery-data confirmation',
+      '*Confirma tus datos de entrega*\n\n*Nombre:* Mariana\n*Calle:* Calle $999.00\n\nResponde *SÍ* para confirmar estos datos, o dime qué quieres cambiar.',
+    ],
+    [
+      'only the bold F3a delivery-data SÍ line',
+      'Revisé todo:\nCalle $999.00\n\nResponde *SÍ* para confirmar estos datos.',
+    ],
   ])(
     '[message-formatting F2b] a model imitating %s is replaced by the real order summary',
     async (_name, fake) => {
@@ -444,7 +452,7 @@ describe('G3 lines never repeat the product name in the presentation', () => {
         promotionEvaluationStatus: 'fully_evaluated',
       }),
     ).toContain(
-      '• Collar Ajustable de Nylon para Perro — Mediana: 1 × $149.00 MXN',
+      '• Collar Ajustable de Nylon para Perro — Mediana\n   1 × $149.00 = *$149.00*',
     );
     const h = harness('04000');
     await summaryForOneCollar(h);

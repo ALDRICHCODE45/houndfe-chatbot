@@ -462,6 +462,13 @@ const priceKey = (productId: string, variantId?: string | null) =>
 /**
  * Model text imitating the server-owned delivery-data or order summaries.
  * Only the application presents them (and arms their SÍ gate).
+ *
+ * The «SÍ» of «Responda *SÍ* …» is closed by the lookahead
+ * `(?![a-záéíóúñ])` instead of `\b`: without the `u` flag `\b` only knows
+ * ASCII word characters, so it never matched right after an accented «Í»
+ * (a bare «SÍ» slipped through) while the lookahead still rejects longer
+ * words such as «sigue» or «siempre». The optional `[«"“'*]` accepts the
+ * quoted and the bold (message formatting S2) forms.
  */
 const IMITATED_CONFIRMATION =
   /confirm[ae] (?:sus|tus) datos de entrega|resumen de (?:su|tu) pedido|respond[ae]\s*[«"“'*]?\s*s[ií](?![a-záéíóúñ])[^\n]{0,40}\b(?:crear el pedido|confirmar (?:estos|sus|tus) datos)/i;

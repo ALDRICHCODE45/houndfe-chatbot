@@ -6,6 +6,7 @@ import {
   MINIMAL_CHECKOUT_CONFIRMED_REPLY,
   MINIMAL_CHECKOUT_DECLINED_REPLY,
   MINIMAL_CHECKOUT_NOT_CONFIRMED_REPLY,
+  MINIMAL_CHECKOUT_SUMMARY_HEADING,
   MinimalCheckoutConfirmation,
   evaluateMinimalCheckoutReadiness,
   renderMinimalCheckoutConfirmation,
@@ -14,6 +15,11 @@ import {
   type MinimalCheckoutMissingField,
   type MinimalCheckoutPrepareResult,
 } from './minimal-checkout-confirmation';
+import {
+  applyCustomerRegister,
+  applyCustomerStyle,
+  type CustomerStyle,
+} from './customer-style';
 
 type Raw = Record<string, unknown>;
 
@@ -267,16 +273,89 @@ describe('delivery confirmation next-step presentation', () => {
       const fields = fullFields({ interiorNumber: '130' });
       const raw = kind === 'new' ? withFields(fields) : savedWithFields(fields);
       const summary = renderMinimalCheckoutConfirmation(normalize(raw));
-      expect(summary).toContain('Calle: Av. Reforma 123, int. 130');
+      expect(summary).toContain('*Calle:* Av. Reforma 123, int. 130');
       // F2: no bureaucratic scope disclaimer.
       expect(summary).not.toMatch(/no crea un pedido|solo en este chat/);
       expect(
         summary.endsWith(
-          'Responda "SÍ" para confirmar estos datos, o dígame qué quiere cambiar.',
+          'Responda *SÍ* para confirmar estos datos, o dígame qué quiere cambiar.',
         ),
       ).toBe(true);
     },
   );
+
+  const USTED: CustomerStyle = {
+    register: 'usted',
+    emojis: false,
+    tone: 'neutral',
+  };
+  const TU: CustomerStyle = { ...USTED, register: 'tu' };
+  const usted = [
+    '*Confirme sus datos de entrega*',
+    '',
+    '*Nombre:* Ana López',
+    '*Calle:* Av. Reforma 123, int. 4',
+    '*Colonia:* Juárez',
+    '*Código postal:* 06600',
+    '*Ciudad o municipio:* Ciudad de México',
+    '*Estado:* CDMX',
+    '',
+    'Responda *SÍ* para confirmar estos datos, o dígame qué quiere cambiar.',
+  ].join('\n');
+  const full = () =>
+    normalize(
+      newDraft({
+        customer: { firstName: 'Ana', lastName: 'López' },
+        address: { kind: 'new', fields: fullFields({ interiorNumber: '4' }) },
+      }),
+    );
+
+  it('[message-formatting F3a S2] renders the usted confirmation with a bold heading, bold labels and the SÍ line', () => {
+    expect(MINIMAL_CHECKOUT_SUMMARY_HEADING).toBe(
+      '*Confirme sus datos de entrega*',
+    );
+    expect(renderMinimalCheckoutConfirmation(full())).toBe(usted);
+    expect(applyCustomerStyle(usted, USTED)).toBe(usted);
+  });
+
+  it('[message-formatting F3a S2] the tú confirmation is fully converted and keeps the heading findable', () => {
+    const tu = applyCustomerStyle(
+      renderMinimalCheckoutConfirmation(full()),
+      TU,
+    );
+    expect(tu).toBe(
+      usted
+        .replace(
+          '*Confirme sus datos de entrega*',
+          '*Confirma tus datos de entrega*',
+        )
+        .replace(
+          'Responda *SÍ* para confirmar estos datos, o dígame qué quiere cambiar.',
+          'Responde *SÍ* para confirmar estos datos, o dime qué quieres cambiar.',
+        ),
+    );
+    expect(tu).toContain(
+      applyCustomerRegister(MINIMAL_CHECKOUT_SUMMARY_HEADING, TU),
+    );
+  });
+
+  it('[F2-fix G1] customer values with markup characters are shown plain', () => {
+    const summary = renderMinimalCheckoutConfirmation(
+      normalize(
+        newDraft({
+          customer: { firstName: '*Ana*', lastName: '_López_' },
+          address: {
+            kind: 'new',
+            fields: fullFields({ street: 'Calle_Uno', neighborhood: '~Roma~' }),
+          },
+        }),
+      ),
+    );
+    expect(summary).toContain(
+      '\n*Nombre:* Ana López\n*Calle:* Calle Uno 123\n',
+    );
+    expect(summary).toContain('\n*Colonia:* Roma\n');
+  });
 
   it('omits the interior suffix when there is no interior number', () => {
     expect(

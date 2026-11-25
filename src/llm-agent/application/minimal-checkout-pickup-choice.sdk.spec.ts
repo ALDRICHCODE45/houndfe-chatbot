@@ -31,7 +31,8 @@ const QUESTION =
   '¿Se lo enviamos a su dirección o prefiere recogerlo en tienda?';
 const QUESTION_TU =
   '¿Te lo enviamos a tu dirección o prefieres recogerlo en tienda?';
-const DELIVERY_SUMMARY = /^Confirm[ae] (sus|tus) datos de entrega:/m;
+// Message formatting F3a: the bold heading line, usted or tú.
+const DELIVERY_SUMMARY = /^\*Confirm[ae] (sus|tus) datos de entrega\*$/m;
 const ORDER_ENDING =
   '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
 

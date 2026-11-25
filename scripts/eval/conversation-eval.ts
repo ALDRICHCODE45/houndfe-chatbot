@@ -289,7 +289,9 @@ function gateLabel(reply: string, llmCalls: number): string | null {
   // pedido* 🧾») and tú customers read «tu pedido».
   if (/^\*?Resumen de (?:su|tu) pedido/m.test(reply))
     labels.push('order summary');
-  if (/^Confirme sus datos de entrega/m.test(reply))
+  // Message formatting F3a: the delivery-data heading is bold and tú
+  // customers read «Confirma tus datos».
+  if (/^\*?Confirm[ae] (?:sus|tus) datos de entrega/m.test(reply))
     labels.push('delivery confirmation');
   if (/folio/i.test(reply)) labels.push('order placed');
   return labels.length === 0 ? null : labels.join(' + ');

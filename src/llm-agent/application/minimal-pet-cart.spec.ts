@@ -127,11 +127,11 @@ describe('T5a R1: pet on a cart line (S16, item 1/3)', () => {
       `{"items":[{"productId":"${BO_PRODUCT}","quantity":2,"unitPriceCents":1500,"pet":{"id":"${MAX.id}","name":"Max"}}],"idempotencyKey":"","expectedTotalCents":3000}`,
     );
     expect(minimalCartReply(result)).toBe(
-      'Su carrito:\n• Ibuprofeno: 2 × $15.00 MXN; importe $30.00 MXN (para Max)\nTotal de productos: $30.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+      '*Su carrito*\n• Ibuprofeno (para Max)\n   2 × $15.00 = *$30.00*\n\n*Total de productos: $30.00*\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
     );
   });
 
-  it('«(para Max)» follows the promotion suffix', async () => {
+  it('«(para Max)» stays on the name line; the promotion is its italic detail line (message formatting F3a)', async () => {
     const h = setup({ promoPercent: 10 });
     const result = await h.cart.setItem(
       SENDER,
@@ -141,7 +141,7 @@ describe('T5a R1: pet on a cart line (S16, item 1/3)', () => {
       MAX,
     );
     expect(minimalCartReply(result)).toContain(
-      '• Ibuprofeno: 2 × $15.00 MXN; importe $27.00 MXN (promoción: Promo orden, ahorro $3.00 MXN) (para Max)',
+      '• Ibuprofeno (para Max)\n   2 × $15.00 = *$27.00*\n   _Promo orden: ahorra $3.00_',
     );
   });
 
@@ -156,7 +156,7 @@ describe('T5a R1: pet on a cart line (S16, item 1/3)', () => {
       `{"items":[{"productId":"${BO_PRODUCT}","quantity":2,"unitPriceCents":1500}],"idempotencyKey":"","expectedTotalCents":3000}`,
     );
     expect(minimalCartReply(result)).toBe(
-      'Su carrito:\n• Ibuprofeno: 2 × $15.00 MXN; importe $30.00 MXN\nTotal de productos: $30.00 MXN.\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
+      '*Su carrito*\n• Ibuprofeno\n   2 × $15.00 = *$30.00*\n\n*Total de productos: $30.00*\nNo incluye envío y no reserva existencias. Todavía no se ha creado un pedido.',
     );
     expect(await h.cart.fingerprint(SENDER)).toBe('9dfafc7fb792dced');
   });
@@ -395,7 +395,7 @@ describe('T5a R3: one line per product (S9)', () => {
     const view = await h.cart.view(SENDER);
     expect(minimalCartReply(view)).toContain('(pedido apartado BO-000012)');
     expect(minimalCartReply(view)).toContain(
-      '• Croquetas Adulto 18 kg: 2 × $1200.00 MXN; importe $2400.00 MXN (para Max)',
+      '• Croquetas Adulto 18 kg (para Max)\n   2 × $1,200.00 = *$2,400.00*',
     );
   });
 });

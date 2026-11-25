@@ -438,7 +438,7 @@ describe('S2 cart summary invites the customer to continue', () => {
     const h = orderHarness();
     await h.unconfirmed();
     const view = await viewCart(h, '¿Qué llevo en mi carrito?', 'c1');
-    expect(view.reply).toContain('Su carrito:');
+    expect(view.reply).toContain('*Su carrito*');
     expect(view.reply.endsWith(`${CART_TAIL}\n\n${CART_QUESTION}`)).toBe(true);
     expect(view.interactive).toEqual({
       type: 'buttons',
@@ -570,7 +570,7 @@ describe('S2 cart summary invites the customer to continue', () => {
     expect(h.seen).toHaveLength(calls);
     expect(h.api.getCustomerCheckoutContext).toHaveBeenCalledTimes(lookups);
     expect(stale.reply).toMatch(/^Ese botón ya no está vigente\./);
-    expect(stale.reply).toContain('3 × $15.00 MXN');
+    expect(stale.reply).toContain('3 × $15.00 = *$45.00*');
     expect(stale.reply.endsWith(CART_QUESTION)).toBe(true);
     const current = buttonIds(stale);
     expect(current).toHaveLength(2);
@@ -600,7 +600,7 @@ describe('S4 delivery-data summary buttons', () => {
       [call('prepareOrder'), say()],
       'd1',
     );
-    expect(offer.reply).toMatch(/^Confirme sus datos de entrega:/);
+    expect(offer.reply).toMatch(/^\*Confirme sus datos de entrega\*/);
     expect(offer.interactive).toEqual({
       type: 'buttons',
       buttons: [

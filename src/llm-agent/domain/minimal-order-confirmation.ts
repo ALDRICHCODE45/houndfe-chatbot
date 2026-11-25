@@ -22,6 +22,7 @@ import {
   itemDetail,
   itemLine,
   money,
+  plain,
   sectionTitle,
 } from './whatsapp-format';
 
@@ -281,8 +282,6 @@ export function sameMinimalOrder(
   }
 }
 
-const mxn = (cents: number) => `$${(cents / 100).toFixed(2)} MXN`;
-
 /**
  * "Producto — Presentación" for one line. Backend presentation labels may
  * already start with the product name ("Collar … Mediana"); only the
@@ -308,25 +307,49 @@ export function minimalLineLabel(
   return `${name} — ${presentation}`;
 }
 
-/** Server-owned display of validated backend savings, never a price calculation. */
-export function minimalPromotionSuffix(
+/**
+ * True when a backend promotion title already starts with the word
+ * «Promoción», «Promociones» or «Promo» (case- and accent-blind), so the
+ * label never doubles it («Promoción Promociones de invierno»).
+ */
+function namesItsPromotion(title: string): boolean {
+  return /^promo(?:cion(?:es)?)?(?![a-z0-9])/.test(
+    title
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase(),
+  );
+}
+
+/**
+ * Message formatting F2-fix G2: the single source of the savings label of a
+ * line — «Promoción Buen Fin: ahorra $125.00», the backend title alone when
+ * it already names the promotion, «Descuento: ahorra $3.00» without a title
+ * — or `null` without a discount. Server-owned display of validated backend
+ * savings, never a price calculation; the title is `plain` (G1).
+ */
+export function minimalPromotionLabel(
   item: Pick<MinimalOrderLine, 'appliedPromotionTitle' | 'discountAmountCents'>,
-): string {
+): string | null {
   const discount = item.discountAmountCents ?? 0;
-  if (discount <= 0) return '';
-  const label = item.appliedPromotionTitle?.trim()
-    ? `promoción: ${item.appliedPromotionTitle}, ahorro`
-    : 'descuento: ahorro';
-  return ` (${label} ${mxn(discount)})`;
+  if (discount <= 0) return null;
+  const title = plain(item.appliedPromotionTitle ?? '');
+  const promotion =
+    title === ''
+      ? 'Descuento'
+      : namesItsPromotion(title)
+        ? title
+        : `Promoción ${title}`;
+  return `${promotion}: ahorra ${money(discount)}`;
 }
 
 /**
  * Restock backorder T5b: « (pedido apartado BO-000012)» after the line of a
  * confirmed backorder; empty for every ordinary line.
  */
-export function minimalBackorderSuffix(
-  item: Pick<MinimalOrderLine, 'backorder'>,
-): string {
+export function minimalBackorderSuffix(item: {
+  readonly backorder?: { readonly folio: string };
+}): string {
   return item.backorder === undefined
     ? ''
     : ` (pedido apartado ${item.backorder.folio})`;
@@ -336,12 +359,20 @@ export function minimalBackorderSuffix(
  * Multi-pet T5a R5 (S16): « (para Max)» after a line for a pet; empty for
  * every other line.
  */
-export function minimalPetSuffix(item: Pick<MinimalOrderLine, 'pet'>): string {
+export function minimalPetSuffix(item: {
+  readonly pet?: { readonly name: string };
+}): string {
   return item.pet === undefined ? '' : ` (para ${item.pet.name})`;
 }
 
 const present = (part: string | null | undefined): part is string =>
-  typeof part === 'string' && part.trim() !== '';
+  typeof part === 'string' && plain(part) !== '';
+
+/** The present parts, each `plain` (G1), joined. */
+const joinPresent = (
+  parts: ReadonlyArray<string | null | undefined>,
+  separator: string,
+): string => parts.filter(present).map(plain).join(separator);
 
 /**
  * Message formatting S2: the people/address lines of the summary, one piece
@@ -351,35 +382,40 @@ const present = (part: string | null | undefined): part is string =>
 function deliveryLines(snapshot: MinimalOrderSnapshot): string[] {
   const draft = snapshot.draft;
   if (draft === null) {
-    const name = [snapshot.customer?.firstName, snapshot.customer?.lastName]
-      .filter(present)
-      .join(' ');
+    const name = joinPresent(
+      [snapshot.customer?.firstName, snapshot.customer?.lastName],
+      ' ',
+    );
     return name === '' ? [] : [name];
   }
   const address =
     draft.address.kind === 'saved'
       ? draft.address.snapshot
       : draft.address.fields;
-  const name = [draft.customer.firstName, draft.customer.lastName]
-    .filter(present)
-    .join(' ');
+  const name = joinPresent(
+    [draft.customer.firstName, draft.customer.lastName],
+    ' ',
+  );
   if (address === null) return [name].filter(present);
   return [
     name,
     [
-      [address.street, address.exteriorNumber].filter(present).join(' '),
-      address.interiorNumber === null ? null : `int. ${address.interiorNumber}`,
+      joinPresent([address.street, address.exteriorNumber], ' '),
+      present(address.interiorNumber)
+        ? `int. ${plain(address.interiorNumber)}`
+        : null,
     ]
       .filter(present)
       .join(', '),
-    [
-      address.neighborhood,
-      address.zipCode === null ? null : `C.P. ${address.zipCode}`,
-      address.city ?? address.municipality,
-      address.state,
-    ]
-      .filter(present)
-      .join(', '),
+    joinPresent(
+      [
+        address.neighborhood,
+        present(address.zipCode) ? `C.P. ${address.zipCode}` : null,
+        address.city ?? address.municipality,
+        address.state,
+      ],
+      ', ',
+    ),
   ].filter(present);
 }
 
@@ -388,7 +424,8 @@ function deliveryLines(snapshot: MinimalOrderSnapshot): string[] {
  * always closed by the bold «Total a pagar» (products + the customer's
  * shipping charge; free shipping and store pickup included). «Total de
  * productos» is shown only when it differs from the total to pay (a
- * shipping charge), so the same amount is never listed twice.
+ * shipping charge), so the same amount is never listed twice; it is always
+ * bold, as in the cart (F2-fix G4).
  */
 function shippingLines(snapshot: MinimalOrderSnapshot): string[] {
   const shipping = snapshot.shipping;
@@ -408,7 +445,7 @@ function shippingLines(snapshot: MinimalOrderSnapshot): string[] {
   const eta = minimalShippingEtaLine(shipping.eta);
   return [
     ...(charge > 0
-      ? [`Total de productos: ${money(snapshot.totalCents)}`]
+      ? [bold(`Total de productos: ${money(snapshot.totalCents)}`)]
       : []),
     `${bold('Envío:')} ${carrier}${charge === 0 ? 'sin costo' : money(charge)}`,
     ...((shipping.creditCents ?? 0) > 0
@@ -421,31 +458,40 @@ function shippingLines(snapshot: MinimalOrderSnapshot): string[] {
   ];
 }
 
+/** The fields of a cart or order line its customer-facing lines show. */
+export interface MinimalItemLineInput {
+  readonly name: string;
+  readonly variantName?: string | null;
+  readonly quantity: number;
+  readonly unitPriceCents: number;
+  readonly finalPriceCents: number;
+  readonly appliedPromotionTitle?: string | null;
+  readonly discountAmountCents?: number;
+  readonly backorder?: { readonly folio: string };
+  readonly pet?: { readonly name: string };
+}
+
 /**
- * Message formatting S2: the item lines of the summary — the bullet with
- * the product label and its backorder (T5b) and pet (T5a) suffixes, then
- * the indented quantity × price = *amount* line and, with a backend
- * discount, the indented italic promotion line.
+ * Message formatting S2: the lines of one item, shared by the order summary
+ * and the cart — the bullet with the product label and its backorder (T5b)
+ * and pet (T5a) suffixes, then the indented quantity × price = *amount*
+ * line and, with a backend discount, the indented italic promotion line.
+ * Catalog and pet names are `plain` (F2-fix G1).
  */
-function summaryItemLines(item: MinimalOrderLine): string[] {
-  const discount = item.discountAmountCents ?? 0;
-  const title = item.appliedPromotionTitle?.trim() ?? '';
-  const promotion =
-    title === ''
-      ? 'Descuento'
-      : /^promoci[oó]n\b/i.test(title)
-        ? title
-        : `Promoción ${title}`;
+export function minimalItemLines(item: MinimalItemLineInput): string[] {
+  const promotion = minimalPromotionLabel(item);
+  const label = minimalLineLabel(
+    plain(item.name),
+    item.variantName == null ? item.variantName : plain(item.variantName),
+  );
+  const pet =
+    item.pet === undefined ? {} : { pet: { name: plain(item.pet.name) } };
   return [
-    itemLine(
-      `${minimalLineLabel(item.name, item.variantName)}${minimalBackorderSuffix(item)}${minimalPetSuffix(item)}`,
-    ),
+    itemLine(`${label}${minimalBackorderSuffix(item)}${minimalPetSuffix(pet)}`),
     itemDetail(
       `${item.quantity} × ${money(item.unitPriceCents)} = ${bold(money(item.finalPriceCents))}`,
     ),
-    ...(discount > 0
-      ? [itemDetail(italic(`${promotion}: ahorra ${money(discount)}`))]
-      : []),
+    ...(promotion === null ? [] : [itemDetail(italic(promotion))]),
   ];
 }
 
@@ -469,13 +515,7 @@ export function renderMinimalOrderSummary(
 ): string {
   const pickup =
     snapshot.shipping !== undefined && !('quoteId' in snapshot.shipping);
-  return [
-    sectionTitle('Resumen de su pedido', TITLE_EMOJI.summary),
-    '',
-    sectionTitle('Productos'),
-    ...snapshot.items.flatMap(summaryItemLines),
-    '',
-    sectionTitle(pickup ? 'Datos del cliente' : 'Entrega'),
+  const people = [
     ...deliveryLines(snapshot),
     ...(snapshot.draft?.address.kind === 'new'
       ? ['Guardaremos esta dirección con su pedido.']
@@ -483,7 +523,22 @@ export function renderMinimalOrderSummary(
     ...(snapshot.draft?.address.kind === 'savedCorrected'
       ? ['Actualizaremos su dirección guardada con estos datos.']
       : []),
+  ];
+  return [
+    sectionTitle('Resumen de su pedido', TITLE_EMOJI.summary),
     '',
+    sectionTitle('Productos'),
+    ...snapshot.items.flatMap(minimalItemLines),
+    '',
+    // F2-fix G4: a section with nothing to show (a pickup without a
+    // customer name) is left out, never rendered as an empty title.
+    ...(people.length === 0
+      ? []
+      : [
+          sectionTitle(pickup ? 'Datos del cliente' : 'Entrega'),
+          ...people,
+          '',
+        ]),
     ...shippingLines(snapshot),
     '',
     MINIMAL_ORDER_SUMMARY_CLOSING,

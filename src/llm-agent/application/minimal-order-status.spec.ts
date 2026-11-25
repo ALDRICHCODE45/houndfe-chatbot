@@ -436,7 +436,7 @@ describe('order summary vs previous order (S5)', () => {
       },
     });
     const decision = await h.turn('ver mi pedido', [say('Inventado')]);
-    expect(reply(decision)).toContain('Su carrito:');
+    expect(reply(decision)).toContain('*Su carrito*');
     expect(reply(decision)).toContain('¿Desea agregar algo más');
     expect(
       interactiveOf(decision)?.buttons?.map((button) => button.id),
@@ -609,7 +609,7 @@ describe('paid placed sale (S6)', () => {
       },
     });
     const cart = await h.turn('ver mi pedido');
-    expect(reply(cart)).toContain('Su carrito:');
+    expect(reply(cart)).toContain('*Su carrito*');
     const question = await h.turn('¿cómo pago?', [say('Con gusto.')]);
     expect(reply(question)).not.toBe(PAID_REPLY);
   });
