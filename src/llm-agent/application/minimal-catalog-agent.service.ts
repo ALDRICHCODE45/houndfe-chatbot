@@ -59,6 +59,7 @@ import {
   type ForgetPetOutcome,
   type KnownPet,
 } from '../../customer-profile/application/customer-pets.service';
+import type { CartPet } from '../../sale-flow/domain/cart-state';
 import {
   chosenPetOptionPromptLine,
   foldPetName,
@@ -1194,6 +1195,23 @@ function customerTexts(turns: readonly MinimalCatalogTurn[]): string[] {
 
 // Minimal SDK route: in-memory catalog history; optional durable cart and human
 // inquiry capabilities. No checkout, payment or inventory reservations.
+/**
+ * T5a R1: the cart pet of a known BACKEND pet with a name (`ref`
+ * `backend:<uuid>`); local and legacy pets never go on a cart line.
+ */
+function backendCartPet(
+  known: readonly KnownPet[],
+  ref: string,
+): CartPet | undefined {
+  const pet = known.find(
+    (candidate) => candidate.ref === ref && candidate.source === 'backend',
+  );
+  const name = pet?.name?.trim();
+  return pet === undefined || !ref.startsWith('backend:') || !name
+    ? undefined
+    : { id: ref.slice('backend:'.length), name };
+}
+
 @Injectable()
 export class MinimalCatalogAgentService {
   private readonly model: string;
@@ -2876,6 +2894,8 @@ export class MinimalCatalogAgentService {
     const priorShipping = this.shippingAvailable()
       ? await cart.shippingMode(senderId)
       : null;
+    // T5a: a past order may hold lines for several pets; its lines are
+    // added without a pet (the per-pet reorder, T5b, tags its own lines).
     const result = await cart.addItems(senderId, offer.items);
     const code = result.ok
       ? 'none'
@@ -4288,6 +4308,7 @@ export class MinimalCatalogAgentService {
     }
     const line = this.chosenPetLine(senderId, option);
     if (line === null) return reply(STALE_BUTTON_FALLBACK);
+    await this.chooseCartPet(senderId, option.ref);
     return this.continuePetChoice(input, live.request, line);
   }
 
@@ -4338,6 +4359,7 @@ export class MinimalCatalogAgentService {
       return this.answerPetPurpose(input, live, option);
     const line = this.chosenPetLine(input.senderId, option);
     if (line === null) return null;
+    await this.chooseCartPet(input.senderId, option.ref);
     return this.continuePetChoice(input, live.request, line);
   }
 
@@ -4545,6 +4567,59 @@ export class MinimalCatalogAgentService {
       case 'failed':
         return answered(PET_CHOICE_UNAVAILABLE_REPLY, false);
     }
+  }
+
+  /**
+   * T5a R2 (S17): the which-pet answer replaces the cart's current pet: the
+   * chosen backend pet, else none (a local or legacy pet, or a pet that is no
+   * longer known). With this turn's pets not loaded only a repeat of the
+   * pet already chosen keeps it. Best effort: a failed write is logged and
+   * the request continues (its lines then simply carry no chosen pet).
+   */
+  private async chooseCartPet(senderId: string, ref: string): Promise<void> {
+    const cart = this.cart;
+    if (cart === undefined) return;
+    try {
+      let pet: CartPet | null;
+      if (this.petListLoaded(senderId))
+        pet = backendCartPet(this.pets?.knownPets(senderId) ?? [], ref) ?? null;
+      else {
+        const current = await cart.currentPet(senderId);
+        if (current !== null && ref === `backend:${current.id}`) return;
+        pet = null;
+      }
+      if (!(await cart.setCurrentPet(senderId, pet)))
+        this.logger.warn('cart current pet not recorded');
+    } catch (error) {
+      this.logger.warn(
+        `cart current pet not recorded: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+    }
+  }
+
+  /**
+   * T5a R2 (S17): the backend pet the cart lines written now are for: the
+   * pet the customer chose (kept on the cart) while still known, else the
+   * only known pet when it is a backend pet. `undefined` when this turn's
+   * pets are not loaded, for prospects (local pets) and the legacy pet.
+   * Never from model input.
+   */
+  private async cartPet(senderId: string): Promise<CartPet | undefined> {
+    const { cart, pets } = this;
+    if (
+      cart === undefined ||
+      pets === undefined ||
+      !this.petListLoaded(senderId)
+    )
+      return undefined;
+    const known = pets.knownPets(senderId);
+    const chosen = await cart.currentPet(senderId);
+    return (
+      (chosen === null
+        ? undefined
+        : backendCartPet(known, `backend:${chosen.id}`)) ??
+      (known.length === 1 ? backendCartPet(known, known[0].ref) : undefined)
+    );
   }
 
   /** T4c-2b: a pet store write waited at most PET_PREPARE_BUDGET_MS; past
@@ -5947,6 +6022,7 @@ export class MinimalCatalogAgentService {
           },
           allowedIds,
           traceInvalidVariant('adjustCartItem'),
+          await this.cartPet(context.senderId),
         );
         traceCartResult('adjustCartItem', result);
         cartReply.value =
@@ -5968,6 +6044,7 @@ export class MinimalCatalogAgentService {
         },
         allowedIds,
         traceInvalidVariant('setCartItem'),
+        await this.cartPet(context.senderId),
       );
       traceCartResult('setCartItem', result);
       cartReply.value = minimalCartReply(result);
