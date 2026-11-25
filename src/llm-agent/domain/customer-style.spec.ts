@@ -350,6 +350,33 @@ describe('applyCustomerStyle', () => {
     ).toBe('Su carrito está vacío.');
   });
 
+  it('[message-formatting S3] keeps a helper title emoji for every customer, outside the body emoji quota', () => {
+    const text = '*Resumen de su pedido* 🧾\n\n¡Listo! 😊 Gracias 🐶';
+    expect(applyCustomerStyle(text, style())).toBe(
+      '*Resumen de su pedido* 🧾\n\n¡Listo! Gracias',
+    );
+    expect(applyCustomerStyle(text, style({ emojis: true }))).toBe(
+      '*Resumen de su pedido* 🧾\n\n¡Listo! 😊 Gracias',
+    );
+    expect(applyCustomerStyle(text, style({ register: 'tu' }))).toBe(
+      '*Resumen de tu pedido* 🧾\n\n¡Listo! Gracias',
+    );
+    for (const title of ['*Envío* 🚚', '*Pedido creado* ✅'])
+      expect(applyCustomerStyle(title, style())).toBe(title);
+    // Only the S3 title emojis in title position are kept.
+    expect(applyCustomerStyle('*Hola* 😊', style())).toBe('*Hola*');
+    expect(applyCustomerStyle('Listo 🧾', style())).toBe('Listo');
+    expect(applyCustomerStyle('*Ya* 🧾 casi', style())).toBe('*Ya* casi');
+  });
+
+  it('[message-formatting S2] removing an emoji keeps the 3-space indentation of item detail lines', () => {
+    const text =
+      '😊 Su carrito:\n• Collar — Mediana\n   1 × $1.00 = *$1.00* 🐶\n   _Descuento: ahorra $0.10_';
+    expect(applyCustomerStyle(text, style())).toBe(
+      'Su carrito:\n• Collar — Mediana\n   1 × $1.00 = *$1.00*\n   _Descuento: ahorra $0.10_',
+    );
+  });
+
   it('keeps the refusal literal byte-identical in every style', () => {
     const refusal = 'esa función aún no está disponible';
     for (const register of ['usted', 'tu'] as const) {
