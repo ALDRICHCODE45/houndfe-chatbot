@@ -213,7 +213,7 @@ describe('SYSTEM_PROMPT', () => {
       for (const rule of [
         'párrafos cortos',
         'Un solo producto: un párrafo breve y natural, sin lista',
-        'Varios productos: uno por línea, «• *Nombre* — $1,250.00»',
+        'Varios productos: uno por línea, «• *Nombre*: $1,250.00»',
         'tres espacios de sangría',
         'Negritas con un solo asterisco (*así*), solo para nombres de producto y precios',
         'Importes como «$1,250.00»: separador de miles, dos decimales y sin «MXN»',
@@ -233,10 +233,17 @@ describe('SYSTEM_PROMPT', () => {
       );
     });
 
-    it('forbids imitating the server-owned summaries, bank details and order-created message', () => {
+    it('forbids imitating the server-owned summaries and the order-created message', () => {
       expect(WHATSAPP_FORMAT_GUIDANCE).toContain(
-        'Nunca imites el resumen del pedido, la confirmación de datos de entrega, los datos bancarios ni el mensaje de pedido creado: los envía la aplicación',
+        'Nunca imites el resumen del pedido, la confirmación de datos de entrega ni el mensaje de pedido creado: los envía la aplicación',
       );
+    });
+
+    it('bank details: never from memory, repeated exactly when a tool returns them (sale-flow step 12 relays them)', () => {
+      expect(WHATSAPP_FORMAT_GUIDANCE).toContain(
+        'Datos bancarios: nunca los escribas de memoria; si una herramienta te los devuelve, repítelos exactamente como vienen.',
+      );
+      expect(WHATSAPP_FORMAT_GUIDANCE).not.toContain('los datos bancarios ni');
     });
 
     it('drops the optional-bullets rule that contradicted the one-per-line layout', () => {
