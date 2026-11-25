@@ -3113,3 +3113,161 @@ describe('CustomerPetsService (T4c-1)', () => {
     });
   });
 });
+
+describe('CustomerPetsService (T4c-2b)', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const otherBruno = (patch: Partial<BackendPet> = {}) =>
+    backend({
+      id: uuid(60),
+      breed: 'Labrador',
+      ageMonths: 30,
+      ageLabel: '~2 años',
+      ...patch,
+    });
+
+  describe('Q1 forgetPetByRef: the tapped pet of the forget question (S7, S11)', () => {
+    it('archives exactly the chosen backend pet with the reason; the other Bruno stays known', async () => {
+      const h = harness(found([backend(), otherBruno()]));
+      h.client.archivePet.mockResolvedValue({
+        kind: 'ok',
+        pet: otherBruno({ status: 'ARCHIVED', version: 4 }),
+        warnings: [],
+      });
+      await h.profiles.load(SENDER);
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.forgetPetByRef(SENDER, `backend:${uuid(60)}`, 'falleció'),
+      ).resolves.toBe('archived');
+      expect(h.client.archivePet.mock.calls).toEqual([
+        [CUSTOMER_ID, uuid(60), { version: 3, reason: 'falleció' }],
+      ]);
+      expect(h.service.knownPets(SENDER).map((pet) => pet.ref)).toEqual([
+        `backend:${backend().id}`,
+      ]);
+    });
+
+    it('removes exactly the chosen local entry of a prospect', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno es un pug');
+      await h.say('mi gata Bruno es siamés');
+      expect(await h.local()).toHaveLength(2);
+      await expect(
+        h.service.forgetPetByRef(SENDER, `local:${uuid(2)}`),
+      ).resolves.toBe('removed');
+      await expect(h.local()).resolves.toMatchObject([
+        { id: uuid(1), name: 'Bruno', species: 'perro' },
+      ]);
+    });
+
+    it('a ref that is not a current pet → none, nothing archived or removed', async () => {
+      const h = harness(found([backend(), otherBruno()]));
+      await h.service.prepare(SENDER);
+      for (const ref of [`backend:${uuid(99)}`, `local:${uuid(7)}`, 'junk'])
+        await expect(h.service.forgetPetByRef(SENDER, ref)).resolves.toBe(
+          'none',
+        );
+      expect(h.client.archivePet).not.toHaveBeenCalled();
+    });
+
+    it('a read-only scope (customer without pets) → unavailable, nothing archived', async () => {
+      const h = harness(found());
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.forgetPetByRef(SENDER, `backend:${backend().id}`),
+      ).resolves.toBe('unavailable');
+      expect(h.client.archivePet).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Q2 separateAmbiguous: «Es otra mascota» for a blocked entry (S3)', () => {
+    const blockedBruno = async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno es un pug');
+      h.setLookup(found([backend(), otherBruno()]));
+      await h.service.afterCheckout(SENDER);
+      expect(h.service.ambiguousEntries(SENDER)).toHaveLength(1);
+      return h;
+    };
+
+    it('the entry is unblocked and uploaded as a new pet (never merged into a twin), then removed locally', async () => {
+      const h = await blockedBruno();
+      await expect(h.service.separateAmbiguous(SENDER, uuid(1))).resolves.toBe(
+        'separated',
+      );
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      expect(h.client.createPet.mock.calls).toEqual([
+        [
+          CUSTOMER_ID,
+          { name: 'Bruno', species: 'DOG', breed: 'pug', size: 'SMALL' },
+          `pet-local:${CUSTOMER_ID}:${uuid(1)}`,
+        ],
+      ]);
+      await expect(h.local()).resolves.toEqual([]);
+      expect(h.service.ambiguousEntries(SENDER)).toEqual([]);
+      expect(h.service.knownPets(SENDER)).toHaveLength(3);
+    });
+
+    it('a failed create keeps the entry separate (not blocked again) for the next prepare', async () => {
+      const h = await blockedBruno();
+      h.client.createPet.mockRejectedValueOnce(new TypeError('down'));
+      await expect(h.service.separateAmbiguous(SENDER, uuid(1))).resolves.toBe(
+        'separated',
+      );
+      await expect(h.local()).resolves.toMatchObject([
+        { id: uuid(1), separate: true },
+      ]);
+      expect((await h.local())[0].blocked).toBeUndefined();
+      expect(h.service.ambiguousEntries(SENDER)).toEqual([]);
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.createPet).toHaveBeenCalledTimes(2);
+      await expect(h.local()).resolves.toEqual([]);
+    });
+
+    it('an unknown or not blocked entry → not_found, nothing written', async () => {
+      const h = await blockedBruno();
+      await expect(h.service.separateAmbiguous(SENDER, uuid(7))).resolves.toBe(
+        'not_found',
+      );
+      expect(h.client.createPet).not.toHaveBeenCalled();
+      expect(await h.local()).toMatchObject([{ blocked: 'ambiguous' }]);
+    });
+  });
+
+  describe('Q3 captureForRef: a diminutive confirmed as a known pet (S10)', () => {
+    it('the facts PATCH that pet by ref (its name is never changed)', async () => {
+      const h = harness(found([backend(), otherBruno()]));
+      h.client.patchPet.mockResolvedValue({
+        kind: 'ok',
+        pet: otherBruno({ allergies: 'pollo', version: 4 }),
+        warnings: [],
+      });
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.captureForRef(SENDER, `backend:${uuid(60)}`, {
+          allergies: 'pollo',
+        }),
+      ).resolves.toBe('applied');
+      expect(h.client.patchPet.mock.calls).toEqual([
+        [CUSTOMER_ID, uuid(60), { version: 3, allergies: 'pollo' }],
+      ]);
+    });
+
+    it('a ref that is not a current pet → none, nothing written', async () => {
+      const h = harness(found([backend()]));
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.captureForRef(SENDER, `backend:${uuid(60)}`, {
+          allergies: 'pollo',
+        }),
+      ).resolves.toBe('none');
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      expect(h.client.createPet).not.toHaveBeenCalled();
+    });
+  });
+});

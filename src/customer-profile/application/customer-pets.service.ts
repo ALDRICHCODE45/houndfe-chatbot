@@ -128,6 +128,16 @@ export type ResolveAmbiguousOutcome =
   | 'failed'
   | 'unavailable';
 
+/** T4c-2b Q2: what `separateAmbiguous` did. */
+export type SeparateAmbiguousOutcome =
+  | 'separated'
+  | 'not_found'
+  | 'failed'
+  | 'unavailable';
+
+/** T4c-2b Q3: what `captureForRef` did. `none`: not a current known pet. */
+export type CaptureForRefOutcome = 'applied' | 'none' | 'unavailable';
+
 /** Upload key of a local pet (contract §4.1: 1–200 chars, per sucursal). */
 export const localPetUploadKey = (customerId: string, localId: string) =>
   `pet-local:${customerId}:${localId}`;
@@ -494,6 +504,154 @@ export class CustomerPetsService {
     return outcome;
   }
 
+  /**
+   * T4c-2b Q1 (S7, S11): the pet the customer tapped in the forget question
+   * (2+ pets with that name) is forgotten by its ref, with the same switch
+   * as `forgetPet` (backend archived with the reason, local entry removed,
+   * legacy pet cleared). A ref that is not a current known pet is `none`
+   * (nothing written); pets unknown this turn is `unavailable` (never a
+   * guess). Serialized and fenced; never throws.
+   */
+  async forgetPetByRef(
+    senderId: string,
+    ref: string,
+    reason?: string,
+  ): Promise<ForgetPetOutcome> {
+    if (this.profiles.isForgotten(senderId)) return 'unavailable';
+    let outcome: ForgetPetOutcome = 'unavailable';
+    await this.serialized(senderId, async (fence) => {
+      try {
+        const state = await this.writableState(senderId, fence);
+        if (state === null) return;
+        const target = this.currentRef(senderId, state, ref);
+        outcome =
+          target === null
+            ? 'none'
+            : await this.forgetRef(senderId, state, target, reason, fence);
+      } catch (error) {
+        this.warn('forget pet', error);
+        outcome = 'failed';
+      }
+    });
+    return outcome;
+  }
+
+  /**
+   * T4c-2b Q2 (S3): «Es otra mascota» for a local entry blocked as
+   * ambiguous: it is unblocked and marked separate, so it uploads as a new
+   * pet (never merged into a twin, never blocked again). A failed create
+   * keeps it separate for the next prepare (backoff as usual).
+   */
+  async separateAmbiguous(
+    senderId: string,
+    localId: string,
+  ): Promise<SeparateAmbiguousOutcome> {
+    if (this.profiles.isForgotten(senderId)) return 'unavailable';
+    let outcome: SeparateAmbiguousOutcome = 'unavailable';
+    await this.serialized(senderId, async (fence) => {
+      try {
+        const state = await this.writableState(senderId, fence);
+        if (state === null || state.scope.kind !== 'customer') return;
+        let found = false;
+        const wrote = await this.writeLocal(senderId, fence, (current) => {
+          found = current.some(
+            (entry) => entry.id === localId && entry.blocked === 'ambiguous',
+          );
+          if (!found) return null;
+          return current.map((entry) => {
+            if (entry.id !== localId) return entry;
+            const next: LocalPet = { ...entry, separate: true };
+            delete next.blocked;
+            return next;
+          });
+        });
+        if (!found) {
+          outcome = 'not_found';
+          return;
+        }
+        if (!wrote) {
+          outcome = 'failed';
+          return;
+        }
+        outcome = 'separated';
+        await this.upload(senderId, localId, fence);
+      } catch (error) {
+        this.warn('separate ambiguous', error);
+        outcome = 'failed';
+      }
+    });
+    return outcome;
+  }
+
+  /**
+   * T4c-2b Q3 (S10): the customer confirmed that a diminutive names this
+   * known pet: the statement's facts go to the pet `ref` (backend PATCH,
+   * local merge, legacy merge), never by name. A ref that is not a current
+   * known pet is `none`.
+   */
+  async captureForRef(
+    senderId: string,
+    ref: string,
+    facts: PetFacts,
+    legacy?: CustomerPet,
+  ): Promise<CaptureForRefOutcome> {
+    if (this.profiles.isForgotten(senderId)) return 'unavailable';
+    let outcome: CaptureForRefOutcome = 'unavailable';
+    await this.serialized(senderId, async (fence) => {
+      try {
+        const state = await this.writableState(senderId, fence);
+        if (state === null) return;
+        const target = this.currentRef(senderId, state, ref, legacy);
+        if (target === null) {
+          outcome = 'none';
+          return;
+        }
+        outcome = 'applied';
+        if (hasPetFacts(facts))
+          await this.applyTo(senderId, state, target, facts, fence);
+      } catch (error) {
+        this.warn('capture', error);
+      }
+    });
+    return outcome;
+  }
+
+  /** The sender's pets when writes may go to them (a Customer with `pets`
+   *  or a prospect, local list known); `null` otherwise. */
+  private async writableState(
+    senderId: string,
+    fence: Fence,
+  ): Promise<SenderPets | null> {
+    if (this.profiles.isForgotten(senderId)) return null;
+    if (!this.cache.has(senderId)) await this.load(senderId, false, fence);
+    const state = this.cache.get(senderId);
+    if (
+      state === undefined ||
+      state.scope.kind === 'unavailable' ||
+      state.scope.kind === 'customer_pets_unknown' ||
+      !state.localKnown
+    )
+      return null;
+    return state;
+  }
+
+  /** T4c-2b: `ref` when it is one of the sender's current match candidates
+   *  (same pets as `forgetPet` matches by name), else `null`. */
+  private currentRef(
+    senderId: string,
+    state: SenderPets,
+    ref: string,
+    legacy: CustomerPet | undefined = this.profiles.cached(senderId)?.pet,
+  ): Ref | null {
+    const parsed = parseRef(ref);
+    if (parsed === null) return null;
+    return (
+      this.candidates(state, legacy)
+        .map((candidate) => candidate.ref)
+        .find((candidate) => sameRef(candidate, parsed)) ?? null
+    );
+  }
+
   private isFresh(senderId: string): boolean {
     const state = this.cache.get(senderId);
     return (
@@ -815,6 +973,8 @@ export class CustomerPetsService {
       state.scope.pets.map((pet) => twinKey(pet.name, pet.species)),
     );
     return local.filter((pet) => {
+      // T4c-2b Q2: the customer said it is another pet than its twins.
+      if (pet.separate === true) return true;
       const body = localCreateBody(pet);
       return (
         body === null || !backendKeys.has(twinKey(body.name, body.species))
@@ -945,9 +1105,13 @@ export class CustomerPetsService {
     // The Customer already has a pet with this name (staff created it, or an
     // earlier uncertain create did): merge by PATCH, never a duplicate.
     const key = twinKey(current.name, current.species);
-    const same = scope.pets.filter(
-      (candidate) => twinKey(candidate.name, candidate.species) === key,
-    );
+    // T4c-2b Q2: a separate entry is another pet: no twin merge, no block.
+    const same =
+      pet.separate === true
+        ? []
+        : scope.pets.filter(
+            (candidate) => twinKey(candidate.name, candidate.species) === key,
+          );
     if (same.length > 1) {
       // C2: several ACTIVE backend pets have this name and species: no new
       // pet, no guess which one to patch; kept blocked for T4c's buttons.
@@ -1017,11 +1181,16 @@ export class CustomerPetsService {
     // archived at or after this entry was written is the pet the customer
     // asked to forget (its twin removal did not land): removed, never
     // created. Unknown (list failed) → no create this round, backed off.
-    const archived = await this.archivedTwin(
-      scope.customerId,
-      new Set([key, twinKey(body.name, body.species)]),
-      pet.createdAt,
-    );
+    // T4c-2b Q2: a separate entry is never a twin of an archived pet (twin
+    // removals skip it), so the check does not apply.
+    const archived =
+      pet.separate === true
+        ? ('clear' as const)
+        : await this.archivedTwin(
+            scope.customerId,
+            new Set([key, twinKey(body.name, body.species)]),
+            pet.createdAt,
+          );
     if (typeof archived === 'object') {
       await this.attemptFailed(
         senderId,
@@ -1312,7 +1481,18 @@ export class CustomerPetsService {
     );
     if (matches.length === 0) return 'none';
     if (matches.length > 1) return 'ambiguous';
-    const ref = matches[0].ref;
+    return this.forgetRef(senderId, state, matches[0].ref, reason, fence);
+  }
+
+  /** G2 / T4c-2b Q1: forgets one known pet by ref (backend archived with
+   *  the reason, local entry removed, legacy pet cleared). */
+  private async forgetRef(
+    senderId: string,
+    state: SenderPets,
+    ref: Ref,
+    reason: string | undefined,
+    fence: Fence,
+  ): Promise<ForgetPetOutcome> {
     switch (ref.kind) {
       case 'legacy':
         return (await this.profiles.clearPet(senderId)) ? 'cleared' : 'failed';
@@ -1437,7 +1617,8 @@ export class CustomerPetsService {
     const wrote = await this.writeLocal(senderId, fence, (current) => {
       checked = true;
       const next = current.filter((entry) => {
-        if (entry.blocked === 'ambiguous') return true;
+        if (entry.blocked === 'ambiguous' || entry.separate === true)
+          return true;
         const body = localCreateBody(entry);
         return body === null || twinKey(body.name, body.species) !== key;
       });
@@ -1751,6 +1932,21 @@ function backendSpecies(
  *  `backendSpecies` on both sides (OTHER is never a cat). */
 function twinKey(name: string, species: BackendPet['species']): string {
   return `${foldPetName(name)}|${backendSpecies({ species })}`;
+}
+
+/** T4c-2b: a `KnownPet` ref (`backend:<id>`, `local:<id>`, `legacy`). */
+function parseRef(ref: string): Ref | null {
+  if (ref === 'legacy') return { kind: 'legacy' };
+  const match = /^(backend|local):(.{1,64})$/.exec(ref);
+  if (match === null) return null;
+  return { kind: match[1] as 'backend' | 'local', id: match[2] };
+}
+
+function sameRef(a: Ref, b: Ref): boolean {
+  return (
+    a.kind === b.kind &&
+    (a.kind === 'legacy' || a.id === (b as { id: string }).id)
+  );
 }
 
 /** G4: the T4c-2 view of one known pet (only the members it has). */
