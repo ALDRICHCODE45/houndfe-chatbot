@@ -11,6 +11,7 @@ import {
   mergeFactsIntoLocal,
   normalizeLocalPets,
   petAgeLabel,
+  petNameDiminutiveOf,
   type LocalPet,
 } from './customer-pets';
 
@@ -437,5 +438,34 @@ describe('local entry states (T4b-fix-2-C C2, C6)', () => {
       JSON.stringify(Array.from({ length: 20 }, () => full)),
     );
     expect(bytes).toBeLessThanOrEqual(32768);
+  });
+});
+
+describe('petNameDiminutiveOf (T4c-2b Q3, S10)', () => {
+  it.each([
+    ['Brunito', ['Bruno'], 'Bruno'],
+    ['BRUNÍTO', ['bruno'], 'bruno'],
+    ['Brunillo', ['Max', 'Bruno'], 'Bruno'],
+    ['Lunita', ['Luna'], 'Luna'],
+    ['Maxito', ['Max'], 'Max'],
+    ['Michito', ['Michi'], 'Michi'],
+    ['Pepito', ['Pepe'], 'Pepe'],
+    ['Leoncito', ['León'], 'León'],
+    ['Paquito', ['Paco'], 'Paco'],
+    ['Manchita', ['Mancha'], 'Mancha'],
+    ['Canelilla', ['Canela'], 'Canela'],
+  ])('%s is a diminutive of %j → %s', (name, bases, base) => {
+    expect(petNameDiminutiveOf(name, bases)).toBe(base);
+  });
+
+  it.each([
+    ['Bruno', ['Bruno']],
+    ['Brunito', ['Max']],
+    ['Rita', ['R']],
+    ['Benito', ['Bruno']],
+    ['Brunito', []],
+    ['Mi Brunito', ['Bruno']],
+  ])('%s is not a diminutive of %j', (name, bases) => {
+    expect(petNameDiminutiveOf(name, bases)).toBeNull();
   });
 });

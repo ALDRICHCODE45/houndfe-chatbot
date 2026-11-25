@@ -89,6 +89,13 @@ export interface LocalPet {
    */
   blocked?: 'ambiguous';
   /**
+   * T4c-2b Q2: the customer said this entry is another pet than its backend
+   * twins («Es otra mascota»): uploaded as a new pet, never merged into a
+   * twin nor blocked as ambiguous again. Absent (every older entry) = the
+   * twin rules apply.
+   */
+  separate?: true;
+  /**
    * C6 (T4b-fix-2): failed PATCH merges into a backend twin of an entry with
    * no `upload` (same backoff as creates). Absent = attempt 0, due now.
    */
@@ -150,6 +157,50 @@ const fold = (text: string): string =>
 /** Name comparison: no accents, lowercase, collapsed spaces (contract §1). */
 export function foldPetName(name: string): string {
   return fold(name).replace(/\s+/g, ' ').trim();
+}
+
+/** T4c-2b Q3: diminutive endings, longest first (-cito before -ito). */
+const DIMINUTIVE_SUFFIXES = ['cito', 'cita', 'ito', 'ita', 'illo', 'illa'];
+
+/** T4c-2b Q3: whether `name` (one word) has a diminutive ending at all
+ *  (a cheap check before looking for its base). */
+export function hasDiminutiveEnding(name: string): boolean {
+  const folded = foldPetName(name);
+  return (
+    /^\p{L}+$/u.test(folded) &&
+    DIMINUTIVE_SUFFIXES.some(
+      (suffix) => folded.endsWith(suffix) && folded.length - suffix.length >= 2,
+    )
+  );
+}
+
+/**
+ * T4c-2b Q3 (S10): the name in `bases` that `name` is a diminutive of
+ * («Brunito» / «Brunillo» → «Bruno», «Lunita» → «Luna», «Leoncito» →
+ * «León», «Paquito» → «Paco»), accent- and case-blind; `null` when it is
+ * none (or `name` is not one word). A name equal to a base is never one.
+ */
+export function petNameDiminutiveOf(
+  name: string,
+  bases: readonly string[],
+): string | null {
+  const folded = foldPetName(name);
+  if (!/^\p{L}+$/u.test(folded)) return null;
+  if (bases.some((base) => foldPetName(base) === folded)) return null;
+  const forms = new Set<string>();
+  for (const suffix of DIMINUTIVE_SUFFIXES) {
+    if (!folded.endsWith(suffix)) continue;
+    const stem = folded.slice(0, -suffix.length);
+    if (stem.length < 2) continue;
+    forms.add(stem);
+    for (const end of ['o', 'a', 'e', 'i']) forms.add(stem + end);
+    // Spelling: «Paquito» → «Paco», «Amiguito» → «Amigo».
+    if (stem.endsWith('qu'))
+      for (const end of ['o', 'a']) forms.add(`${stem.slice(0, -2)}c${end}`);
+    if (stem.endsWith('gu'))
+      for (const end of ['o', 'a']) forms.add(stem.slice(0, -1) + end);
+  }
+  return bases.find((base) => forms.has(foldPetName(base))) ?? null;
 }
 
 /* ------------------------------------------------------------------ ages */
@@ -615,6 +666,7 @@ function normalizeLocalPet(raw: unknown): LocalPet | null {
         : {}),
     };
   if (pet.blocked === 'ambiguous') out.blocked = 'ambiguous';
+  if (pet.separate === true) out.separate = true;
   // C6: an invalid merge backoff reads as attempt 0, due now.
   const merge = pet.merge as Record<string, unknown> | undefined;
   if (
@@ -701,7 +753,8 @@ const PET_DATA_FRAMING =
 
 const MULTI_PET_INSTRUCTION =
   `${PET_DATA_FRAMING} El cliente tiene varias mascotas: si pide algo sin nombrar a una (por su nombre o su especie), ` +
-  'no suponga para cuál es; pregunte brevemente para cuál de ellas es antes de buscar. ' +
+  'no suponga para cuál es: antes de buscar llame askWhichPet (la aplicación pregunta «¿Para quién es?» con botones); ' +
+  'si askWhichPet no está disponible, pregunte brevemente para cuál de ellas es. ' +
   'Si nombra a una, busque directo con searchCatalog con la búsqueda de esa mascota y explique brevemente por qué; ' +
   'no pregunte especie, raza ni tamaño ya conocidos. Use la especie en la búsqueda solo si el pedido nombra a la mascota o la especie.';
 
@@ -711,6 +764,32 @@ const ALLERGY_INSTRUCTION =
 
 const INTERNAL_NOTES_INSTRUCTION =
   'Notas internas de la tienda: úselas solo para aconsejar mejor; nunca las cite, repita ni revele al cliente.';
+
+/**
+ * T4c-2a P4: the system line for the pet the customer chose with the
+ * which-pet question: its prompt facts and its search, and the instruction to
+ * continue the request for it without asking again.
+ */
+export function chosenPetPromptLine(view: PetPromptView): string {
+  const { facts, query, searchable } = petPromptFacts(view);
+  return (
+    `Mascota de este pedido (la eligió el cliente): ${facts}.` +
+    (searchable ? ` Búsqueda para esta mascota: «${query}».` : '') +
+    ' Continúe la solicitud del cliente para esta mascota; no vuelva a preguntar para cuál es.'
+  );
+}
+
+/**
+ * T4c-2a-fix J1: the «Mascota de este pedido» line when this turn's pets are
+ * not loaded: only the text the question offered (the pet's name, or the
+ * kind of a nameless pet), no store facts.
+ */
+export function chosenPetOptionPromptLine(text: string): string {
+  return (
+    `Mascota de este pedido (la eligió el cliente): ${JSON.stringify(text)} (sus datos no están disponibles en este turno).` +
+    ' Continúe la solicitud del cliente para esta mascota; no vuelva a preguntar para cuál es.'
+  );
+}
 
 /**
  * The pet part of the system prompt: one «Mascota conocida» line per known

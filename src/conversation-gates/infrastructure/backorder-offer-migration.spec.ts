@@ -29,7 +29,11 @@ describe('conversation gate backorder kinds migration (5500)', () => {
     );
   });
 
-  it('up re-creates the kind CHECK with exactly the code list', () => {
+  it('up re-creates the kind CHECK with exactly the kinds known at 5500', () => {
+    // 5800 widens the code list with pet_choice (own spec).
+    const known = CONVERSATION_GATE_KINDS.filter(
+      (kind) => kind !== 'pet_choice',
+    );
     const [drop, add] = run('up');
     expect(drop).toEqual([
       'drop',
@@ -37,9 +41,8 @@ describe('conversation gate backorder kinds migration (5500)', () => {
       'conversation_gates_gate_kind_check',
     ]);
     const check = String(add[3]);
-    for (const kind of CONVERSATION_GATE_KINDS)
-      expect(check).toContain(`'${kind}'`);
-    expect(check.match(/'/g)).toHaveLength(CONVERSATION_GATE_KINDS.length * 2);
+    for (const kind of known) expect(check).toContain(`'${kind}'`);
+    expect(check.match(/'/g)).toHaveLength(known.length * 2);
   });
 
   it('down refuses while an unexpired backorder row exists, then restores the 5400 CHECK', () => {

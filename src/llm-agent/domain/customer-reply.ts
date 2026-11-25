@@ -40,12 +40,17 @@ export type CustomerReplyInteractive =
       type: 'buttons';
       buttons: readonly CustomerReplyButton[];
       prompt?: string;
+      /** T4c-2a-fix J3: the plain text sent instead when the interactive
+       *  message cannot be (absent: the reply text itself). */
+      textFallback?: string;
     }
   | {
       type: 'list';
       buttonText: string;
       rows: readonly CustomerReplyListRow[];
       prompt?: string;
+      /** T4c-2a-fix J3: see the buttons variant. */
+      textFallback?: string;
     };
 
 export interface CustomerReply {
@@ -88,6 +93,12 @@ const BACKORDER_RESCHEDULE = 'backorder_reschedule';
 const BACKORDER_RESCHEDULE_DECLINE = 'backorder_reschedule_decline';
 // Restock backorder S7: «Seguir esperando» under the ETA notices.
 const BACKORDER_WAIT = 'backorder_wait';
+// T4c-2a: the which-pet question; the tail is the pet ref.
+const PET_PICK = 'pet_pick';
+/** `backend:<id>`, `local:<id>`, `legacy`, `other` («Otra mascota» / «Es
+ *  otra mascota») or `forgotten` (T4c-2b: a just-forgotten pet). */
+const PET_PICK_REF =
+  /^(?:legacy|other|forgotten|(?:backend|local):[A-Za-z0-9-]{1,64})$/;
 const BACKORDER_REFERENCE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -166,7 +177,13 @@ export type InteractiveReplyIntent =
    * (eta_updated / eta_unavailable); the reference is the BACKORDER id,
    * re-verified against the customer's own active backorders.
    */
-  | { kind: 'backorder_wait'; reference: string };
+  | { kind: 'backorder_wait'; reference: string }
+  /**
+   * T4c-2a: a pet of the which-pet question (`backend:<id>`, `local:<id>`,
+   * `legacy`), `other` («Otra mascota») or, T4c-2b, `forgotten`; re-checked
+   * against the live question and the customer's current pets.
+   */
+  | { kind: 'pet_pick'; ref: string };
 
 /** Parse a reply id the bot issued; anything else (unknown, forged) is `null`. */
 export function parseInteractiveReplyId(
@@ -250,6 +267,10 @@ export function parseInteractiveReplyId(
         ? null
         : { kind: 'payment_method', method, reference: tail.slice(split + 1) };
     }
+    case PET_PICK:
+      return tail !== null && PET_PICK_REF.test(tail)
+        ? { kind: 'pet_pick', ref: tail }
+        : null;
     case PICK_VARIANT:
     case PICK_PRODUCT:
       return tail === null
@@ -446,6 +467,286 @@ export function backorderCancelPick(
     })),
     prompt,
   };
+}
+
+/** T4c-2a: the pet ref of the «Otra mascota» row (S12). */
+export const PET_CHOICE_OTHER_REF = 'other';
+export const PET_CHOICE_OTHER_TEXT = 'Otra mascota';
+/** T4c-2b Q2/Q3: the «it is another pet» answer (ref `other`). */
+export const PET_CHOICE_SEPARATE_TEXT = 'Es otra mascota';
+/** T4c-2b Q3: the ref of a just-forgotten pet a diminutive may name. */
+export const PET_CHOICE_FORGOTTEN_REF = 'forgotten';
+const PET_CHOICE_OTHER_DESCRIPTION = 'Escríbame su nombre';
+
+/** One known pet as the which-pet question shows it. */
+export type PetChoicePet = {
+  ref: string;
+  name?: string;
+  species?: string;
+  breed?: string;
+  ageLabel?: string;
+  stage?: string;
+};
+
+/** «labrador, adulto»: the breed (else the species) and the life stage
+ *  (else the age label). */
+function petChoiceDetail(pet: PetChoicePet): string {
+  return [pet.breed ?? pet.species, pet.stage ?? pet.ageLabel]
+    .filter((part): part is string => part !== undefined && part.trim() !== '')
+    .join(', ');
+}
+
+/** The pet's name, or its kind when it has none. */
+function petChoiceName(pet: PetChoicePet): string {
+  const name = pet.name?.trim() ?? '';
+  if (name !== '') return name;
+  const kind = (pet.breed ?? pet.species ?? '').trim();
+  return kind === '' ? 'Mascota' : kind[0].toUpperCase() + kind.slice(1);
+}
+
+/** «Max (labrador, adulto)»: the name and its detail, when it has one. */
+function petChoiceLabel(pet: PetChoicePet): string {
+  const detail = petChoiceDetail(pet);
+  const name = petChoiceName(pet);
+  return detail === '' ? name : `${name} (${detail})`;
+}
+
+/** Case- and accent-blind comparison key of a title. */
+const foldTitle = (text: string): string =>
+  text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+/**
+ * One offered answer as the `pet_choice` gate stores it: the pet ref and its
+ * display text (the name, or the kind of a nameless pet). `matchable: false`
+ * marks a nameless pet: its text is shown, never matched against a typed
+ * answer (absent = matchable, as in the rows written before the flag).
+ */
+export type PetChoiceOptionValue = {
+  ref: string;
+  text: string;
+  matchable?: false;
+};
+
+/** A pet the question can offer: a well-formed ref whose reply id fits. */
+const petChoiceUsable = (pet: PetChoicePet): boolean =>
+  PET_PICK_REF.test(pet.ref) &&
+  pet.ref !== PET_CHOICE_OTHER_REF &&
+  `${PET_PICK}:${pet.ref}`.length <= INTERACTIVE_LIMITS.id;
+
+/**
+ * T4c-2a-fix J4: the one builder of the which-pet options (the question and
+ * the «Otra mascota» follow-up): usable refs only, in the given order, at
+ * most `max`.
+ */
+export function petChoiceOptions(
+  pets: readonly PetChoicePet[],
+  max: number,
+): PetChoiceOptionValue[] {
+  return pets
+    .filter(petChoiceUsable)
+    .slice(0, Math.max(0, max))
+    .map((pet) => ({
+      ref: pet.ref,
+      text: petChoiceName(pet),
+      ...((pet.name?.trim() ?? '') === '' ? { matchable: false as const } : {}),
+    }));
+}
+
+/**
+ * T4c-2a-fix J2: the reply buttons, only when every title shows the whole
+ * name and no two titles read the same once fitted to Meta's 20 chars;
+ * `null` otherwise (the caller sends a list).
+ */
+function petChoiceButtons(
+  shown: readonly PetChoicePet[],
+): CustomerReplyButton[] | null {
+  if (shown.length < 2 || shown.length > INTERACTIVE_LIMITS.buttons)
+    return null;
+  return distinctButtons(shown.map(petChoiceButton));
+}
+
+/** J2: one pet's button, `null` when its title would cut the name. */
+function petChoiceButton(pet: PetChoicePet): CustomerReplyButton | null {
+  const label = petChoiceLabel(pet);
+  const title = fitInteractiveText(label, INTERACTIVE_LIMITS.buttonTitle);
+  const name = petChoiceName(pet);
+  const readable = title === label || title.startsWith(`${name} (`);
+  return readable ? { id: `${PET_PICK}:${pet.ref}`, title } : null;
+}
+
+/** J2: the buttons when every one is readable and no two titles read the
+ *  same; else `null`. */
+function distinctButtons(
+  buttons: ReadonlyArray<CustomerReplyButton | null>,
+): CustomerReplyButton[] | null {
+  if (buttons.some((button) => button === null)) return null;
+  const titles = new Set(buttons.map((button) => foldTitle(button!.title)));
+  return titles.size === buttons.length
+    ? (buttons as CustomerReplyButton[])
+    : null;
+}
+
+/**
+ * T4c-2a-fix J2: the list row titles: the name; pets whose fitted names read
+ * the same are told apart by their age («Max (~3 años)») when that makes
+ * every title distinct, else by a trailing number («Max 1», «Max 2»).
+ */
+function petChoiceRowTitles(shown: readonly PetChoicePet[]): string[] {
+  const max = INTERACTIVE_LIMITS.rowTitle;
+  const titles = shown.map((pet) =>
+    fitInteractiveText(petChoiceName(pet), max),
+  );
+  const groups = new Map<string, number[]>();
+  titles.forEach((title, index) => {
+    const key = foldTitle(title);
+    groups.set(key, [...(groups.get(key) ?? []), index]);
+  });
+  for (const members of groups.values()) {
+    if (members.length < 2) continue;
+    const byAge = members.map((index) => {
+      const age = (shown[index].ageLabel ?? shown[index].stage ?? '').trim();
+      return age === ''
+        ? null
+        : fitInteractiveText(`${petChoiceName(shown[index])} (${age})`, max);
+    });
+    const ageKeys = new Set(
+      byAge.map((t) => (t === null ? null : foldTitle(t))),
+    );
+    if (!byAge.includes(null) && ageKeys.size === members.length) {
+      members.forEach((index, k) => (titles[index] = byAge[k]!));
+      continue;
+    }
+    members.forEach((index, k) => {
+      const suffix = ` ${k + 1}`;
+      titles[index] =
+        fitInteractiveText(petChoiceName(shown[index]), max - suffix.length) +
+        suffix;
+    });
+  }
+  return titles;
+}
+
+/**
+ * T4c-2a-fix J3: the plain text sent when the buttons/list cannot be: the
+ * question and the offered pets, «¿Para Max (labrador, adulto) o para Bruno
+ * (chihuahua, cachorro)?» (3+: commas, then « o para » before the last).
+ */
+function petChoiceTextFallback(
+  shown: readonly PetChoicePet[],
+  prompt: string,
+): string {
+  const labels = shown.map(petChoiceLabel);
+  const last = labels.at(-1)!;
+  const head = labels.slice(0, -1).join(', ');
+  return `${prompt} ¿Para ${head} o para ${last}?`;
+}
+
+/**
+ * T4c-2a (S3, S12): «¿Para quién es?» with one answer per pet. Two or three
+ * pets are reply buttons «Max (labrador, adulto)» (cut to Meta's 20 chars)
+ * when every title is distinct and shows the whole name (J2); otherwise, and
+ * for four to ten pets, a list (name as title, told apart by age or a number
+ * when names repeat; breed and age as description); more than ten show the
+ * first nine given (the caller orders them by recency) and the row «Otra
+ * mascota», which asks to write the name. The interactive carries its own
+ * text fallback naming the pets (J3). `options` is what the gate stores.
+ * `null` below two usable pets.
+ *
+ * T4c-2b: `extra` adds a last answer that is not a pet («Es otra mascota»,
+ * ref `other`) in place of the overflow row (one usable pet is then
+ * enough); `textFallback` words the fallback from the pets' labels.
+ */
+export function petChoicePick(
+  pets: readonly PetChoicePet[],
+  prompt: string,
+  options: {
+    extra?: { ref: string; text: string };
+    textFallback?: (labels: readonly string[]) => string;
+  } = {},
+): {
+  interactive: CustomerReplyInteractive;
+  options: PetChoiceOptionValue[];
+} | null {
+  const { extra } = options;
+  const usable = pets.filter(petChoiceUsable);
+  if (usable.length < (extra === undefined ? 2 : 1)) return null;
+  const slots = INTERACTIVE_LIMITS.rows - (extra === undefined ? 0 : 1);
+  const more = extra === undefined && usable.length > slots;
+  const shown =
+    extra !== undefined
+      ? usable.slice(0, slots)
+      : more
+        ? usable.slice(0, INTERACTIVE_LIMITS.rows - 1)
+        : usable;
+  const values = petChoiceOptions(shown, shown.length);
+  const textFallback =
+    options.textFallback === undefined
+      ? petChoiceTextFallback(shown, prompt)
+      : options.textFallback(shown.map(petChoiceLabel));
+  const extraId = extra === undefined ? '' : `${PET_PICK}:${extra.ref}`;
+  const buttons =
+    extra === undefined
+      ? petChoiceButtons(shown)
+      : petChoiceButtonsWith(shown, extra.text, extraId);
+  if (extra !== undefined) values.push({ ref: extra.ref, text: extra.text });
+  if (buttons !== null)
+    return {
+      interactive: { type: 'buttons', buttons, prompt, textFallback },
+      options: values,
+    };
+  const titles = petChoiceRowTitles(shown);
+  const rows: CustomerReplyListRow[] = shown.map((pet, index) => {
+    const detail = fitInteractiveText(
+      petChoiceDetail(pet),
+      INTERACTIVE_LIMITS.rowDescription,
+    );
+    return {
+      id: `${PET_PICK}:${pet.ref}`,
+      title: titles[index],
+      ...(detail === '' ? {} : { description: detail }),
+    };
+  });
+  if (extra !== undefined)
+    rows.push({
+      id: extraId,
+      title: fitInteractiveText(extra.text, INTERACTIVE_LIMITS.rowTitle),
+    });
+  if (more) {
+    rows.push({
+      id: `${PET_PICK}:${PET_CHOICE_OTHER_REF}`,
+      title: PET_CHOICE_OTHER_TEXT,
+      description: PET_CHOICE_OTHER_DESCRIPTION,
+    });
+    values.push({ ref: PET_CHOICE_OTHER_REF, text: PET_CHOICE_OTHER_TEXT });
+  }
+  return {
+    interactive: {
+      type: 'list',
+      buttonText: 'Ver mascotas',
+      rows,
+      prompt,
+      textFallback,
+    },
+    options: values,
+  };
+}
+
+/**
+ * T4c-2b: the pets' buttons plus a last non-pet button (`text`), under the
+ * same J2 rule (whole names, distinct titles); one pet is enough.
+ */
+function petChoiceButtonsWith(
+  shown: readonly PetChoicePet[],
+  text: string,
+  id: string,
+): CustomerReplyButton[] | null {
+  if (shown.length + 1 > INTERACTIVE_LIMITS.buttons) return null;
+  const title = fitInteractiveText(text, INTERACTIVE_LIMITS.buttonTitle);
+  if (title !== text.trim()) return null;
+  return distinctButtons([...shown.map(petChoiceButton), { id, title }]);
 }
 
 /**

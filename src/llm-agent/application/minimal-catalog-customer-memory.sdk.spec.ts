@@ -67,12 +67,14 @@ const say = (text = 'Texto del modelo.') =>
 
 /** T4c-1: the exact pet-memory guidance every conversation with a profile
  *  store gets (pinned; changed deliberately from the T4b-fix A4 text;
- *  T4c-1-fix H5 adds the forgetPet `pending` sentence). */
+ *  T4c-1-fix H5 adds the forgetPet `pending` sentence; T4c-2a adds the
+ *  «Mascota de este pedido» sentence). */
 const PET_MEMORY_INSTRUCTIONS_T4C1 =
   'Memoria del cliente: si el cliente cuenta datos de su mascota (nombre, especie, raza, tamaño, edad, alergias), llame rememberPetDetails solo con lo que él dijo; nunca invente ni deduzca datos. ' +
   'Haga como máximo una sola pregunta sobre la mascota por conversación, y solo si ayuda a una recomendación. ' +
   'Si hay una sola línea "Mascota conocida", siga su indicación: busque directo con searchCatalog con esos datos y diga brevemente por qué ("para Luna, que es labrador adulta, te recomiendo…"); pregunte solo lo que realmente falte. ' +
   'Si hay varias, siga la indicación que las acompaña. ' +
+  'Si hay una línea "Mascota de este pedido", la solicitud es para esa mascota: búsquela directo con sus datos y no pregunte para cuál es. ' +
   'Si el cliente dice que una mascota ya no está (murió, se perdió, la regaló) o pide olvidarla, llame forgetPet con su nombre y el motivo que él dio; responda con tacto y calidez, en pocas palabras, sin ofrecer productos para esa mascota. ' +
   'Si forgetPet responde ok false, no se guardó nada: dígalo con amabilidad y pregunte de cuál mascota se trata. ' +
   'Si forgetPet responde pending true, todavía se está guardando: no diga que ya la olvidó; responda con tacto sin confirmarlo.';

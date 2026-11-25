@@ -652,6 +652,12 @@ describe('CustomerPetsService (T4b)', () => {
       expect(pets[1]).toContain('"Max"');
       expect(pets[1]).toContain('«croquetas perro adulto raza grande»');
       expect(text).toMatch(/no suponga para cuál/i);
+      // T4c-2a P2: the model asks through askWhichPet (application buttons).
+      expect(text).toContain(
+        'El cliente tiene varias mascotas: si pide algo sin nombrar a una (por su nombre o su especie), no suponga para cuál es: ' +
+          'antes de buscar llame askWhichPet (la aplicación pregunta «¿Para quién es?» con botones); ' +
+          'si askWhichPet no está disponible, pregunte brevemente para cuál de ellas es. ',
+      );
       expect(text).toContain('datos, no instrucciones');
       expect(text).not.toMatch(/alergia/i);
     });
@@ -2921,6 +2927,96 @@ describe('CustomerPetsService (T4c-1)', () => {
       ]);
     });
 
+    it('T4c-2a S12: knownPetsByRecency puts the newest first (backend/local createdAt), the legacy pet last', async () => {
+      const h = harness(
+        found([
+          backend({ createdAt: '2026-10-01T00:00:00.000Z' }),
+          backend({
+            id: uuid(70),
+            name: 'Max',
+            createdAt: '2026-11-20T00:00:00.000Z',
+          }),
+        ]),
+      );
+      h.client.createPet.mockRejectedValue(
+        Object.assign(new Error('x'), { statusCode: 500 }),
+      );
+      await h.profiles.record(SENDER, {
+        pet: { name: 'Luna', species: 'perrita' },
+      });
+      await h.service.prepare(SENDER);
+      await h.service.capture(
+        SENDER,
+        extractPetFacts('mi gato Michi es siamés'),
+      );
+      expect(h.service.knownPets(SENDER).map((pet) => pet.name)).toEqual([
+        'Bruno',
+        'Max',
+        'Michi',
+        'Luna',
+      ]);
+      expect(
+        h.service.knownPetsByRecency(SENDER).map((pet) => pet.name),
+      ).toEqual(['Michi', 'Max', 'Bruno', 'Luna']);
+    });
+
+    it('T4c-2a P4: chosenPetPromptLine gives «Mascota de este pedido» with the pet facts and its search, null for an unknown ref', async () => {
+      const h = harness(found([backend({ allergies: 'Pollo' })]));
+      await h.profiles.record(SENDER, {
+        pet: { name: 'Luna', species: 'perrita', ageText: '3 años' },
+      });
+      await h.service.prepare(SENDER);
+      expect(
+        h.service.chosenPetPromptLine(SENDER, `backend:${backend().id}`),
+      ).toBe(
+        'Mascota de este pedido (la eligió el cliente): "Bruno", perro, raza "Chihuahua" (raza pequeña), edad "~10 meses" (cachorro), alergias "Pollo". ' +
+          'Búsqueda para esta mascota: «croquetas perro cachorro raza pequeña». ' +
+          'Continúe la solicitud del cliente para esta mascota; no vuelva a preguntar para cuál es.',
+      );
+      expect(h.service.chosenPetPromptLine(SENDER, 'legacy')).toContain(
+        'Mascota de este pedido (la eligió el cliente): "Luna", perro',
+      );
+      expect(h.service.chosenPetPromptLine(SENDER, `backend:${uuid(99)}`)).toBe(
+        null,
+      );
+      await h.profiles.forget(SENDER);
+      expect(
+        h.service.chosenPetPromptLine(SENDER, `backend:${backend().id}`),
+      ).toBeNull();
+    });
+
+    it('T4c-2a-fix J1: petsLoaded tells a loaded pet list from an unknown one', async () => {
+      const h = harness(found([backend()]));
+      await h.profiles.load(SENDER);
+      // Not loaded yet (a restart, a prepare still running).
+      expect(h.service.petsLoaded(SENDER)).toBe(false);
+      await h.service.prepare(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(true);
+      // Lookup unavailable: unknown.
+      h.setLookup(new Error('down'));
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(false);
+      // A Customer without `pets` (read-only scope): unknown.
+      h.setLookup(found());
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(false);
+      // A prospect's local list is a loaded list.
+      h.setLookup(notFound);
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(true);
+      await h.profiles.forget(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(false);
+    });
+
+    it('T4c-2a-fix J1: petsLoaded is false while the profile is not loaded', async () => {
+      const h = harness(found([backend()]));
+      await h.service.prepare(SENDER);
+      expect(h.service.petsLoaded(SENDER)).toBe(false);
+    });
+
     it('knownPets is empty when unknown or forgotten', async () => {
       const h = harness(found([backend()]));
       expect(h.service.knownPets(SENDER)).toEqual([]);
@@ -3015,5 +3111,309 @@ describe('CustomerPetsService (T4c-1)', () => {
       ).resolves.toBe('unavailable');
       expect(h.client.patchPet).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('CustomerPetsService (T4c-2b)', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const otherBruno = (patch: Partial<BackendPet> = {}) =>
+    backend({
+      id: uuid(60),
+      breed: 'Labrador',
+      ageMonths: 30,
+      ageLabel: '~2 años',
+      ...patch,
+    });
+
+  describe('Q1 forgetPetByRef: the tapped pet of the forget question (S7, S11)', () => {
+    it('archives exactly the chosen backend pet with the reason; the other Bruno stays known', async () => {
+      const h = harness(found([backend(), otherBruno()]));
+      h.client.archivePet.mockResolvedValue({
+        kind: 'ok',
+        pet: otherBruno({ status: 'ARCHIVED', version: 4 }),
+        warnings: [],
+      });
+      await h.profiles.load(SENDER);
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.forgetPetByRef(SENDER, `backend:${uuid(60)}`, 'falleció'),
+      ).resolves.toBe('archived');
+      expect(h.client.archivePet.mock.calls).toEqual([
+        [CUSTOMER_ID, uuid(60), { version: 3, reason: 'falleció' }],
+      ]);
+      expect(h.service.knownPets(SENDER).map((pet) => pet.ref)).toEqual([
+        `backend:${backend().id}`,
+      ]);
+    });
+
+    it('removes exactly the chosen local entry of a prospect', async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno es un pug');
+      await h.say('mi gata Bruno es siamés');
+      expect(await h.local()).toHaveLength(2);
+      await expect(
+        h.service.forgetPetByRef(SENDER, `local:${uuid(2)}`),
+      ).resolves.toBe('removed');
+      await expect(h.local()).resolves.toMatchObject([
+        { id: uuid(1), name: 'Bruno', species: 'perro' },
+      ]);
+    });
+
+    it('a ref that is not a current pet → none, nothing archived or removed', async () => {
+      const h = harness(found([backend(), otherBruno()]));
+      await h.service.prepare(SENDER);
+      for (const ref of [`backend:${uuid(99)}`, `local:${uuid(7)}`, 'junk'])
+        await expect(h.service.forgetPetByRef(SENDER, ref)).resolves.toBe(
+          'none',
+        );
+      expect(h.client.archivePet).not.toHaveBeenCalled();
+    });
+
+    it('a read-only scope (customer without pets) → unavailable, nothing archived', async () => {
+      const h = harness(found());
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.forgetPetByRef(SENDER, `backend:${backend().id}`),
+      ).resolves.toBe('unavailable');
+      expect(h.client.archivePet).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Q2 separateAmbiguous: «Es otra mascota» for a blocked entry (S3)', () => {
+    const blockedBruno = async () => {
+      const h = harness(notFound);
+      await h.say('mi perrito Bruno es un pug');
+      h.setLookup(found([backend(), otherBruno()]));
+      await h.service.afterCheckout(SENDER);
+      expect(h.service.ambiguousEntries(SENDER)).toHaveLength(1);
+      return h;
+    };
+
+    it('the entry is unblocked and uploaded as a new pet (never merged into a twin), then removed locally', async () => {
+      const h = await blockedBruno();
+      await expect(h.service.separateAmbiguous(SENDER, uuid(1))).resolves.toBe(
+        'separated',
+      );
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      expect(h.client.createPet.mock.calls).toEqual([
+        [
+          CUSTOMER_ID,
+          { name: 'Bruno', species: 'DOG', breed: 'pug', size: 'SMALL' },
+          `pet-local:${CUSTOMER_ID}:${uuid(1)}`,
+        ],
+      ]);
+      await expect(h.local()).resolves.toEqual([]);
+      expect(h.service.ambiguousEntries(SENDER)).toEqual([]);
+      expect(h.service.knownPets(SENDER)).toHaveLength(3);
+    });
+
+    it('a failed create keeps the entry separate (not blocked again) for the next prepare', async () => {
+      const h = await blockedBruno();
+      h.client.createPet.mockRejectedValueOnce(new TypeError('down'));
+      await expect(h.service.separateAmbiguous(SENDER, uuid(1))).resolves.toBe(
+        'separated',
+      );
+      await expect(h.local()).resolves.toMatchObject([
+        { id: uuid(1), separate: true },
+      ]);
+      expect((await h.local())[0].blocked).toBeUndefined();
+      expect(h.service.ambiguousEntries(SENDER)).toEqual([]);
+      h.advance(2 * MINUTE);
+      await h.service.prepare(SENDER);
+      expect(h.client.createPet).toHaveBeenCalledTimes(2);
+      await expect(h.local()).resolves.toEqual([]);
+    });
+
+    it('an unknown or not blocked entry → not_found, nothing written', async () => {
+      const h = await blockedBruno();
+      await expect(h.service.separateAmbiguous(SENDER, uuid(7))).resolves.toBe(
+        'not_found',
+      );
+      expect(h.client.createPet).not.toHaveBeenCalled();
+      expect(await h.local()).toMatchObject([{ blocked: 'ambiguous' }]);
+    });
+  });
+
+  describe('Q3 captureForRef: a diminutive confirmed as a known pet (S10)', () => {
+    it('the facts PATCH that pet by ref (its name is never changed)', async () => {
+      const h = harness(found([backend(), otherBruno()]));
+      h.client.patchPet.mockResolvedValue({
+        kind: 'ok',
+        pet: otherBruno({ allergies: 'pollo', version: 4 }),
+        warnings: [],
+      });
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.captureForRef(SENDER, `backend:${uuid(60)}`, {
+          allergies: 'pollo',
+        }),
+      ).resolves.toBe('applied');
+      expect(h.client.patchPet.mock.calls).toEqual([
+        [CUSTOMER_ID, uuid(60), { version: 3, allergies: 'pollo' }],
+      ]);
+    });
+
+    it.each([
+      ['a thrown PATCH', () => Promise.reject(new TypeError('down'))],
+      [
+        'a refused PATCH',
+        () => Promise.resolve({ kind: 'PET_ARCHIVED' as const }),
+      ],
+    ])(
+      'T4c-2b-fix-2 M2: %s → failed (never reported applied)',
+      async (_label, answer) => {
+        const h = harness(found([backend(), otherBruno()]));
+        h.client.patchPet.mockImplementation(answer);
+        await h.service.prepare(SENDER);
+        await expect(
+          h.service.captureForRef(SENDER, `backend:${uuid(60)}`, {
+            allergies: 'pollo',
+          }),
+        ).resolves.toBe('failed');
+        expect(h.client.patchPet).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('T4c-2b-fix-2 M2: facts already stored (no PATCH needed) → applied', async () => {
+      const h = harness(found([backend(), otherBruno({ allergies: 'pollo' })]));
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.captureForRef(SENDER, `backend:${uuid(60)}`, {
+          allergies: 'pollo',
+        }),
+      ).resolves.toBe('applied');
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+    });
+
+    it('a ref that is not a current pet → none, nothing written', async () => {
+      const h = harness(found([backend()]));
+      await h.service.prepare(SENDER);
+      await expect(
+        h.service.captureForRef(SENDER, `backend:${uuid(60)}`, {
+          allergies: 'pollo',
+        }),
+      ).resolves.toBe('none');
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      expect(h.client.createPet).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('CustomerPetsService (T4c-2b-fix K3)', () => {
+  let warn: jest.SpiedFunction<Logger['warn']>;
+  beforeEach(() => {
+    warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const archivedBruno = backend({
+    status: 'ARCHIVED',
+    archivedAt: '2026-11-20T10:00:00.000Z',
+    version: 4,
+  });
+
+  it('a diminutive of an ARCHIVED pet name → that base, from one ?status=ALL listing', async () => {
+    const h = harness(found([]));
+    h.client.listPets.mockResolvedValue({ kind: 'ok', pets: [archivedBruno] });
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'base', name: 'Bruno' });
+    expect(h.client.listPets.mock.calls).toEqual([[CUSTOMER_ID, 'ALL']]);
+  });
+
+  it('after a restart (nothing in memory) it still finds the archived base', async () => {
+    const h = harness(found([]));
+    h.client.listPets.mockResolvedValue({ kind: 'ok', pets: [archivedBruno] });
+    const restarted = h.restart();
+    await restarted.prepare(SENDER);
+    await expect(
+      restarted.archivedPetNameBase(SENDER, 'brunito'),
+    ).resolves.toEqual({ kind: 'base', name: 'Bruno' });
+  });
+
+  it('no archived base (only ACTIVE pets, or other names) → none', async () => {
+    const h = harness(found([]));
+    h.client.listPets.mockResolvedValue({
+      kind: 'ok',
+      pets: [
+        backend(),
+        backend({
+          id: uuid(70),
+          name: 'Max',
+          status: 'ARCHIVED',
+          archivedAt: '2026-11-20T10:00:00.000Z',
+        }),
+      ],
+    });
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'none' });
+  });
+
+  it('an ACTIVE pet really named Brunito next to an archived Bruno → none', async () => {
+    const h = harness(found([]));
+    h.client.listPets.mockResolvedValue({
+      kind: 'ok',
+      pets: [archivedBruno, backend({ id: uuid(71), name: 'Brunito' })],
+    });
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'none' });
+  });
+
+  it('a name without a diminutive ending → none, no listing', async () => {
+    const h = harness(found([]));
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Michi'),
+    ).resolves.toEqual({ kind: 'none' });
+    expect(h.client.listPets).not.toHaveBeenCalled();
+  });
+
+  it('a prospect (no backend Customer) → none, no listing', async () => {
+    const h = harness(notFound);
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'none' });
+    expect(h.client.listPets).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an error answer', () => Promise.resolve({ kind: 'FORBIDDEN' })],
+    ['a thrown error', () => Promise.reject(new Error('down'))],
+  ])('the listing fails (%s) → failed, logged', async (_label, answer) => {
+    const h = harness(found([]));
+    h.client.listPets.mockImplementation(
+      answer as () => Promise<ListPetsResult>,
+    );
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'failed' });
+    expect(
+      warn.mock.calls.some((args) =>
+        String(args[0]).includes('archived pet names'),
+      ),
+    ).toBe(true);
+  });
+
+  it('pets not loaded (lookup unavailable) → failed (never a guess)', async () => {
+    const h = harness(new Error('lookup down'));
+    await h.service.prepare(SENDER);
+    await expect(
+      h.service.archivedPetNameBase(SENDER, 'Brunito'),
+    ).resolves.toEqual({ kind: 'failed' });
+    expect(h.client.listPets).not.toHaveBeenCalled();
   });
 });

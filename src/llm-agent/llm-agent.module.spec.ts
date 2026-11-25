@@ -347,6 +347,7 @@ describe('LlmAgentModule integration', () => {
       'checkout_confirmed',
       'order_confirmation',
       'payment_offer',
+      'pet_choice',
       'restock_pending',
     ]);
     // Restock backorder S1: the offer service owns the two backorder gates,

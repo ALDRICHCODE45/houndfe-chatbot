@@ -24,9 +24,10 @@ function run(direction: 'up' | 'down') {
 
 describe('conversation gate payment_offer migration (5400)', () => {
   it('up re-creates the kind CHECK with exactly the kinds known at 5400', () => {
-    // 5500 widens the code list with the backorder kinds (own spec).
+    // 5500 widens the code list with the backorder kinds and 5800 with
+    // pet_choice (own specs).
     const known = CONVERSATION_GATE_KINDS.filter(
-      (kind) => !kind.startsWith('backorder_'),
+      (kind) => !kind.startsWith('backorder_') && kind !== 'pet_choice',
     );
     const [drop, add] = run('up');
     expect(drop).toEqual([
