@@ -86,6 +86,9 @@ export type PetChoice =
       readonly name: string;
       /** What the statement said, written only once answered. */
       readonly facts: PetChoiceFacts;
+      /** T4c-2b-fix K4: the customer's message, continued once answered.
+       *  Absent on rows written before it (their answer replies as before). */
+      readonly request?: string;
     };
 
 const optionsSchema = z
@@ -134,6 +137,7 @@ const payloadSchema = z.discriminatedUnion('purpose', [
       allergies: fact,
       notes: fact,
     }),
+    request: requestSchema.optional(),
   }),
 ]);
 
@@ -240,6 +244,7 @@ function copy(choice: PetChoice): PetChoice {
             ([, value]) => typeof value === 'string',
           ),
         ),
+        ...(choice.request === undefined ? {} : { request: choice.request }),
       };
   }
 }
@@ -288,4 +293,34 @@ export function matchPetChoiceAnswer(
       forms.has(foldAnswer(option.text)),
   );
   return matched.length === 1 ? matched[0] : null;
+}
+
+/** T4c-2b-fix K2: whole typed answers that mean «it is another pet». */
+const OTHER_PET_ANSWERS: ReadonlySet<string> = new Set([
+  'otra',
+  'otro',
+  'otra mascota',
+  'otro mascota',
+  'ninguno',
+  'ninguna',
+  'ninguno de esos',
+  'ninguna de esas',
+  'ninguno de ellos',
+  'ninguna de ellas',
+  'ninguno de los dos',
+  'ninguna de las dos',
+]);
+
+/**
+ * T4c-2b-fix K2: a typed answer meaning «Es otra mascota» («es otra», «otra
+ * mascota», «ninguna de esas», «no, es otro»): the whole message, with an
+ * optional leading «no» and «es». Only the ambiguous and diminutive
+ * questions use it (the request question's «Otra mascota» row keeps its own
+ * behaviour); `matchPetChoiceAnswer` never answers `other`.
+ */
+export function isOtherPetAnswer(text: string): boolean {
+  const folded = foldAnswer(text)
+    .replace(/^no\s+/, '')
+    .replace(/^(?:es|son|seria)\s+/, '');
+  return OTHER_PET_ANSWERS.has(folded);
 }

@@ -2,6 +2,7 @@ import { ConversationGates } from '../../../conversation-gates/application/conve
 import { InMemoryConversationGateStore } from '../../../conversation-gates/infrastructure/in-memory-conversation-gate.store';
 import {
   DurablePetChoice,
+  isOtherPetAnswer,
   MINIMAL_PET_CHOICE_TTL_MS,
   matchPetChoiceAnswer,
   PET_CHOICE_OPTIONS_MAX,
@@ -274,7 +275,8 @@ describe('pet choice purposes (T4c-2b Q1-Q3)', () => {
     { ...AMBIGUOUS, request: undefined },
     { ...DIMINUTIVE, facts: { name: 'Brunito', extra: 'x' } },
     { ...DIMINUTIVE, facts: undefined },
-    { ...DIMINUTIVE, request: 'x' },
+    // T4c-2b-fix K4: a diminutive row may keep the message, never empty.
+    { ...DIMINUTIVE, request: '' },
   ])('treats the malformed purpose payload %j as absent', async (p) => {
     const w = world();
     await w.store.put({
@@ -286,5 +288,67 @@ describe('pet choice purposes (T4c-2b Q1-Q3)', () => {
     const restarted = w.boot();
     await restarted.gates.begin(SENDER);
     expect(restarted.choices.read(SENDER)).toBeNull();
+  });
+});
+
+describe('typed «es otra» (T4c-2b-fix K2)', () => {
+  it.each([
+    'es otra',
+    'otra',
+    'Otra.',
+    'es otra mascota',
+    'Otra mascota',
+    'ninguno',
+    'Ninguna',
+    'ninguna de esas',
+    'ninguno de esos',
+    'no, es otro',
+    'No es otra',
+    '¡Es otra!',
+  ])('%j is an «other» answer', (text) => {
+    expect(isOtherPetAnswer(text)).toBe(true);
+  });
+
+  it.each([
+    'no',
+    'es Bruno',
+    'otra cosa, quiero croquetas',
+    'quiero otra bolsa',
+    'otra vez',
+    '',
+  ])('%j is not', (text) => {
+    expect(isOtherPetAnswer(text)).toBe(false);
+  });
+
+  it('a diminutive row with the customer message round-trips; one without it still loads', async () => {
+    const w = world();
+    const first = w.boot();
+    const withRequest: PetChoice = {
+      purpose: 'diminutive',
+      options: [
+        { ref: BRUNO, text: 'Bruno' },
+        { ref: 'other', text: 'Es otra mascota' },
+      ],
+      name: 'Brunito',
+      facts: { name: 'Brunito', ageText: '3 años' },
+      request: 'mi perrito Brunito tiene 3 años, ¿qué croquetas le doy?',
+    };
+    first.choices.ask(SENDER, withRequest);
+    first.gates.touch(SENDER);
+    await first.gates.settle(SENDER);
+    const restarted = w.boot();
+    await restarted.gates.begin(SENDER);
+    expect(restarted.choices.read(SENDER)).toEqual(withRequest);
+    const { request: _dropped, ...legacy } = withRequest;
+    void _dropped;
+    await w.store.put({
+      senderId: SENDER,
+      kind: 'pet_choice',
+      payload: legacy,
+      expiresAt: new Date(T0 + 60_000),
+    });
+    const again = w.boot();
+    await again.gates.begin(SENDER);
+    expect(again.choices.read(SENDER)).toEqual(legacy);
   });
 });

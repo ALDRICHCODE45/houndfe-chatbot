@@ -140,6 +140,7 @@ function world(lookup: {
   const profileStore = new InMemoryCustomerProfileStore();
   const localStore = new InMemoryLocalPetStore(profileStore);
   const backend = client();
+  const conversations = new InMemoryConversationStore();
   let ids = 100;
   const boot = () => {
     const api = new EvalFakeApi({ kind: 'new' });
@@ -192,7 +193,7 @@ function world(lookup: {
       new InMemoryMinimalCatalogSessionStore(),
       undefined,
       undefined,
-      new MinimalCartService(api, new InMemoryConversationStore()),
+      new MinimalCartService(api, conversations),
       undefined,
       undefined,
       undefined,
@@ -235,6 +236,23 @@ function world(lookup: {
     profileStore,
     local: () => localStore.read(SENDER),
     seedLocal: (pets: LocalPet[]) => localStore.write(SENDER, pets, NOW),
+    /** T4c-2b-fix K5: one stored cart line (a purchase in progress). */
+    seedCart: () =>
+      conversations.commitMinimalCart(
+        SENDER,
+        undefined,
+        {
+          items: [
+            {
+              productId: 'd0000000-0000-4000-8000-000000000001',
+              quantity: 1,
+              unitPriceCents: 45000,
+            },
+          ],
+          idempotencyKey: '',
+        },
+        NOW.toISOString(),
+      ),
   };
 }
 
@@ -450,7 +468,7 @@ describe('T4c-2b Q2: a local entry blocked as ambiguous (S3)', () => {
       ],
       prompt: '¿Bruno es alguno de estos?',
       textFallback:
-        '¿Bruno es Bruno (Chihuahua, cachorro), Bruno (Labrador, adulto) o es otra mascota?',
+        '¿Bruno es Bruno (Chihuahua, cachorro), Bruno (Labrador, adulto) o es otra mascota? Si es otra, puede responder «es otra».',
     });
     await expect(gateRow(w)).resolves.toMatchObject({
       payload: {
@@ -574,7 +592,8 @@ describe('T4c-2b Q3: a diminutive of a forgotten or known pet (S10, I4)', () => 
         { id: 'pet_pick:other', title: 'Es otra mascota' },
       ],
       prompt: '¿Brunito es Bruno o es otra mascota?',
-      textFallback: '¿Brunito es Bruno o es otra mascota?',
+      textFallback:
+        '¿Brunito es Bruno o es otra mascota? Si es otra, puede responder «es otra».',
     });
     await expect(gateRow(w)).resolves.toMatchObject({
       payload: {
@@ -585,6 +604,8 @@ describe('T4c-2b Q3: a diminutive of a forgotten or known pet (S10, I4)', () => 
         ],
         name: 'Brunito',
         facts: { name: 'Brunito', species: 'perro', ageText: '3 años' },
+        // T4c-2b-fix K4: the message, continued once answered.
+        request: 'mi perrito Brunito tiene 3 años',
       },
     });
     expect(w.backend.createPet).not.toHaveBeenCalled();
@@ -592,15 +613,13 @@ describe('T4c-2b Q3: a diminutive of a forgotten or known pet (S10, I4)', () => 
     await expect(w.local()).resolves.toEqual([]);
   });
 
-  it('tap «Bruno» (the forgotten one) writes nothing and the forget stands', async () => {
+  it('tap «Bruno» (the forgotten one) writes nothing and the forget stands (K4: the message continues)', async () => {
     const { w, h } = await afterForget();
     await h.turn('mi perrito Brunito tiene 3 años');
     const decision = await h.turn('Bruno', [], 'pet_pick:forgotten');
     await flush();
-    expect(decision.reply).toBe(PET_DIMINUTIVE_FORGOTTEN_REPLY);
-    expect(PET_DIMINUTIVE_FORGOTTEN_REPLY).toBe(
-      'Entiendo, gracias por contarme.',
-    );
+    expect(decision.reply).toBe('Texto del modelo.');
+    expect(h.lastUser()).toBe('mi perrito Brunito tiene 3 años');
     expect(w.backend.createPet).not.toHaveBeenCalled();
     expect(w.backend.patchPet).not.toHaveBeenCalled();
     expect(w.backend.restorePet).not.toHaveBeenCalled();
@@ -608,14 +627,15 @@ describe('T4c-2b Q3: a diminutive of a forgotten or known pet (S10, I4)', () => 
     await expect(gateRow(w)).resolves.toBeNull();
   });
 
-  it('a typed «es Bruno» answers it like the tap (nothing written, no model)', async () => {
+  it('a typed «es Bruno» answers it like the tap (nothing written; K4: the message continues)', async () => {
     const { w, h } = await afterForget();
     await h.turn('mi perrito Brunito tiene 3 años');
     const calls = h.seen.length;
     const decision = await h.turn('es Bruno');
     await flush();
-    expect(decision.reply).toBe(PET_DIMINUTIVE_FORGOTTEN_REPLY);
-    expect(h.seen).toHaveLength(calls);
+    expect(decision.reply).toBe('Texto del modelo.');
+    expect(h.seen).toHaveLength(calls + 1);
+    expect(h.lastUser()).toBe('mi perrito Brunito tiene 3 años');
     expect(w.backend.createPet).not.toHaveBeenCalled();
     expect(w.backend.patchPet).not.toHaveBeenCalled();
     await expect(gateRow(w)).resolves.toBeNull();
@@ -635,10 +655,7 @@ describe('T4c-2b Q3: a diminutive of a forgotten or known pet (S10, I4)', () => 
     );
     const decision = await h.turn('Es otra mascota', [], 'pet_pick:other');
     await flush();
-    expect(decision.reply).toBe(PET_DIMINUTIVE_NEW_REPLY);
-    expect(PET_DIMINUTIVE_NEW_REPLY).toBe(
-      'Gracias, ya la anoté como otra mascota.',
-    );
+    expect(decision.reply).toBe('Texto del modelo.');
     expect(w.backend.createPet).toHaveBeenCalledTimes(1);
     expect(w.backend.createPet).toHaveBeenCalledWith(
       CUSTOMER_ID,
@@ -671,8 +688,10 @@ describe('T4c-2b Q3: a diminutive of a forgotten or known pet (S10, I4)', () => 
     });
     const tapped = await h.turn('Max', [], `pet_pick:backend:${MAX_ID}`);
     await flush();
-    expect(tapped.reply).toBe(PET_DIMINUTIVE_SAME_REPLY);
-    expect(PET_DIMINUTIVE_SAME_REPLY).toBe('Gracias, ya lo anoté.');
+    // K4: the message continues with Max as the turn's pet.
+    expect(tapped.reply).toBe('Texto del modelo.');
+    expect(h.lastUser()).toBe('Maxito es alérgico al pollo');
+    expect(lineOf(h.system())).toContain('"Max"');
     expect(w.backend.patchPet.mock.calls).toEqual([
       [CUSTOMER_ID, MAX_ID, { version: 3, allergies: 'pollo' }],
     ]);
@@ -704,5 +723,468 @@ describe('T4c-2b Q3: a diminutive of a forgotten or known pet (S10, I4)', () => 
       expect.any(String),
     );
     await expect(gateRow(w)).resolves.toBeNull();
+  });
+});
+
+describe('T4c-2b-fix (S3, S10): pet questions only when they matter, typed «es otra», archived diminutives, the request kept', () => {
+  let warn: jest.SpiedFunction<Logger['warn']>;
+  beforeEach(() => {
+    warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const blocked = (): LocalPet => ({
+    id: LOCAL_ID,
+    name: 'Bruno',
+    species: 'perro',
+    breed: 'pug',
+    createdAt: '2026-11-20T10:00:00.000Z',
+    blocked: 'ambiguous',
+  });
+  const ambiguousWorld = async () => {
+    const w = world({ current: customer([pet(), bruno2(), max()]) });
+    await w.seedLocal([blocked()]);
+    return w;
+  };
+  const createEcho = (w: ReturnType<typeof world>, id: string) =>
+    w.backend.createPet.mockImplementation(
+      (_c: string, body: { name: string }) =>
+        Promise.resolve({
+          kind: 'ok',
+          created: true,
+          pet: pet({ id, ...body }),
+          warnings: [],
+        }),
+    );
+  const archivedBruno = () =>
+    pet({
+      status: 'ARCHIVED',
+      archivedAt: '2026-11-20T10:00:00.000Z',
+      archivedReason: 'falleció',
+      version: 4,
+    });
+  const afterForget = async () => {
+    const w = world({ current: customer([pet(), max()]) });
+    const h = w.boot();
+    w.backend.archivePet.mockResolvedValue(archived({}));
+    await h.turn('Bruno ya no está', [
+      [call('forgetPet', { name: 'Bruno' }), say('Lo siento mucho.')],
+    ]);
+    await flush();
+    return { w, h };
+  };
+
+  describe('K1: the ambiguous question only for a pet reference', () => {
+    it('pin: «Mi dirección es Calle Bruno Traven 45, Coyoacán» asks nothing; the model runs', async () => {
+      const w = await ambiguousWorld();
+      const h = w.boot();
+      const decision = await h.turn(
+        'Mi dirección es Calle Bruno Traven 45, Coyoacán',
+        [[say('Gracias, anoté su dirección.')]],
+      );
+      expect(decision.reply).toBe('Gracias, anoté su dirección.');
+      expect(decision.interactive).toBeUndefined();
+      expect(h.seen).toHaveLength(1);
+      await expect(gateRow(w)).resolves.toBeNull();
+    });
+
+    it.each([
+      'Vivo en Av. Bruno Traven 12, col. Centro',
+      'es en la colonia Bruno Traven, CP 04000',
+      'entre calles Bruno y Juárez, esquina con Reforma',
+      'Bruno Traven #45 int 2',
+      'hablé con Bruno ayer',
+      'Hola, soy Bruno',
+    ])('%j (not a pet reference) asks nothing', async (text) => {
+      const w = await ambiguousWorld();
+      const h = w.boot();
+      const decision = await h.turn(text, [[say('Claro.')]]);
+      expect(decision.reply).toBe('Claro.');
+      await expect(gateRow(w)).resolves.toBeNull();
+    });
+
+    it.each([
+      'croquetas para Bruno',
+      'quiero un shampoo a Bruno',
+      'mi perrito Bruno tiene comezón',
+      'mi mascota Bruno necesita arena',
+      'Bruno tiene comezón, ¿qué le doy?',
+      'Bruno come muy poco',
+    ])('%j (a pet reference) asks which Bruno', async (text) => {
+      const w = await ambiguousWorld();
+      const h = w.boot();
+      const decision = await h.turn(text);
+      expect(decision.reply).toBe('¿Bruno es alguno de estos?');
+      expect(h.seen).toHaveLength(0);
+      await expect(gateRow(w)).resolves.toMatchObject({
+        payload: { purpose: 'ambiguous', request: text },
+      });
+    });
+
+    it('still holding: a greeting is not hijacked', async () => {
+      const w = await ambiguousWorld();
+      const h = w.boot();
+      const decision = await h.turn('hola, buenas tardes', [[say('¡Hola!')]]);
+      expect(decision.reply).toBe('¡Hola!');
+      await expect(gateRow(w)).resolves.toBeNull();
+    });
+  });
+
+  describe('K2: typed «es otra» answers the ambiguous / diminutive question', () => {
+    it('pin Q2: typed «es otra mascota» uploads the entry as a new pet and the original request continues', async () => {
+      const w = await ambiguousWorld();
+      const h = w.boot();
+      await h.turn('croquetas para Bruno');
+      createEcho(w, 'c0000000-0000-4000-8000-000000000080');
+      const decision = await h.turn('es otra mascota', [
+        [say('Para su otro Bruno le recomiendo…')],
+      ]);
+      expect(decision.reply).toBe('Para su otro Bruno le recomiendo…');
+      expect(w.backend.patchPet).not.toHaveBeenCalled();
+      expect(w.backend.createPet.mock.calls).toEqual([
+        [
+          CUSTOMER_ID,
+          { name: 'Bruno', species: 'DOG', breed: 'pug' },
+          `pet-local:${CUSTOMER_ID}:${LOCAL_ID}`,
+        ],
+      ]);
+      await expect(w.local()).resolves.toEqual([]);
+      expect(h.lastUser()).toBe('croquetas para Bruno');
+      await expect(gateRow(w)).resolves.toBeNull();
+    });
+
+    it('pin Q3: typed «otra» creates Brunito with the facts', async () => {
+      const { w, h } = await afterForget();
+      await h.turn('mi perrito Brunito tiene 3 años');
+      createEcho(w, 'c0000000-0000-4000-8000-000000000081');
+      await h.turn('otra', [[say('¡Qué lindo Brunito!')]]);
+      await flush();
+      expect(w.backend.createPet).toHaveBeenCalledTimes(1);
+      expect(w.backend.createPet).toHaveBeenCalledWith(
+        CUSTOMER_ID,
+        expect.objectContaining({
+          name: 'Brunito',
+          species: 'DOG',
+          birthDate: expect.any(String) as unknown,
+        }),
+        expect.any(String),
+      );
+      expect(w.backend.patchPet).not.toHaveBeenCalled();
+      await expect(gateRow(w)).resolves.toBeNull();
+    });
+
+    it.each([
+      'es otra',
+      'Otra.',
+      'es otra mascota',
+      'otra mascota',
+      'ninguno',
+      'Ninguna',
+      'ninguna de esas',
+      'no, es otro',
+    ])('Q3 typed %j answers «Es otra mascota»', async (text) => {
+      const { w, h } = await afterForget();
+      await h.turn('mi perrito Brunito tiene 3 años');
+      createEcho(w, 'c0000000-0000-4000-8000-000000000082');
+      await h.turn(text, [[say('Anotado.')]]);
+      await flush();
+      expect(w.backend.createPet).toHaveBeenCalledTimes(1);
+      expect(w.backend.createPet).toHaveBeenCalledWith(
+        CUSTOMER_ID,
+        expect.objectContaining({ name: 'Brunito' }),
+        expect.any(String),
+      );
+    });
+
+    it('the text fallbacks of both questions say how to answer by text', async () => {
+      const a = await ambiguousWorld();
+      const asked = await a.boot().turn('croquetas para Bruno');
+      expect(asked.interactive).toMatchObject({
+        textFallback:
+          '¿Bruno es Bruno (Chihuahua, cachorro), Bruno (Labrador, adulto) o es otra mascota? Si es otra, puede responder «es otra».',
+      });
+      const { h } = await afterForget();
+      const dim = await h.turn('mi perrito Brunito tiene 3 años');
+      expect(dim.interactive).toMatchObject({
+        textFallback:
+          '¿Brunito es Bruno o es otra mascota? Si es otra, puede responder «es otra».',
+      });
+    });
+
+    it('still holding: on a request question typed «otra mascota» is a new message, and its «Otra mascota» row still asks the name', async () => {
+      const many = Array.from({ length: 11 }, (_, i) =>
+        pet({
+          id: `e0000000-0000-4000-8000-0000000000${String(10 + i)}`,
+          name: `Mascota${String.fromCharCode(65 + i)}`,
+          createdAt: `2026-10-${String(10 + i)}T10:00:00.000Z`,
+        }),
+      );
+      const w = world({ current: customer(many) });
+      const h = w.boot();
+      await h.turn('busco croquetas', [[call('askWhichPet'), say('¿Cuál?')]]);
+      const typed = await h.turn('otra mascota', [[say('¿Cómo se llama?')]]);
+      expect(typed.reply).toBe('¿Cómo se llama?');
+      await expect(gateRow(w)).resolves.toBeNull();
+      await h.turn('busco croquetas', [[call('askWhichPet'), say('¿Cuál?')]]);
+      const tapped = await h.turn('Otra mascota', [], 'pet_pick:other');
+      expect(tapped.reply).toBe(
+        '¿Cómo se llama? Escríbame el nombre de su mascota.',
+      );
+    });
+  });
+
+  describe('K3: a diminutive of a pet ARCHIVED in the backend', () => {
+    it('pin: after a restart with Bruno ARCHIVED, «mi perrito Brunito tiene 3 años» asks; no createPet', async () => {
+      const w = world({ current: customer([max()]) });
+      w.backend.listPets.mockResolvedValue({
+        kind: 'ok',
+        pets: [archivedBruno(), max()],
+      });
+      const h = w.boot();
+      const decision = await h.turn('mi perrito Brunito tiene 3 años', [
+        [say('¡Qué lindo Brunito!')],
+      ]);
+      await flush();
+      expect(decision.reply).toBe('¿Brunito es Bruno o es otra mascota?');
+      expect(decision.interactive).toMatchObject({
+        type: 'buttons',
+        buttons: [
+          { id: 'pet_pick:forgotten', title: 'Bruno' },
+          { id: 'pet_pick:other', title: 'Es otra mascota' },
+        ],
+      });
+      expect(w.backend.listPets.mock.calls).toEqual([[CUSTOMER_ID, 'ALL']]);
+      expect(w.backend.createPet).not.toHaveBeenCalled();
+      expect(w.backend.patchPet).not.toHaveBeenCalled();
+      await expect(w.local()).resolves.toEqual([]);
+    });
+
+    it('rememberPetDetails «Brunito» with Bruno ARCHIVED asks too (one listing for the turn)', async () => {
+      const w = world({ current: customer([max()]) });
+      w.backend.listPets.mockResolvedValue({
+        kind: 'ok',
+        pets: [archivedBruno(), max()],
+      });
+      const h = w.boot();
+      const decision = await h.turn('mi perrito Brunito tiene 3 años', [
+        [
+          call('rememberPetDetails', { name: 'Brunito', ageText: '3 años' }),
+          say('Anotado.'),
+        ],
+      ]);
+      await flush();
+      expect(h.toolOutputs).toEqual([
+        { ok: true, remembered: false, presentedByApplication: true },
+      ]);
+      expect(decision.reply).toBe('¿Brunito es Bruno o es otra mascota?');
+      expect(w.backend.listPets.mock.calls).toEqual([[CUSTOMER_ID, 'ALL']]);
+      expect(w.backend.createPet).not.toHaveBeenCalled();
+    });
+
+    it('the listing fails → no question, nothing written, logged; the model reply stands', async () => {
+      const w = world({ current: customer([max()]) });
+      w.backend.listPets.mockResolvedValue({ kind: 'FORBIDDEN' });
+      const h = w.boot();
+      const decision = await h.turn('mi perrito Brunito tiene 3 años', [
+        [say('¡Qué lindo Brunito!')],
+      ]);
+      await flush();
+      expect(decision.reply).toBe('¡Qué lindo Brunito!');
+      expect(decision.interactive).toBeUndefined();
+      expect(w.backend.createPet).not.toHaveBeenCalled();
+      await expect(w.local()).resolves.toEqual([]);
+      await expect(gateRow(w)).resolves.toBeNull();
+      expect(
+        warn.mock.calls.some((args) =>
+          String(args[0]).includes('archived pet names'),
+        ),
+      ).toBe(true);
+    });
+
+    it('nothing archived with that base → captured as a new pet (no question)', async () => {
+      const w = world({ current: customer([max()]) });
+      createEcho(w, 'c0000000-0000-4000-8000-000000000083');
+      const h = w.boot();
+      const decision = await h.turn('mi perrito Brunito tiene 3 años', [
+        [say('¡Qué lindo Brunito!')],
+      ]);
+      await flush();
+      expect(decision.reply).toBe('¡Qué lindo Brunito!');
+      expect(w.backend.createPet).toHaveBeenCalledWith(
+        CUSTOMER_ID,
+        expect.objectContaining({ name: 'Brunito' }),
+        expect.any(String),
+      );
+    });
+
+    it('a name without a diminutive ending never lists archived pets for the question', async () => {
+      const w = world({ current: customer([max()]) });
+      createEcho(w, 'c0000000-0000-4000-8000-000000000084');
+      const h = w.boot();
+      await h.turn('mi gata Michi es siamés', [[say('¡Qué linda!')]]);
+      await flush();
+      // Only the I1 guard's listing before the create.
+      expect(w.backend.listPets).toHaveBeenCalledTimes(1);
+      expect(w.backend.createPet).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('K4: the diminutive question keeps the message and continues it', () => {
+    const MESSAGE = 'mi perrito Brunito tiene 3 años, ¿qué croquetas le doy?';
+
+    it('pin: the question stores the message; tap «Bruno» writes the facts to Bruno and the model answers the original message', async () => {
+      const w = world({ current: customer([pet(), max()]) });
+      const h = w.boot();
+      const asked = await h.turn(MESSAGE, [[say('¿Qué croquetas…?')]]);
+      expect(asked.reply).toBe('¿Brunito es Bruno o es otra mascota?');
+      await expect(gateRow(w)).resolves.toMatchObject({
+        payload: { purpose: 'diminutive', name: 'Brunito', request: MESSAGE },
+      });
+      w.backend.patchPet.mockResolvedValue({
+        kind: 'ok',
+        pet: pet({ version: 4 }),
+        warnings: [],
+      });
+      const calls = h.seen.length;
+      const decision = await h.turn(
+        'Bruno',
+        [
+          [
+            call('rememberPetDetails', { name: 'Brunito', ageText: '3 años' }),
+            say('Para Bruno le recomiendo croquetas de adulto.'),
+          ],
+        ],
+        `pet_pick:backend:${BRUNO_ID}`,
+      );
+      await flush();
+      expect(decision.reply).toBe(
+        'Para Bruno le recomiendo croquetas de adulto.',
+      );
+      expect(decision.interactive).toBeUndefined();
+      expect(h.seen).toHaveLength(calls + 1);
+      expect(h.lastUser()).toBe(MESSAGE);
+      expect(lineOf(h.system())).toContain('"Bruno"');
+      expect(w.backend.patchPet).toHaveBeenCalledWith(
+        CUSTOMER_ID,
+        BRUNO_ID,
+        expect.objectContaining({ version: 3 }),
+      );
+      expect(w.backend.patchPet).toHaveBeenCalledTimes(1);
+      expect(w.backend.createPet).not.toHaveBeenCalled();
+      await expect(gateRow(w)).resolves.toBeNull();
+    });
+
+    it('after a forget: tap «Bruno» (forgotten) writes nothing and the model answers the original message', async () => {
+      const { w, h } = await afterForget();
+      await h.turn(MESSAGE);
+      const decision = await h.turn(
+        'Bruno',
+        [[say('Le recomiendo croquetas de adulto.')]],
+        'pet_pick:forgotten',
+      );
+      await flush();
+      expect(decision.reply).toBe('Le recomiendo croquetas de adulto.');
+      expect(h.lastUser()).toBe(MESSAGE);
+      expect(w.backend.createPet).not.toHaveBeenCalled();
+      expect(w.backend.patchPet).not.toHaveBeenCalled();
+      await expect(gateRow(w)).resolves.toBeNull();
+    });
+
+    it('typed «es otra» creates Brunito and the model answers the original message', async () => {
+      const { w, h } = await afterForget();
+      await h.turn(MESSAGE);
+      createEcho(w, 'c0000000-0000-4000-8000-000000000085');
+      const decision = await h.turn('es otra', [
+        [say('Para Brunito le recomiendo…')],
+      ]);
+      await flush();
+      expect(decision.reply).toBe('Para Brunito le recomiendo…');
+      expect(h.lastUser()).toBe(MESSAGE);
+      expect(w.backend.createPet).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['forgotten', 'Entiendo, gracias por contarme.'],
+      ['other', 'Gracias, ya la anoté como otra mascota.'],
+      [`backend:${BRUNO_ID}`, 'Gracias, ya lo anoté.'],
+    ])(
+      'a row without the stored message (written by 60de094) still loads; tap %s replies as before (%j, no model)',
+      async (ref, text) => {
+        expect([
+          PET_DIMINUTIVE_FORGOTTEN_REPLY,
+          PET_DIMINUTIVE_NEW_REPLY,
+          PET_DIMINUTIVE_SAME_REPLY,
+        ]).toContain(text);
+        const w = world({ current: customer([pet(), max()]) });
+        createEcho(w, 'c0000000-0000-4000-8000-000000000086');
+        w.backend.patchPet.mockResolvedValue({
+          kind: 'ok',
+          pet: pet({ version: 4 }),
+          warnings: [],
+        });
+        await w.gateStore.put({
+          senderId: SENDER,
+          kind: 'pet_choice',
+          payload: {
+            purpose: 'diminutive',
+            options: [
+              ref === 'forgotten'
+                ? { ref: 'forgotten', text: 'Bruno' }
+                : { ref: `backend:${BRUNO_ID}`, text: 'Bruno' },
+              { ref: 'other', text: 'Es otra mascota' },
+            ],
+            name: 'Brunito',
+            facts: { name: 'Brunito', species: 'perro', ageText: '3 años' },
+          },
+          expiresAt: new Date(NOW.getTime() + 60_000),
+        });
+        const h = w.boot();
+        const decision = await h.turn('Bruno', [], `pet_pick:${ref}`);
+        await flush();
+        expect(decision.reply).toBe(text);
+        expect(h.seen).toHaveLength(0);
+        await expect(gateRow(w)).resolves.toBeNull();
+      },
+    );
+  });
+
+  describe('K5: no diminutive question during a purchase', () => {
+    it('pin: with a cart line, «mi perrito Brunito tiene 3 años» asks nothing, writes nothing; the model reply stands', async () => {
+      const w = world({ current: customer([pet(), max()]) });
+      await w.seedCart();
+      const h = w.boot();
+      const decision = await h.turn('mi perrito Brunito tiene 3 años', [
+        [say('¡Qué lindo! ¿Seguimos con su pedido?')],
+      ]);
+      await flush();
+      expect(decision.reply).toBe('¡Qué lindo! ¿Seguimos con su pedido?');
+      expect(decision.interactive).toBeUndefined();
+      expect(w.backend.createPet).not.toHaveBeenCalled();
+      expect(w.backend.patchPet).not.toHaveBeenCalled();
+      await expect(gateRow(w)).resolves.toBeNull();
+    });
+
+    it('rememberPetDetails «Brunito» with a cart line writes nothing and asks nothing', async () => {
+      const w = world({ current: customer([pet(), max()]) });
+      await w.seedCart();
+      const h = w.boot();
+      const decision = await h.turn('mi perrito Brunito tiene 3 años', [
+        [
+          call('rememberPetDetails', { name: 'Brunito', ageText: '3 años' }),
+          say('Anotado.'),
+        ],
+      ]);
+      await flush();
+      expect(decision.reply).toBe('Anotado.');
+      expect(h.toolOutputs).toEqual([
+        { ok: false, error: 'pet_name_needs_confirmation' },
+      ]);
+      expect(w.backend.createPet).not.toHaveBeenCalled();
+      expect(w.backend.patchPet).not.toHaveBeenCalled();
+      await expect(gateRow(w)).resolves.toBeNull();
+    });
   });
 });
