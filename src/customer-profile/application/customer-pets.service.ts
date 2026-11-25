@@ -8,7 +8,10 @@ import {
   CUSTOMER_PETS_CLIENT,
   type CustomerPetsClient,
 } from '../../chatbot-api/domain/customer-pets.port';
-import type { CustomerPet as BackendPet } from '../../chatbot-api/domain/dtos/customer-pets.dto';
+import type {
+  CustomerPet as BackendPet,
+  ListPetsResult,
+} from '../../chatbot-api/domain/dtos/customer-pets.dto';
 import { parseMexicanWhatsAppPhone } from '../../sale-flow/domain/mexican-whatsapp-phone';
 import {
   LOCAL_PET_STORE,
@@ -222,9 +225,6 @@ export class CustomerPetsService {
    *  sender (even one left in flight by a timed-out task) and is computed
    *  from the list the previous write left. */
   private readonly localIo = new Map<string, Promise<void>>();
-  /** H7: per sender, twin keys of archived pets whose local twin entry
-   *  could not be removed: kept from upload until a removal lands. */
-  private readonly archivedTwins = new Map<string, Set<string>>();
   private readonly now: () => Date;
   private readonly newId: () => string;
 
@@ -889,9 +889,6 @@ export class CustomerPetsService {
     // The Customer already has a pet with this name (staff created it, or an
     // earlier uncertain create did): merge by PATCH, never a duplicate.
     const key = twinKey(current.name, current.species);
-    // H7: the twin of a pet archived by forgetPet whose removal did not
-    // land: never created again, removed instead.
-    if (await this.keptFromUpload(senderId, fence, key)) return;
     const same = scope.pets.filter(
       (candidate) => twinKey(candidate.name, candidate.species) === key,
     );
@@ -960,6 +957,33 @@ export class CustomerPetsService {
       );
       if (!frozen) return;
     }
+    // I1: durable guard (survives a restart): an ARCHIVED backend twin
+    // archived at or after this entry was written is the pet the customer
+    // asked to forget (its twin removal did not land): removed, never
+    // created. Unknown (list failed) → no create this round, backed off.
+    const archived = await this.archivedTwin(
+      scope.customerId,
+      new Set([key, twinKey(body.name, body.species)]),
+      pet.createdAt,
+    );
+    if (typeof archived === 'object') {
+      await this.attemptFailed(
+        senderId,
+        fence,
+        localId,
+        'create',
+        `archived twin check ${archived.failed}`,
+        attempts,
+      );
+      return;
+    }
+    if (archived === 'forgotten') {
+      this.logger.log(
+        'pet not uploaded: its backend twin was archived after it was stored (forgotten pet, removed locally)',
+      );
+      await this.removeLocal(senderId, fence, localId);
+      return;
+    }
     // C4: re-checked right before the create.
     if (this.profiles.isForgotten(senderId)) return;
     let result: Awaited<ReturnType<CustomerPetsClient['createPet']>>;
@@ -1019,6 +1043,40 @@ export class CustomerPetsService {
           attempts,
         );
     }
+  }
+
+  /**
+   * I1: whether the Customer has an ARCHIVED pet with one of these twin
+   * keys archived at or after `createdAt` (the local entry's creation):
+   * `forgotten`. One archived before is an old pet (`clear`: a new pet with
+   * the same name). A failed list, or an archived twin whose `archivedAt`
+   * cannot be read, is `{ failed }`: never a guess.
+   */
+  private async archivedTwin(
+    customerId: string,
+    keys: ReadonlySet<string>,
+    createdAt: string,
+  ): Promise<'forgotten' | 'clear' | { failed: string }> {
+    let listed: ListPetsResult;
+    try {
+      listed = await this.client.listPets(customerId, 'ALL');
+    } catch (error) {
+      return { failed: errorStatus(error) };
+    }
+    if (listed.kind !== 'ok') return { failed: listed.kind };
+    const since = Date.parse(createdAt);
+    let unknown = false;
+    for (const pet of listed.pets) {
+      if (
+        pet.status !== 'ARCHIVED' ||
+        !keys.has(twinKey(pet.name, pet.species))
+      )
+        continue;
+      const at = pet.archivedAt === null ? NaN : Date.parse(pet.archivedAt);
+      if (Number.isNaN(at) || Number.isNaN(since)) unknown = true;
+      else if (at >= since) return 'forgotten';
+    }
+    return unknown ? { failed: 'archivedAt unreadable' } : 'clear';
   }
 
   /** B1: true when a persisted next attempt time (if any) has passed. */
@@ -1286,8 +1344,8 @@ export class CustomerPetsService {
    *  hidden by B6) is that pet: removed so it is never uploaded later. The
    *  legacy pet it shadowed (B3 rule) is that pet too: cleared, so it does
    *  not resurface once the archived pet leaves the list. H7: a removal
-   *  that does not land (or cannot be checked) is logged and its key kept
-   *  from upload until a later removal lands. */
+   *  that does not land (or cannot be checked) is logged; I1: the upload's
+   *  archived-twin check keeps it from upload and removes it later. */
   private async forgetTwinEntries(
     senderId: string,
     fence: Fence,
@@ -1308,9 +1366,6 @@ export class CustomerPetsService {
       return;
     if (this.profiles.isForgotten(senderId)) return;
     this.logger.warn('pet archive: twin entry not removed, kept from upload');
-    const keys = this.archivedTwins.get(senderId) ?? new Set<string>();
-    keys.add(key);
-    this.archivedTwins.set(senderId, keys);
   }
 
   /** H7: removes the (non-ambiguous) local entries with this twin key.
@@ -1335,22 +1390,6 @@ export class CustomerPetsService {
     });
     if (wrote) return 'removed';
     return checked && !existed ? 'none' : 'failed';
-  }
-
-  /** H7: true when `key` belongs to an archived pet whose local twin is
-   *  still stored; tries the removal again (the key goes once it lands). */
-  private async keptFromUpload(
-    senderId: string,
-    fence: Fence,
-    key: string,
-  ): Promise<boolean> {
-    const keys = this.archivedTwins.get(senderId);
-    if (keys === undefined || !keys.has(key)) return false;
-    if ((await this.removeTwinEntries(senderId, fence, key)) !== 'failed') {
-      keys.delete(key);
-      if (keys.size === 0) this.archivedTwins.delete(senderId);
-    }
-    return true;
   }
 
   /** G3: the Customer's pets, every page of `?status=ALL`, deleted. */

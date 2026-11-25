@@ -3931,50 +3931,76 @@ export class MinimalCatalogAgentService {
           reason: z.string().min(1).max(500).optional(),
         }),
         execute: async ({ name, reason }) => {
-          // T4c-1-fix H1: whatever the outcome (even an unknown name), the
-          // same turn's captures never (re)create a pet with this name.
-          this.markPetForgotten(senderId, name);
-          const pets = this.pets;
-          // Without the pet store only the legacy single pet exists.
-          if (pets === undefined) {
-            const legacy = profiles.cached(senderId)?.pet?.name;
-            if (
-              legacy === undefined ||
-              foldPetName(legacy) !== foldPetName(name)
-            )
-              return toolError('no_pet_with_that_name');
-            return (await profiles.clearPet(senderId))
-              ? { ok: true as const, forgotten: true as const }
-              : toolError('pet_memory_unavailable');
+          // T4c-1-fix N1: whatever the outcome, this turn's deterministic
+          // capture is skipped. H1/I3: the window is open while the call
+          // runs (a parallel rememberPetDetails is refused) and stays only
+          // for a forgotten, pending or unknown-name (pinned) outcome.
+          const undo = this.markPetForgotten(senderId, name);
+          let keep = false;
+          try {
+            const result = await this.forgetPetNow(senderId, name, reason);
+            keep =
+              result.ok ||
+              ('error' in result && result.error === 'no_pet_with_that_name');
+            return result;
+          } finally {
+            if (!keep) undo();
           }
-          // T4b-fix A2: the pets of this turn are not loaded; no writes.
-          if (this.petsOverBudget.has(senderId))
-            return toolError('pet_memory_unavailable');
-          // Same budget as rememberPetDetails (D1); past it the archive goes
-          // on in the background and the tool says it is pending.
-          const forget = (async () => pets.forgetPet(senderId, name, reason))();
-          const outcome = await this.withinPetBudget(
-            forget.then(
-              (value) => ({ failed: false as const, value }),
-              (error: unknown) => ({ failed: true as const, error }),
-            ),
-          );
-          if (outcome === 'over_budget') {
-            this.logger.warn(
-              `customer pets forget pet over budget (${PET_PREPARE_BUDGET_MS} ms): continuing in the background`,
-            );
-            void this.petsInBackground('forget pet', () => forget);
-            return {
-              ok: true as const,
-              forgotten: false as const,
-              pending: true as const,
-            };
-          }
-          if (outcome.failed) throw outcome.error;
-          return forgetPetResult(outcome.value);
         },
       }),
     };
+  }
+
+  /** T4c-1 G2: the forgetPet tool body (store or legacy pet). */
+  private async forgetPetNow(
+    senderId: string,
+    name: string,
+    reason: string | undefined,
+  ): Promise<
+    | { ok: true; forgotten: true }
+    | { ok: true; forgotten: false; pending: true }
+    | { ok: false; error: string }
+  > {
+    const profiles = this.profiles;
+    const pets = this.pets;
+    // Without the pet store only the legacy single pet exists.
+    if (pets === undefined) {
+      const legacy = profiles?.cached(senderId)?.pet?.name;
+      if (
+        profiles === undefined ||
+        legacy === undefined ||
+        foldPetName(legacy) !== foldPetName(name)
+      )
+        return toolError('no_pet_with_that_name');
+      return (await profiles.clearPet(senderId))
+        ? { ok: true as const, forgotten: true as const }
+        : toolError('pet_memory_unavailable');
+    }
+    // T4b-fix A2: the pets of this turn are not loaded; no writes.
+    if (this.petsOverBudget.has(senderId))
+      return toolError('pet_memory_unavailable');
+    // Same budget as rememberPetDetails (D1); past it the archive goes
+    // on in the background and the tool says it is pending.
+    const forget = (async () => pets.forgetPet(senderId, name, reason))();
+    const outcome = await this.withinPetBudget(
+      forget.then(
+        (value) => ({ failed: false as const, value }),
+        (error: unknown) => ({ failed: true as const, error }),
+      ),
+    );
+    if (outcome === 'over_budget') {
+      this.logger.warn(
+        `customer pets forget pet over budget (${PET_PREPARE_BUDGET_MS} ms): continuing in the background`,
+      );
+      void this.petsInBackground('forget pet', () => forget);
+      return {
+        ok: true as const,
+        forgotten: false as const,
+        pending: true as const,
+      };
+    }
+    if (outcome.failed) throw outcome.error;
+    return forgetPetResult(outcome.value);
   }
 
   /**
@@ -4056,8 +4082,10 @@ export class MinimalCatalogAgentService {
   }
 
   /** T4c-1-fix H1: starts (or renews) the window of a forgotten name;
-   *  expired windows of every sender are dropped on the way. */
-  private markPetForgotten(senderId: string, name: string): void {
+   *  expired windows of every sender are dropped on the way. I3: returns
+   *  the undo that puts back the name's previous window (if this one is
+   *  still the current one). */
+  private markPetForgotten(senderId: string, name: string): () => void {
     const now = Date.now();
     for (const [sender, names] of this.forgottenPets) {
       for (const [folded, until] of names)
@@ -4065,9 +4093,20 @@ export class MinimalCatalogAgentService {
       if (names.size === 0) this.forgottenPets.delete(sender);
     }
     const names = this.forgottenPets.get(senderId) ?? new Map<string, number>();
-    names.set(foldPetName(name), now + PET_FORGOTTEN_WINDOW_MS);
+    const folded = foldPetName(name);
+    const previous = names.get(folded);
+    const until = now + PET_FORGOTTEN_WINDOW_MS;
+    names.set(folded, until);
     this.forgottenPets.set(senderId, names);
     this.petForgetTurns.add(senderId);
+    return () => {
+      const current = this.forgottenPets.get(senderId);
+      if (current?.get(folded) !== until) return;
+      if (previous !== undefined && previous > Date.now())
+        current.set(folded, previous);
+      else current.delete(folded);
+      if (current.size === 0) this.forgottenPets.delete(senderId);
+    };
   }
 
   /** T4c-1-fix H1: true while `name` is inside its forgotten window. */

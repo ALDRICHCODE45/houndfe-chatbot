@@ -4,7 +4,10 @@ import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import { CustomerProfileService } from '../../customer-profile/application/customer-profile.service';
-import { CustomerPetsService } from '../../customer-profile/application/customer-pets.service';
+import {
+  CustomerPetsService,
+  type ForgetPetOutcome,
+} from '../../customer-profile/application/customer-pets.service';
 import type { CustomerPetsClient } from '../../chatbot-api/domain/customer-pets.port';
 import type { CustomerPet as BackendPet } from '../../chatbot-api/domain/dtos/customer-pets.dto';
 import type { CustomerLookupResponse } from '../../chatbot-api/domain/dtos/customers.dto';
@@ -505,7 +508,8 @@ describe('T4b multi-pet memory on the customer route', () => {
   const client = () => {
     let n = 0;
     return {
-      listPets: jest.fn(),
+      // T4c-1-fix-2 I1: listed (ALL) before a create: no archived twin.
+      listPets: jest.fn().mockResolvedValue({ kind: 'ok', pets: [] }),
       createPet: jest.fn<
         Promise<unknown>,
         [string, Record<string, unknown>, string]
@@ -1684,6 +1688,141 @@ describe('T4c-1: allergies, forget one pet, forget my data (S5, S7)', () => {
       await expect(localPets(profileStore)).resolves.toMatchObject([
         { name: 'Bruno', species: 'perro' },
       ]);
+    });
+
+    describe('T4c-1-fix-2 I3: only a forgotten, pending or unknown-name outcome starts the window', () => {
+      const stubPets = (forgetPet: () => Promise<ForgetPetOutcome>) => ({
+        prepare: jest.fn(() => Promise.resolve()),
+        capture: jest.fn(() => Promise.resolve()),
+        captureAllergy: jest.fn(() => Promise.resolve()),
+        promptLines: jest.fn(() => null),
+        afterCheckout: jest.fn(() => Promise.resolve()),
+        forgetPet: jest.fn(forgetPet),
+      });
+
+      it.each<
+        [string, () => Promise<ForgetPetOutcome>, Record<string, unknown>]
+      >([
+        [
+          'ambiguous',
+          () => Promise.resolve('ambiguous'),
+          { ok: false, error: 'several_pets_with_that_name' },
+        ],
+        [
+          'failed',
+          () => Promise.resolve('failed'),
+          { ok: false, error: 'pet_memory_unavailable' },
+        ],
+        [
+          'unavailable',
+          () => Promise.resolve('unavailable'),
+          { ok: false, error: 'pet_memory_unavailable' },
+        ],
+      ])(
+        'a %s forgetPet, then rememberPetDetails for that name in a later turn → remembered',
+        async (_label, forgetPet, result) => {
+          const stub = stubPets(forgetPet);
+          const h = harness(
+            new InMemoryCustomerProfileStore(),
+            undefined,
+            stub,
+          );
+          await h.turn('olvida a Bruno', [
+            [call('forgetPet', { name: 'Bruno' }), say('¿De cuál se trata?')],
+          ]);
+          // The forgetting turn itself still skips the deterministic capture.
+          expect(stub.capture).not.toHaveBeenCalled();
+          await h.turn('es mi perro Bruno', [
+            [
+              call('rememberPetDetails', { name: 'Bruno', species: 'perro' }),
+              say('¡Anotado!'),
+            ],
+          ]);
+          expect(h.toolOutputs).toEqual([
+            result,
+            { ok: true, remembered: true },
+          ]);
+          expect(
+            (stub.capture.mock.calls as unknown[][]).map((c) => c[1]),
+          ).toContainEqual({ name: 'Bruno', species: 'perro' });
+        },
+      );
+
+      it('a thrown forgetPet does not start the window either', async () => {
+        const stub = stubPets(() => Promise.reject(new TypeError('down')));
+        const h = harness(new InMemoryCustomerProfileStore(), undefined, stub);
+        await h.turn('olvida a Bruno', [
+          [call('forgetPet', { name: 'Bruno' }), say('No pude.')],
+        ]);
+        await h.turn('es mi perro Bruno', [
+          [
+            call('rememberPetDetails', { name: 'Bruno', species: 'perro' }),
+            say('¡Anotado!'),
+          ],
+        ]);
+        expect(h.toolOutputs.at(-1)).toEqual({ ok: true, remembered: true });
+      });
+
+      it('a failure keeps a window an earlier successful forget started', async () => {
+        const stub = stubPets(() => Promise.resolve('archived'));
+        const h = harness(new InMemoryCustomerProfileStore(), undefined, stub);
+        await h.turn('Bruno ya no está', [
+          [call('forgetPet', { name: 'Bruno' }), say('Lo siento mucho.')],
+        ]);
+        stub.forgetPet.mockResolvedValue('failed');
+        await h.turn('olvida a Bruno', [
+          [call('forgetPet', { name: 'Bruno' }), say('No pude.')],
+        ]);
+        await h.turn('es mi perro Bruno', [
+          [
+            call('rememberPetDetails', { name: 'Bruno', species: 'perro' }),
+            say('Lo sé.'),
+          ],
+        ]);
+        expect(h.toolOutputs.at(-1)).toEqual({
+          ok: false,
+          error: 'pet_recently_forgotten',
+        });
+      });
+
+      it.each<
+        [string, () => Promise<ForgetPetOutcome>, Record<string, unknown>]
+      >([
+        [
+          'archived',
+          () => Promise.resolve('archived'),
+          { ok: true, forgotten: true },
+        ],
+        [
+          'unknown name',
+          () => Promise.resolve('none'),
+          { ok: false, error: 'no_pet_with_that_name' },
+        ],
+      ])(
+        'a %s forgetPet still blocks rememberPetDetails for that name in a later turn',
+        async (_label, forgetPet, result) => {
+          const stub = stubPets(forgetPet);
+          const h = harness(
+            new InMemoryCustomerProfileStore(),
+            undefined,
+            stub,
+          );
+          await h.turn('Bruno ya no está', [
+            [call('forgetPet', { name: 'Bruno' }), say('Lo siento mucho.')],
+          ]);
+          await h.turn('es mi perro Bruno', [
+            [
+              call('rememberPetDetails', { name: 'Bruno', species: 'perro' }),
+              say('Lo sé.'),
+            ],
+          ]);
+          expect(h.toolOutputs).toEqual([
+            result,
+            { ok: false, error: 'pet_recently_forgotten' },
+          ]);
+          expect(stub.capture).not.toHaveBeenCalled();
+        },
+      );
     });
   });
 });
