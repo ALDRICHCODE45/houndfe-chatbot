@@ -170,7 +170,8 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
             : { address: message.address }),
         },
       },
-      // T2-fix-2 K4: a hung pin request ends (the dispatcher's same bound).
+      // T2-fix-2 K4: a hung pin request ends; longer than the dispatcher's
+      // wait so a late accepted pin is still remembered (see the port).
       { origin: message.origin, timeoutMs: REPLY_LOCATION_REQUEST_TIMEOUT_MS },
     );
   }
