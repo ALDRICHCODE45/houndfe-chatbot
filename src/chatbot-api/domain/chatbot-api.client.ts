@@ -4,6 +4,7 @@ import {
   CustomerUpsertInput,
   CustomerUpsertResponse,
 } from './dtos/customers.dto';
+import type { BranchInfo } from './dtos/branch.dto';
 import type { PaymentDetail } from './dtos/payment-details.dto';
 import type { PayInStoreHold } from './dtos/pay-in-store.dto';
 import type { ExpirationIntakeInput } from './dtos/human-decisions-expiration.dto';
@@ -121,6 +122,12 @@ export interface ChatbotApiClient {
    *  Returns the active `PaymentDetail` or rejects with
    *  `ChatbotApiError { statusCode: 404, errorCode: 'NO_ACTIVE_PAYMENT_DETAIL' }`. */
   getPaymentDetails(): Promise<PaymentDetail>;
+  /** T2 H1: `GET /chatbot-api/branch` (scope `catalog:read`): the branch
+   *  name, address, hours and pin, each part nullable. Strict body (drift
+   *  rejects with `UpstreamError`), safe GET retry policy, a 5-minute
+   *  in-process cache that never keeps a failure. Optional so hand-built
+   *  fakes stay valid (no store-info tool without it). */
+  getBranch?(): Promise<BranchInfo>;
   /** `POST /chatbot-api/sales/:saleId/cancel` (scope `sales:write`).
    *  No client `X-Idempotency-Key` — idempotency is backend-derived
    *  from `sale:cancel:<saleId>` (SHA-256 of `{saleId, actorId, reason}`).

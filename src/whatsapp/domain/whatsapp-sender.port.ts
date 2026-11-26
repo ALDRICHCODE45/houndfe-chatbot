@@ -54,6 +54,19 @@ export interface OutboundDocument extends OutboundOriginOption {
   caption?: string;
 }
 
+/**
+ * T2 H3: native location message (Graph API `type: 'location'`), the store
+ * pin. Latitude in [-90, 90], longitude in [-180, 180]; `name` and `address`
+ * are optional labels shown on the pin.
+ */
+export interface OutboundLocation extends OutboundOriginOption {
+  to: string;
+  latitude: number;
+  longitude: number;
+  name?: string;
+  address?: string;
+}
+
 /** Mime types accepted for a media file sent from disk. */
 export const OUTBOUND_MEDIA_MIME_TYPES = [
   'image/jpeg',
@@ -170,6 +183,9 @@ export interface WhatsappSenderPort {
   sendImage?(message: OutboundImage): Promise<SendResult>;
   /** Unit 11. Optional like `sendImage`. */
   sendDocument?(message: OutboundDocument): Promise<SendResult>;
+  /** T2 H3. Optional like `sendImage`; callers send the text alone when it
+   *  is absent or fails. */
+  sendLocation?(message: OutboundLocation): Promise<SendResult>;
   /** Unit 11: upload a local file, then send it by media id. */
   sendMediaFile?(message: OutboundMediaFile): Promise<MediaSendResult>;
   /**

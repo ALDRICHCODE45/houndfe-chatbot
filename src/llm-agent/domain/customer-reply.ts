@@ -53,10 +53,22 @@ export type CustomerReplyInteractive =
       textFallback?: string;
     };
 
+/**
+ * T2 H3: the store pin, a WhatsApp location message the dispatcher sends
+ * AFTER the text (a failed pin never drops or repeats the text).
+ */
+export type CustomerReplyLocation = {
+  latitude: number;
+  longitude: number;
+  name?: string;
+  address?: string;
+};
+
 export interface CustomerReply {
   reply: string;
   media?: readonly CustomerReplyMedia[];
   interactive?: CustomerReplyInteractive;
+  location?: CustomerReplyLocation;
 }
 
 /** Meta interactive limits (Cloud API). */

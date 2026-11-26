@@ -29,6 +29,7 @@ import {
 import {
   interactiveReplyText,
   type CustomerReply,
+  type CustomerReplyLocation,
   type CustomerReplyMedia,
 } from '../../llm-agent/domain/customer-reply';
 import { ProductImageRecognitionService } from '../../product-image/application/product-image-recognition.service';
@@ -147,6 +148,8 @@ const WINDOW_REOPENING_MIRROR_TYPES: ReadonlySet<string> = new Set([
  *      sendImage (an image failure only warns). S4:
  *      a reply with buttons/list goes out through the optional
  *      sendInteractive; when absent or failing, the same text is sent.
+ *      T2 H3: a store pin goes AFTER the text via the optional
+ *      sendLocation (a pin failure only warns; the text is never repeated).
  *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen (claim → DONE) —
  *      only after the message was handled; a failed send releases the claim
  *      so Meta re-delivers and retries.
@@ -979,7 +982,35 @@ export class WebhookDispatcherService {
     // an observation failure can never undo the accepted send.
     minimal.onSent?.();
     for (const id of providerMessageIds) this.recentOutbound.remember(id);
+    // T2 H3: the store pin goes after the text, best effort. The text is
+    // already out, so the mode is re-read as after a partial send (a read
+    // error drops the pin, never redelivers the turn).
+    if (
+      minimal.location !== undefined &&
+      !(await this.mutedAfterPartial(message, 'reply location', true))
+    )
+      await this.sendReplyLocation(message.senderId, minimal.location);
     await this.markSeenSafely(message.messageId);
+  }
+
+  /** T2 H3: best effort. A failed or unsupported pin is only logged; the
+   * text it follows was sent once and is never repeated. */
+  private async sendReplyLocation(
+    to: string,
+    location: CustomerReplyLocation,
+  ): Promise<void> {
+    if (this.whatsappSender.sendLocation === undefined) return;
+    try {
+      const { providerMessageId } = await this.whatsappSender.sendLocation({
+        to,
+        ...location,
+      });
+      this.recentOutbound.remember(providerMessageId);
+    } catch (error) {
+      this.logger.warn(
+        `reply location failed for ${maskConversationRef(to)}; the text was sent: ${describeError(error)}`,
+      );
+    }
   }
 
   /**

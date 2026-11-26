@@ -209,6 +209,10 @@ const pickupLocation = z
 export type CheckoutPickupLocation = z.infer<typeof pickupLocation>;
 /** The same strict shape, for state that remembers the store (pay in store). */
 export const CheckoutPickupLocationSchema = pickupLocation;
+/** T2 H1: the branch read (`GET /chatbot-api/branch`) reuses these parts. */
+export const PickupAddressSchema = pickupAddress;
+export const PickupHoursSchema = pickupHours;
+export const PickupCoordinatesSchema = pickupCoordinates;
 
 const customerResponse = z
   .object({
