@@ -1,9 +1,13 @@
-import type { CustomerProfileStore } from '../domain/customer-profile';
+import type {
+  CustomerProfilePatch,
+  CustomerProfileStore,
+} from '../domain/customer-profile';
 
 /**
  * Shared contract for every `CustomerProfileStore` adapter: round-trip,
- * merge-only upsert (a known field is never erased), pet facts merged field
- * by field, bounded/sanitized text, invalid sender ids refused, delete.
+ * merge-only upsert (a known field is never erased), bounded/sanitized
+ * text, invalid sender ids refused, delete. T6b: a `pet` in a patch from
+ * an older caller is ignored (the profile keeps no pet).
  */
 export type CustomerProfileStoreFactory = () => Promise<{
   store: CustomerProfileStore;
@@ -58,7 +62,6 @@ export function runCustomerProfileStoreContract(
           register: 'tu',
           emojis: true,
           tone: 'casual',
-          pet: { name: 'Luna', species: 'perro' },
           lastOrder: {
             folio: 'A-1',
             confirmedAt: '2026-11-01T10:00:00.000Z',
@@ -73,7 +76,8 @@ export function runCustomerProfileStoreContract(
           displayName: null,
           preferredName: '  ',
           register: null,
-          pet: { breed: 'labrador', name: null },
+          // One real value, so the write happens (T6b: was a pet fact).
+          tone: 'casual',
           lastOrder: null,
         },
         T2,
@@ -85,7 +89,6 @@ export function runCustomerProfileStoreContract(
         register: 'tu',
         emojis: true,
         tone: 'casual',
-        pet: { name: 'Luna', species: 'perro', breed: 'labrador' },
         lastOrder: {
           folio: 'A-1',
           confirmedAt: '2026-11-01T10:00:00.000Z',
@@ -124,11 +127,11 @@ export function runCustomerProfileStoreContract(
     it('stores sanitized, bounded text', async () => {
       const saved = await store.upsert(
         SENDER,
-        { displayName: ' A\u0000na\n ', pet: { notes: 'x'.repeat(900) } },
+        { displayName: ' A\u0000na\n ', preferredName: 'x'.repeat(900) },
         T1,
       );
       expect(saved?.displayName).toBe('Ana');
-      expect(saved?.pet?.notes).toHaveLength(200);
+      expect(saved?.preferredName).toHaveLength(40);
     });
 
     it('an empty patch creates nothing', async () => {
@@ -145,32 +148,32 @@ export function runCustomerProfileStoreContract(
       await expect(store.read('sender-1')).resolves.toBeNull();
     });
 
-    it('clears only the legacy pet (T4c-1 G2), keeping every other field', async () => {
-      await store.upsert(
-        SENDER,
-        { displayName: 'Ana', pet: { name: 'Luna', species: 'perro' } },
-        T1,
-      );
-      await expect(store.clearPet(SENDER, T2)).resolves.toBe(true);
-      await expect(store.read(SENDER)).resolves.toEqual({
+    it('T6b: a `pet` in a patch from an older caller is ignored (never stored, never read back)', async () => {
+      // SAFETY: an older build's patch shape, no longer in the type.
+      const legacy = {
+        displayName: 'Ana',
+        pet: { name: 'Luna', species: 'perro' },
+      } as unknown as CustomerProfilePatch;
+      const saved = await store.upsert(SENDER, legacy, T1);
+      const expected = {
         senderId: SENDER,
         displayName: 'Ana',
         register: 'usted',
         emojis: false,
         tone: 'neutral',
-        updatedAt: T2.toISOString(),
-      });
-      // Nothing left to clear, unknown or invalid sender: false, no row.
-      await expect(store.clearPet(SENDER, T2)).resolves.toBe(false);
-      await expect(store.clearPet(OTHER, T2)).resolves.toBe(false);
+        updatedAt: T1.toISOString(),
+      };
+      expect(saved).toEqual(expected);
+      await expect(store.read(SENDER)).resolves.toEqual(expected);
+      // A pet alone is an empty patch: no row for an unknown sender.
+      await expect(
+        store.upsert(
+          OTHER,
+          { pet: { name: 'Max' } } as unknown as CustomerProfilePatch,
+          T1,
+        ),
+      ).resolves.toBeNull();
       await expect(store.read(OTHER)).resolves.toBeNull();
-      await expect(store.clearPet('sender-1', T2)).resolves.toBe(false);
-      // A later pet fact starts a fresh pet (not merged into the old one).
-      await store.upsert(SENDER, { pet: { name: 'Max' } }, T2);
-      await expect(store.read(SENDER)).resolves.toMatchObject({
-        pet: { name: 'Max' },
-      });
-      expect((await store.read(SENDER))?.pet?.species).toBeUndefined();
     });
 
     it('deletes the profile', async () => {

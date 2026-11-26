@@ -38,7 +38,7 @@ describe('PostgresCustomerProfileStore SQL (no database)', () => {
     const { pool, store } = fake([[]]);
     await store.upsert(
       SENDER,
-      { displayName: 'Ana', pet: { name: 'Luna' } },
+      { displayName: 'Ana' },
       new Date('2026-11-07T00:00:00.000Z'),
     );
     expect(pool.calls).toHaveLength(1);
@@ -48,25 +48,37 @@ describe('PostgresCustomerProfileStore SQL (no database)', () => {
     expect(sql).toMatch(
       /display_name = COALESCE\(EXCLUDED\.display_name, customer_profiles\.display_name\)/,
     );
-    expect(sql).toMatch(/customer_profiles\.pet, '\{\}'::jsonb\) \|\|/);
     expect(params[0]).toBe(SENDER);
     expect(params).toContain('Ana');
-    expect(params).toContain(JSON.stringify({ name: 'Luna' }));
   });
 
-  it('clears the legacy pet in one UPDATE that touches only pet and updated_at (T4c-1 G2)', async () => {
-    const { pool, store } = fake([[{}]]);
-    await expect(
-      store.clearPet(SENDER, new Date('2026-11-24T00:00:00.000Z')),
-    ).resolves.toBe(true);
-    expect(pool.calls).toEqual([
-      {
-        sql: 'UPDATE customer_profiles SET pet = NULL, updated_at = $2 WHERE sender_id = $1 AND pet IS NOT NULL',
-        params: [SENDER, '2026-11-24T00:00:00.000Z'],
-      },
+  it('T6b: no statement reads or writes the dropped `pet` column (nor the local `pets` list)', async () => {
+    const { pool, store } = fake([[], [], []]);
+    await store.read(SENDER);
+    await store.upsert(
+      SENDER,
+      // SAFETY: an older caller's patch shape, no longer in the type.
+      { displayName: 'Ana', pet: { name: 'Luna' } } as never,
+      new Date('2026-11-07T00:00:00.000Z'),
+    );
+    await store.delete(SENDER);
+    expect(pool.calls).toHaveLength(3);
+    for (const { sql, params } of pool.calls) {
+      expect(sql).not.toMatch(/\bpets?\b/);
+      expect(JSON.stringify(params)).not.toContain('Luna');
+    }
+    expect(pool.calls[1].params).toEqual([
+      SENDER,
+      'Ana',
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      '2026-11-07T00:00:00.000Z',
     ]);
-    await expect(store.clearPet('sender-1', new Date())).resolves.toBe(false);
-    expect(pool.calls).toHaveLength(1);
   });
 
   it('never queries for an invalid sender or an empty first patch', async () => {
@@ -79,6 +91,34 @@ describe('PostgresCustomerProfileStore SQL (no database)', () => {
     expect(pool.calls).toHaveLength(0);
   });
 
+  it('T6b: a row still carrying a `pet` value from an older build maps without it', async () => {
+    const { store } = fake([
+      [
+        {
+          sender_id: SENDER,
+          display_name: 'Ana',
+          preferred_name: null,
+          register: 'usted',
+          emojis: false,
+          tone: 'neutral',
+          pet: { name: 'Luna', species: 'perro' },
+          last_order_folio: null,
+          last_order_confirmed_at: null,
+          last_order_total_cents: null,
+          updated_at: new Date('2026-11-07T00:00:00.000Z'),
+        },
+      ],
+    ]);
+    await expect(store.read(SENDER)).resolves.toEqual({
+      senderId: SENDER,
+      displayName: 'Ana',
+      register: 'usted',
+      emojis: false,
+      tone: 'neutral',
+      updatedAt: '2026-11-07T00:00:00.000Z',
+    });
+  });
+
   it('maps a row back to the profile shape', async () => {
     const { store } = fake([
       [
@@ -89,7 +129,6 @@ describe('PostgresCustomerProfileStore SQL (no database)', () => {
           register: 'tu',
           emojis: true,
           tone: 'casual',
-          pet: { name: 'Luna' },
           last_order_folio: 'A-1',
           last_order_confirmed_at: new Date('2026-11-01T10:00:00.000Z'),
           last_order_total_cents: '89900',
@@ -103,7 +142,6 @@ describe('PostgresCustomerProfileStore SQL (no database)', () => {
       register: 'tu',
       emojis: true,
       tone: 'casual',
-      pet: { name: 'Luna' },
       lastOrder: {
         folio: 'A-1',
         confirmedAt: '2026-11-01T10:00:00.000Z',
@@ -159,8 +197,8 @@ ddescribe('customer_profiles migration 3700 + store (real PostgreSQL)', () => {
       'last_order_confirmed_at',
       'last_order_folio',
       'last_order_total_cents',
-      'pet',
-      // T4b (migration 5700): the prospect's local pet list.
+      // T4b (migration 5700): the prospect's local pet list. T6d
+      // (migration 5900): the legacy `pet` column is dropped.
       'pets',
       'preferred_name',
       'register',
@@ -168,17 +206,14 @@ ddescribe('customer_profiles migration 3700 + store (real PostgreSQL)', () => {
       'tone',
       'updated_at',
     ]);
-    const insert = (sender: string, register = 'usted', pet = '{}') =>
+    const insert = (sender: string, register = 'usted') =>
       pool.query(
-        `INSERT INTO customer_profiles (sender_id, register, pet, created_at, updated_at)
-         VALUES ($1, $2, $3::jsonb, now(), now())`,
-        [sender, register, pet],
+        `INSERT INTO customer_profiles (sender_id, register, created_at, updated_at)
+         VALUES ($1, $2, now(), now())`,
+        [sender, register],
       );
     await expect(insert('abc')).rejects.toMatchObject({ code: '23514' });
     await expect(insert('5215550009999', 'vos')).rejects.toMatchObject({
-      code: '23514',
-    });
-    await expect(insert('5215550009999', 'tu', '[]')).rejects.toMatchObject({
       code: '23514',
     });
     await expect(
@@ -217,12 +252,12 @@ ddescribe('customer_profiles migration 3700 + store (real PostgreSQL)', () => {
   it('a profile survives a new adapter instance (restart)', async () => {
     await new PostgresCustomerProfileStore(pool).upsert(
       SENDER,
-      { register: 'tu', pet: { name: 'Luna' } },
+      { register: 'tu', preferredName: 'Anita' },
       new Date('2026-11-07T00:00:00.000Z'),
     );
     await expect(
       new PostgresCustomerProfileStore(pool).read(SENDER),
-    ).resolves.toMatchObject({ register: 'tu', pet: { name: 'Luna' } });
+    ).resolves.toMatchObject({ register: 'tu', preferredName: 'Anita' });
     await pool.query('TRUNCATE TABLE customer_profiles');
   });
 });

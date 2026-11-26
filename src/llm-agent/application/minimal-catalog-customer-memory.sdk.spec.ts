@@ -243,14 +243,13 @@ describe('S1 persistent customer memory', () => {
     expect(next.system()).toContain('Estilo del cliente: tutea');
   });
 
-  it('adds the "Cliente conocido" line with name, pet and last order (never the phone)', async () => {
+  it('adds the "Cliente conocido" line with name and last order (never the phone)', async () => {
     const profileStore = new InMemoryCustomerProfileStore();
     await profileStore.upsert(
       SENDER,
       {
         displayName: 'Ana P',
         preferredName: 'Anita',
-        pet: { name: 'Luna', species: 'perro', breed: 'labrador' },
         lastOrder: {
           folio: 'A-12',
           confirmedAt: '2026-11-01T10:00:00.000Z',
@@ -267,79 +266,9 @@ describe('S1 persistent customer memory', () => {
       .find((text) => text.startsWith('Cliente conocido:'));
     expect(line).toBeDefined();
     expect(line).toContain('"Anita"');
-    expect(line).toContain('"Luna"');
+    expect(line).not.toContain('mascota "');
     expect(line).toContain('A-12');
     expect(h.system()).not.toContain(SENDER);
-  });
-
-  it('H2: known pet facts reach the prompt as a "Mascota conocida" search hint, not duplicated', async () => {
-    const profileStore = new InMemoryCustomerProfileStore();
-    await profileStore.upsert(
-      SENDER,
-      {
-        register: 'tu',
-        preferredName: 'Mariana',
-        pet: {
-          name: 'Luna',
-          species: 'perro',
-          breed: 'labrador',
-          ageText: '3 años',
-        },
-      },
-      NOW,
-    );
-    const h = harness(profileStore);
-    await h.turn('busco croquetas para ella');
-    const lines = h.system().split('\n');
-    const known = lines.find((text) => text.startsWith('Cliente conocido:'));
-    const pet = lines.find((text) => text.startsWith('Mascota conocida:'));
-    expect(known).toContain('"Mariana"');
-    expect(known).not.toContain('labrador');
-    expect(pet).toContain('"Luna", perro, raza "labrador" (raza grande)');
-    expect(pet).toContain('edad "3 años" (adulto)');
-    expect(pet).toContain('«croquetas perro adulto raza grande»');
-    expect(pet).toMatch(/no pregunte especie, raza ni tamaño ya conocidos/);
-  });
-
-  it('captures a pet statement deterministically when the model calls no tool, and uses it after a restart', async () => {
-    const profileStore = new InMemoryCustomerProfileStore();
-    const h = harness(profileStore);
-    await h.turn('mi perrita Luna es una labrador de 3 años 🐾', [
-      [say('¡Qué linda Luna! 🐾')],
-    ]);
-    await expect(profileStore.read(SENDER)).resolves.toMatchObject({
-      pet: {
-        name: 'Luna',
-        species: 'perro',
-        breed: 'labrador',
-        size: 'grande',
-        ageText: '3 años',
-      },
-    });
-    const next = harness(profileStore);
-    await next.turn('busco croquetas para ella');
-    expect(next.system()).toContain('«croquetas perro adulto raza grande»');
-  });
-
-  it('a product query is never stored as a pet fact', async () => {
-    const profileStore = new InMemoryCustomerProfileStore();
-    const h = harness(profileStore);
-    await h.turn('busco croquetas para perro grande');
-    expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
-  });
-
-  it('never mixes another pet into the stored one', async () => {
-    const profileStore = new InMemoryCustomerProfileStore();
-    await profileStore.upsert(
-      SENDER,
-      { pet: { name: 'Luna', species: 'perro', breed: 'labrador' } },
-      NOW,
-    );
-    const h = harness(profileStore);
-    await h.turn('mi perro Max es un husky');
-    await expect(profileStore.read(SENDER)).resolves.toMatchObject({
-      pet: { name: 'Luna', breed: 'labrador' },
-    });
   });
 
   it.each(['adjustCartItem', 'prepareCartItem'])(
@@ -372,7 +301,7 @@ describe('S1 persistent customer memory', () => {
         [call(toolName, input), say('¡Listo, agregado!')],
       ]);
       expect(await h.cartItems()).toEqual([]);
-      expect((await profileStore.read(SENDER))?.pet?.name).toBe('Luna');
+      expect((await profileStore.read(SENDER)) ?? {}).not.toHaveProperty('pet');
     },
   );
 
@@ -382,7 +311,7 @@ describe('S1 persistent customer memory', () => {
     expect(h.system()).not.toContain('Cliente conocido:');
   });
 
-  it('rememberPetDetails stores only what the model passes, merged with earlier facts', async () => {
+  it('T6b: without the pet store nothing about a pet is remembered (tool or deterministic) and no pet is known', async () => {
     const profileStore = new InMemoryCustomerProfileStore();
     const h = harness(profileStore);
     expect(Object.keys(h.seen.at(-1)?.tools ?? {})).toEqual([]);
@@ -400,18 +329,23 @@ describe('S1 persistent customer memory', () => {
     expect(Object.keys(h.seen[0].tools ?? {})).toContain('rememberPetDetails');
     expect(h.system()).toMatch(/rememberPetDetails/);
     expect(h.system()).toMatch(/una sola pregunta sobre la mascota/i);
-    await h.turn('ya está grande, pesa 30 kg', [
-      [call('rememberPetDetails', { size: 'grande' }), say('Entendido.')],
+    expect(h.toolOutputs).toEqual([{ ok: true, remembered: false }]);
+    expect((await profileStore.read(SENDER)) ?? {}).not.toHaveProperty('pet');
+    await h.turn('Luna ya no está', [
+      [call('forgetPet', { name: 'Luna' }), say('Lo siento mucho.')],
     ]);
-    await expect(profileStore.read(SENDER)).resolves.toMatchObject({
-      pet: {
-        name: 'Luna',
-        species: 'perro',
-        breed: 'labrador',
-        ageText: '3 años',
-        size: 'grande',
-      },
+    expect(h.toolOutputs.at(-1)).toEqual({
+      ok: false,
+      error: 'no_pet_with_that_name',
     });
+    await h.turn('busco croquetas para ella');
+    const lines = h.system().split('\n');
+    expect(lines.some((line) => line.startsWith('Mascota conocida:'))).toBe(
+      false,
+    );
+    expect(lines.some((line) => line.startsWith('Cliente conocido:'))).toBe(
+      false,
+    );
   });
 
   it('stores the WhatsApp profile name and an explicit "llámame X"', async () => {
@@ -432,7 +366,7 @@ describe('S1 persistent customer memory', () => {
     const profileStore = new InMemoryCustomerProfileStore();
     await profileStore.upsert(
       SENDER,
-      { preferredName: 'Anita', register: 'tu', pet: { name: 'Luna' } },
+      { preferredName: 'Anita', register: 'tu' },
       NOW,
     );
     const h = harness(profileStore);
@@ -460,7 +394,6 @@ describe('S1 persistent customer memory', () => {
       read: () => Promise.reject(new Error('down')),
       upsert: () => Promise.reject(new Error('down')),
       delete: () => Promise.reject(new Error('down')),
-      clearPet: () => Promise.reject(new Error('down')),
     };
     const h = harness(failing);
     const result = await h.turn('hola', [[say('Hola, ¿en qué le ayudo?')]]);
@@ -594,7 +527,7 @@ describe('T4b multi-pet memory on the customer route', () => {
     expect(h.system()).not.toMatch(/no suponga para cuál/i);
   });
 
-  it('two pets named in one message through rememberPetDetails → two backend creates; the legacy pet column is not written', async () => {
+  it('two pets named in one message through rememberPetDetails → two backend creates; nothing written to the profile', async () => {
     const profileStore = new InMemoryCustomerProfileStore();
     const pets = client();
     const h = harness(profileStore, { lookup: customer([]), client: pets });
@@ -639,7 +572,7 @@ describe('T4b multi-pet memory on the customer route', () => {
     expect(pets.patchPet.mock.calls.map((c) => [c[1], c[2]])).toEqual([
       ['c0000000-0000-4000-8000-000000000001', { version: 1, size: 'LARGE' }],
     ]);
-    expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
+    expect((await profileStore.read(SENDER)) ?? {}).not.toHaveProperty('pet');
   });
 
   it("a prospect's pet statement goes to the local list (no backend write), never to the cart", async () => {
@@ -664,7 +597,7 @@ describe('T4b multi-pet memory on the customer route', () => {
     await flushCapture();
     expect(await h.cartItems()).toEqual([]);
     expect(pets.createPet).not.toHaveBeenCalled();
-    expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
+    expect((await profileStore.read(SENDER)) ?? {}).not.toHaveProperty('pet');
     await expect(
       new InMemoryLocalPetStore(profileStore).read(SENDER),
     ).resolves.toMatchObject([
@@ -847,8 +780,8 @@ describe('T4b-fix A2-A4: the pet store never holds the reply', () => {
     expect((result as { reply: string }).reply).toBe('¡Qué lindo Max!');
     await flush();
     expect(pets.capture).not.toHaveBeenCalled();
-    // The legacy pet column is not a fallback either.
-    expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
+    // Nothing goes to the profile either.
+    expect((await profileStore.read(SENDER)) ?? {}).not.toHaveProperty('pet');
     finish();
     await flush();
     // Next turn: the prepare is fast again, captures run.
@@ -856,7 +789,7 @@ describe('T4b-fix A2-A4: the pet store never holds the reply', () => {
     await h.turn('mi perro Max es un husky', [[say('¡Qué lindo Max!')]]);
     await flush();
     expect(pets.capture.mock.calls).toEqual([
-      [SENDER, expect.objectContaining({ name: 'Max' }), undefined],
+      [SENDER, expect.objectContaining({ name: 'Max' })],
     ]);
     expect(warnings()).toEqual([
       'customer pets prepare over budget (1500 ms): continuing without pet writes this turn',
@@ -933,7 +866,6 @@ describe('T4b-fix A2-A4: the pet store never holds the reply', () => {
       1,
       SENDER,
       expect.objectContaining(MAX_TOOL),
-      undefined,
     );
     expect(warnings()).toEqual([]);
   });
@@ -1304,30 +1236,6 @@ describe('T4c-1: allergies, forget one pet, forget my data (S5, S7)', () => {
     },
   );
 
-  it('G2: without the pet store, forgetPet clears the matching legacy pet', async () => {
-    const profileStore = new InMemoryCustomerProfileStore();
-    await profileStore.upsert(
-      SENDER,
-      { preferredName: 'Ana', pet: { name: 'Luna', species: 'perro' } },
-      NOW,
-    );
-    const h = harness(profileStore);
-    await h.turn('Luna ya no está', [
-      [call('forgetPet', { name: 'luna' }), say('Lo siento mucho.')],
-    ]);
-    expect(h.toolOutputs).toEqual([{ ok: true, forgotten: true }]);
-    const stored = await profileStore.read(SENDER);
-    expect(stored?.pet).toBeUndefined();
-    expect(stored?.preferredName).toBe('Ana');
-    await h.turn('olvida a Toby', [
-      [call('forgetPet', { name: 'Toby' }), say('No lo encuentro.')],
-    ]);
-    expect(h.toolOutputs.at(-1)).toEqual({
-      ok: false,
-      error: 'no_pet_with_that_name',
-    });
-  });
-
   it('G2: a forgetPet that never settles waits the 1500 ms budget, then returns pending', async () => {
     jest.useFakeTimers({
       doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'],
@@ -1530,7 +1438,7 @@ describe('T4c-1: allergies, forget one pet, forget my data (S5, S7)', () => {
       expect(pets.createPet).not.toHaveBeenCalled();
       expect(pets.patchPet).not.toHaveBeenCalled();
       await expect(localPets(profileStore)).resolves.toEqual([]);
-      expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
+      expect((await profileStore.read(SENDER)) ?? {}).not.toHaveProperty('pet');
       // Next turn inside the window: still not re-created.
       await h.turn('mi perrito Bruno era muy bueno', [[say('Lo sé.')]]);
       await flush();
@@ -1618,32 +1526,6 @@ describe('T4c-1: allergies, forget one pet, forget my data (S5, S7)', () => {
       ]);
       await expect(localPets(profileStore)).resolves.toEqual([]);
       expect(pets.createPet).not.toHaveBeenCalled();
-    });
-
-    it('without the pet store: the legacy pet stays cleared (no deterministic patch, no rememberPetDetails)', async () => {
-      const profileStore = new InMemoryCustomerProfileStore();
-      await profileStore.upsert(
-        SENDER,
-        { preferredName: 'Ana', pet: { name: 'Bruno', species: 'perro' } },
-        NOW,
-      );
-      const h = harness(profileStore);
-      await h.turn(FORGET_TEXT, [
-        [
-          call('forgetPet', { name: 'Bruno' }),
-          call('rememberPetDetails', { name: 'Bruno', species: 'perro' }),
-          say('Lo siento mucho.'),
-        ],
-      ]);
-      expect(h.toolOutputs).toEqual([
-        { ok: true, forgotten: true },
-        { ok: false, error: 'pet_recently_forgotten' },
-      ]);
-      const stored = await profileStore.read(SENDER);
-      expect(stored?.pet).toBeUndefined();
-      expect(stored?.preferredName).toBe('Ana');
-      await h.turn('mi perrito Bruno era muy bueno', [[say('Lo sé.')]]);
-      expect((await profileStore.read(SENDER))?.pet).toBeUndefined();
     });
 
     it('another pet named in the same window is still captured', async () => {

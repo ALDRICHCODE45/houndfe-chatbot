@@ -10,7 +10,6 @@ const failing = (): CustomerProfileStore => ({
   read: () => Promise.reject(new Error('db down')),
   upsert: () => Promise.reject(new Error('db down')),
   delete: () => Promise.reject(new Error('db down')),
-  clearPet: () => Promise.reject(new Error('db down')),
 });
 
 describe('CustomerProfileService', () => {
@@ -34,13 +33,25 @@ describe('CustomerProfileService', () => {
     await service.load(SENDER);
     await service.record(SENDER, { displayName: 'Ana', register: 'tu' });
     await service.record(SENDER, { displayName: 'Ana', register: 'tu' });
-    await service.record(SENDER, { pet: { name: 'Luna' } });
+    await service.record(SENDER, { emojis: true });
     expect(upsert).toHaveBeenCalledTimes(2);
     expect(service.cached(SENDER)).toMatchObject({
       displayName: 'Ana',
       register: 'tu',
-      pet: { name: 'Luna' },
+      emojis: true,
     });
+  });
+
+  it('T6b: a `pet` from an older caller writes nothing', async () => {
+    const store = new InMemoryCustomerProfileStore();
+    const upsert = jest.spyOn(store, 'upsert');
+    const service = new CustomerProfileService(store, clock);
+    await service.load(SENDER);
+    await service.record(SENDER, {
+      pet: { name: 'Luna' },
+    } as unknown as Parameters<CustomerProfileService['record']>[1]);
+    expect(upsert).not.toHaveBeenCalled();
+    await expect(store.read(SENDER)).resolves.toBeNull();
   });
 
   it('never throws when the store fails', async () => {
@@ -51,28 +62,7 @@ describe('CustomerProfileService', () => {
       service.record(SENDER, { displayName: 'Ana' }),
     ).resolves.toBeUndefined();
     await expect(service.styleFor(SENDER)).resolves.toBeNull();
-    await expect(service.clearPet(SENDER)).resolves.toBe(false);
     await expect(service.forget(SENDER)).resolves.toBe(false);
-  });
-
-  it('clearPet drops the legacy pet in the store and the cache (T4c-1 G2); skipped once forgotten', async () => {
-    const store = new InMemoryCustomerProfileStore();
-    const service = new CustomerProfileService(store, clock);
-    await service.record(SENDER, {
-      displayName: 'Ana',
-      pet: { name: 'Luna', species: 'perro' },
-    });
-    await expect(service.clearPet(SENDER)).resolves.toBe(true);
-    expect(service.cached(SENDER)).toMatchObject({ displayName: 'Ana' });
-    expect(service.cached(SENDER)?.pet).toBeUndefined();
-    expect((await store.read(SENDER))?.pet).toBeUndefined();
-    // A cleared pet is not a no-op base for the next fact.
-    await service.record(SENDER, { pet: { name: 'Luna' } });
-    expect((await store.read(SENDER))?.pet).toEqual({ name: 'Luna' });
-    await service.forget(SENDER);
-    const clear = jest.spyOn(store, 'clearPet');
-    await expect(service.clearPet(SENDER)).resolves.toBe(false);
-    expect(clear).not.toHaveBeenCalled();
   });
 
   it('styleFor reads the stored style, null when there is no profile', async () => {

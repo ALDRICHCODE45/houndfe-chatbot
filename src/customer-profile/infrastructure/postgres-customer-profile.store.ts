@@ -5,7 +5,6 @@ import {
   isEmptyProfilePatch,
   isValidProfileSenderId,
   normalizeCustomerProfilePatch,
-  type CustomerPet,
   type CustomerProfile,
   type CustomerProfilePatch,
   type CustomerProfileStore,
@@ -22,7 +21,6 @@ interface CustomerProfileRow {
   register: CustomerRegister;
   emojis: boolean;
   tone: CustomerTone;
-  pet: CustomerPet | null;
   last_order_folio: string | null;
   last_order_confirmed_at: Date | null;
   last_order_total_cents: string | number | null;
@@ -31,42 +29,38 @@ interface CustomerProfileRow {
 
 type Queryable = Pick<Pool, 'query'>;
 
+/** T6b: never `pet` (dropped by migration 5900) nor the local `pets` list
+ *  (PostgresLocalPetStore owns it). */
 const COLUMNS =
-  'sender_id, display_name, preferred_name, register, emojis, tone, pet, ' +
+  'sender_id, display_name, preferred_name, register, emojis, tone, ' +
   'last_order_folio, last_order_confirmed_at, last_order_total_cents, updated_at';
 
 /**
  * Merge-only upsert in ONE statement: every column keeps the stored value
- * when the patch has none (COALESCE), pet facts are concatenated per key,
- * and the last-order pointer is replaced as a whole. No read-modify-write,
- * so concurrent writers never erase each other's fields.
+ * when the patch has none (COALESCE), and the last-order pointer is
+ * replaced as a whole. No read-modify-write, so concurrent writers never
+ * erase each other's fields.
  */
 const UPSERT = `
 INSERT INTO customer_profiles (${COLUMNS}, created_at)
 VALUES ($1, $2, $3, COALESCE($4::text, 'usted'), COALESCE($5::boolean, false),
-        COALESCE($6::text, 'neutral'), $7::jsonb, $8::text, $9::timestamptz,
-        $10::bigint, $11::timestamptz, $11::timestamptz)
+        COALESCE($6::text, 'neutral'), $7::text, $8::timestamptz,
+        $9::bigint, $10::timestamptz, $10::timestamptz)
 ON CONFLICT (sender_id) DO UPDATE SET
   display_name = COALESCE(EXCLUDED.display_name, customer_profiles.display_name),
   preferred_name = COALESCE(EXCLUDED.preferred_name, customer_profiles.preferred_name),
   register = COALESCE($4::text, customer_profiles.register),
   emojis = COALESCE($5::boolean, customer_profiles.emojis),
   tone = COALESCE($6::text, customer_profiles.tone),
-  pet = CASE WHEN $7::jsonb IS NULL THEN customer_profiles.pet
-             ELSE COALESCE(customer_profiles.pet, '{}'::jsonb) || $7::jsonb END,
-  last_order_folio = COALESCE($8::text, customer_profiles.last_order_folio),
-  last_order_confirmed_at = CASE WHEN $8::text IS NULL
-    THEN customer_profiles.last_order_confirmed_at ELSE $9::timestamptz END,
-  last_order_total_cents = CASE WHEN $8::text IS NULL
-    THEN customer_profiles.last_order_total_cents ELSE $10::bigint END,
-  updated_at = $11::timestamptz
+  last_order_folio = COALESCE($7::text, customer_profiles.last_order_folio),
+  last_order_confirmed_at = CASE WHEN $7::text IS NULL
+    THEN customer_profiles.last_order_confirmed_at ELSE $8::timestamptz END,
+  last_order_total_cents = CASE WHEN $7::text IS NULL
+    THEN customer_profiles.last_order_total_cents ELSE $9::bigint END,
+  updated_at = $10::timestamptz
 RETURNING ${COLUMNS}`;
 
 function toProfile(row: CustomerProfileRow): CustomerProfile {
-  const pet =
-    row.pet !== null && typeof row.pet === 'object' && !Array.isArray(row.pet)
-      ? row.pet
-      : null;
   return {
     senderId: row.sender_id,
     ...(row.display_name === null ? {} : { displayName: row.display_name }),
@@ -76,7 +70,6 @@ function toProfile(row: CustomerProfileRow): CustomerProfile {
     register: row.register,
     emojis: row.emojis,
     tone: row.tone,
-    ...(pet === null || Object.keys(pet).length === 0 ? {} : { pet }),
     ...(row.last_order_folio === null ||
     row.last_order_confirmed_at === null ||
     row.last_order_total_cents === null
@@ -122,7 +115,6 @@ export class PostgresCustomerProfileStore implements CustomerProfileStore {
       next.register ?? null,
       next.emojis ?? null,
       next.tone ?? null,
-      next.pet === undefined ? null : JSON.stringify(next.pet),
       next.lastOrder?.folio ?? null,
       next.lastOrder?.confirmedAt ?? null,
       next.lastOrder?.totalCents ?? null,
@@ -130,17 +122,6 @@ export class PostgresCustomerProfileStore implements CustomerProfileStore {
     ]);
     const row = result.rows[0];
     return row === undefined ? null : toProfile(row);
-  }
-
-  /** T4c-1 G2: only `pet` (and `updated_at`); the local `pets` list and
-   *  every other column stay. */
-  async clearPet(senderId: string, now: Date): Promise<boolean> {
-    if (!isValidProfileSenderId(senderId)) return false;
-    const result = await this.pool.query(
-      'UPDATE customer_profiles SET pet = NULL, updated_at = $2 WHERE sender_id = $1 AND pet IS NOT NULL',
-      [senderId, now.toISOString()],
-    );
-    return (result.rowCount ?? 0) > 0;
   }
 
   async delete(senderId: string): Promise<boolean> {

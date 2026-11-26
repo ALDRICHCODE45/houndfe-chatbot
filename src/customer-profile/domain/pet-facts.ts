@@ -415,8 +415,8 @@ function lifeStage(
 }
 
 /**
- * What a prompt line shows about one pet: the legacy stored pet, a backend
- * pet or a local (prospect) pet. `ageText` is display text («3 años»,
+ * What a prompt line shows about one pet: a backend pet or a local
+ * (prospect) pet. `ageText` is display text («3 años»,
  * «~10 meses»); `stage` overrides the stage derived from it.
  */
 export interface PetPromptView {

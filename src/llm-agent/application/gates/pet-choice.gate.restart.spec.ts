@@ -174,7 +174,7 @@ describe('pet choice options (T4c-2a-fix J4)', () => {
       ...CHOICE,
       options: [
         ...CHOICE.options,
-        { ref: 'legacy', text: 'Siamés', matchable: false },
+        { ref: 'local:siames', text: 'Siamés', matchable: false },
       ],
     };
     first.choices.ask(SENDER, choice);
@@ -350,5 +350,60 @@ describe('typed «es otra» (T4c-2b-fix K2)', () => {
     const again = w.boot();
     await again.gates.begin(SENDER);
     expect(again.choices.read(SENDER)).toEqual(legacy);
+  });
+});
+
+describe('a pet_choice row from an older build (T6b)', () => {
+  it('T6b: a row an older build stored with the `legacy` ref loads; that option is no longer offered (the durable row is untouched)', async () => {
+    const w = world();
+    const payload = {
+      purpose: 'request',
+      options: [
+        { ref: 'legacy', text: 'Luna' },
+        { ref: MAX, text: 'Max' },
+      ],
+      request: 'busco croquetas',
+    };
+    await w.store.put({
+      senderId: SENDER,
+      kind: 'pet_choice',
+      payload,
+      expiresAt: new Date(T0 + 60_000),
+    });
+    const restarted = w.boot();
+    await restarted.gates.begin(SENDER);
+    const live = restarted.choices.read(SENDER);
+    expect(live).toEqual({
+      purpose: 'request',
+      options: [{ ref: MAX, text: 'Max' }],
+      request: 'busco croquetas',
+    });
+    expect(matchPetChoiceAnswer('Luna', live!.options, 'other')).toBeNull();
+    restarted.gates.touch(SENDER);
+    await restarted.gates.settle(SENDER);
+    await expect(w.store.get(SENDER, 'pet_choice')).resolves.toMatchObject({
+      payload,
+    });
+  });
+
+  it('T6b: a row whose only option is `legacy` loads with no option offered', async () => {
+    const w = world();
+    await w.store.put({
+      senderId: SENDER,
+      kind: 'pet_choice',
+      payload: {
+        purpose: 'forget',
+        options: [{ ref: 'legacy', text: 'Luna' }],
+        name: 'Luna',
+      },
+      expiresAt: new Date(T0 + 60_000),
+    });
+    const restarted = w.boot();
+    await restarted.gates.begin(SENDER);
+    expect(restarted.choices.read(SENDER)).toEqual({
+      purpose: 'forget',
+      options: [],
+      name: 'Luna',
+    });
   });
 });

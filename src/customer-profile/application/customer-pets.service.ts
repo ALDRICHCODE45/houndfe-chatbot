@@ -40,13 +40,9 @@ import {
   type PetFacts,
   type PetStage,
 } from '../domain/customer-pets';
-import {
-  sanitizeProfileText,
-  type CustomerPet,
-} from '../domain/customer-profile';
+import { sanitizeProfileText } from '../domain/customer-profile';
 import {
   breedSpecies,
-  petFactsConflict,
   petLifeStage,
   petSpeciesWord,
   type PetPromptView,
@@ -86,8 +82,8 @@ const ERASE_ROUNDS_MAX = 5;
 
 /**
  * G4 (T4c-1): one known ACTIVE pet as T4c-2 shows it (buttons). `ref` is
- * `backend:<petId>`, `local:<localId>` or `legacy`; same pets and order as
- * the prompt lines.
+ * `backend:<petId>` or `local:<localId>`; same pets and order as the
+ * prompt lines.
  */
 export interface KnownPet {
   ref: string;
@@ -96,7 +92,7 @@ export interface KnownPet {
   breed?: string;
   ageLabel?: string;
   stage?: PetStage;
-  source: 'backend' | 'local' | 'legacy';
+  source: 'backend' | 'local';
 }
 
 /** G4: a local entry blocked as ambiguous and the backend pets it may be. */
@@ -108,8 +104,8 @@ export interface AmbiguousPetEntry {
 }
 
 /**
- * G2: what `forgetPet` did. `archived` (backend), `removed` (local entry),
- * `cleared` (legacy single pet): forgotten. `none` / `ambiguous`: 0 or 2+
+ * G2: what `forgetPet` did. `archived` (backend), `removed` (local entry):
+ * forgotten. `none` / `ambiguous`: 0 or 2+
  * pets with that name, nothing written. `unavailable`: pets unknown this
  * turn (read-only scope, lookup down, local list unknown, forgotten).
  * `failed`: the write did not land.
@@ -117,7 +113,6 @@ export interface AmbiguousPetEntry {
 export type ForgetPetOutcome =
   | 'archived'
   | 'removed'
-  | 'cleared'
   | 'none'
   | 'ambiguous'
   | 'unavailable'
@@ -195,17 +190,14 @@ interface Fence {
   expired: boolean;
 }
 
-type Ref =
-  | { kind: 'backend'; id: string }
-  | { kind: 'local'; id: string }
-  | { kind: 'legacy' };
+type Ref = { kind: 'backend'; id: string } | { kind: 'local'; id: string };
 
 /** One known pet with its prompt view (prompt lines, `knownPets`). */
 interface KnownEntry {
   ref: string;
   source: KnownPet['source'];
   view: PetPromptView;
-  /** T4c-2a S12: when the pet was added (backend/local; none for legacy). */
+  /** T4c-2a S12: when the pet was added. */
   createdAt?: string;
 }
 
@@ -233,8 +225,8 @@ type PatchOutcome =
  * once a minute) and uploads pending local pets once the sender is a
  * Customer; `afterCheckout` forces it after an order (the checkout may have
  * created the Customer). `capture` applies one statement's facts to the
- * matched pet: PATCH a backend pet (changed fields only), update a local or
- * the legacy single pet, or start a new pet (local first, then uploaded with
+ * matched pet: PATCH a backend pet (changed fields only), update a local
+ * pet, or start a new pet (local first, then uploaded with
  * `pet-local:<customerId>:<localId>` — removed locally only after a 201 or
  * replay 200).
  */
@@ -319,18 +311,13 @@ export class CustomerPetsService {
 
   /**
    * Applies one statement's facts (`extractPetFacts` or rememberPetDetails)
-   * to the matched pet. `legacy` is the single stored pet of the profile
-   * (until T6 moves it): facts about it keep updating it like before.
-   * Serialized per sender (B5): overlapping captures never lose an entry.
+   * to the matched pet. Serialized per sender (B5): overlapping captures
+   * never lose an entry.
    */
-  async capture(
-    senderId: string,
-    facts: PetFacts,
-    legacy?: CustomerPet,
-  ): Promise<void> {
+  async capture(senderId: string, facts: PetFacts): Promise<void> {
     if (!hasPetFacts(facts) || this.profiles.isForgotten(senderId)) return;
     await this.serialized(senderId, (fence) =>
-      this.captureNow(senderId, facts, legacy, fence, false),
+      this.captureNow(senderId, facts, fence, false),
     );
   }
 
@@ -342,7 +329,6 @@ export class CustomerPetsService {
   async captureAllergy(
     senderId: string,
     statement: { name: string; allergies: string },
-    legacy?: CustomerPet,
   ): Promise<void> {
     const facts: PetFacts = {
       name: statement.name,
@@ -350,15 +336,15 @@ export class CustomerPetsService {
     };
     if (!hasPetFacts(facts) || this.profiles.isForgotten(senderId)) return;
     await this.serialized(senderId, (fence) =>
-      this.captureNow(senderId, facts, legacy, fence, true),
+      this.captureNow(senderId, facts, fence, true),
     );
   }
 
   /**
    * G2 (T4c-1): «Bruno ya no está» / «olvida a Bruno». The single known pet
    * with that name is forgotten: a backend pet is archived with the reason
-   * (version-conflict reread), a local entry removed, the legacy single pet
-   * cleared. 0 or 2+ matches write nothing. Serialized and fenced like the
+   * (version-conflict reread), a local entry removed. 0 or 2+ matches
+   * write nothing. Serialized and fenced like the
    * other pet work; never throws.
    */
   async forgetPet(
@@ -403,9 +389,7 @@ export class CustomerPetsService {
    */
   knownPets(senderId: string): KnownPet[] {
     if (this.profiles.isForgotten(senderId)) return [];
-    return this.knownEntries(senderId, this.profiles.cached(senderId)?.pet).map(
-      knownPet,
-    );
+    return this.knownEntries(senderId).map(knownPet);
   }
 
   /**
@@ -430,7 +414,7 @@ export class CustomerPetsService {
 
   /**
    * T4c-2a (S12): the same pets as `knownPets`, newest first (backend and
-   * local `createdAt`); the legacy pet, which has no date, goes last.
+   * local `createdAt`).
    */
   knownPetsByRecency(senderId: string): KnownPet[] {
     if (this.profiles.isForgotten(senderId)) return [];
@@ -439,7 +423,7 @@ export class CustomerPetsService {
         entry.createdAt === undefined ? NaN : Date.parse(entry.createdAt);
       return Number.isNaN(at) ? -Infinity : at;
     };
-    return this.knownEntries(senderId, this.profiles.cached(senderId)?.pet)
+    return this.knownEntries(senderId)
       .map((entry, index) => ({ entry, index }))
       .sort((a, b) => time(b.entry) - time(a.entry) || a.index - b.index)
       .map(({ entry }) => knownPet(entry));
@@ -452,10 +436,9 @@ export class CustomerPetsService {
    */
   chosenPetPromptLine(senderId: string, ref: string): string | null {
     if (this.profiles.isForgotten(senderId)) return null;
-    const entry = this.knownEntries(
-      senderId,
-      this.profiles.cached(senderId)?.pet,
-    ).find((candidate) => candidate.ref === ref);
+    const entry = this.knownEntries(senderId).find(
+      (candidate) => candidate.ref === ref,
+    );
     return entry === undefined ? null : chosenPetPromptLine(entry.view);
   }
 
@@ -521,8 +504,8 @@ export class CustomerPetsService {
   /**
    * T4c-2b Q1 (S7, S11): the pet the customer tapped in the forget question
    * (2+ pets with that name) is forgotten by its ref, with the same switch
-   * as `forgetPet` (backend archived with the reason, local entry removed,
-   * legacy pet cleared). A ref that is not a current known pet is `none`
+   * as `forgetPet` (backend archived with the reason, local entry
+   * removed). A ref that is not a current known pet is `none`
    * (nothing written); pets unknown this turn is `unavailable` (never a
    * guess). Serialized and fenced; never throws.
    */
@@ -537,7 +520,7 @@ export class CustomerPetsService {
       try {
         const state = await this.writableState(senderId, fence);
         if (state === null) return;
-        const target = this.currentRef(senderId, state, ref);
+        const target = this.currentRef(state, ref);
         outcome =
           target === null
             ? 'none'
@@ -600,7 +583,7 @@ export class CustomerPetsService {
   /**
    * T4c-2b Q3 (S10): the customer confirmed that a diminutive names this
    * known pet: the statement's facts go to the pet `ref` (backend PATCH,
-   * local merge, legacy merge), never by name. A ref that is not a current
+   * local merge), never by name. A ref that is not a current
    * known pet is `none`. T4c-2b-fix-2 M2: `applied` only once the write
    * landed (or nothing was left to write); a refused or thrown write is
    * `failed`.
@@ -609,7 +592,6 @@ export class CustomerPetsService {
     senderId: string,
     ref: string,
     facts: PetFacts,
-    legacy?: CustomerPet,
   ): Promise<CaptureForRefOutcome> {
     if (this.profiles.isForgotten(senderId)) return 'unavailable';
     let outcome: CaptureForRefOutcome = 'unavailable';
@@ -617,7 +599,7 @@ export class CustomerPetsService {
       try {
         const state = await this.writableState(senderId, fence);
         if (state === null) return;
-        const target = this.currentRef(senderId, state, ref, legacy);
+        const target = this.currentRef(state, ref);
         if (target === null) {
           outcome = 'none';
           return;
@@ -697,16 +679,11 @@ export class CustomerPetsService {
 
   /** T4c-2b: `ref` when it is one of the sender's current match candidates
    *  (same pets as `forgetPet` matches by name), else `null`. */
-  private currentRef(
-    senderId: string,
-    state: SenderPets,
-    ref: string,
-    legacy: CustomerPet | undefined = this.profiles.cached(senderId)?.pet,
-  ): Ref | null {
+  private currentRef(state: SenderPets, ref: string): Ref | null {
     const parsed = parseRef(ref);
     if (parsed === null) return null;
     return (
-      this.candidates(state, legacy)
+      this.candidates(state)
         .map((candidate) => candidate.ref)
         .find((candidate) => sameRef(candidate, parsed)) ?? null
     );
@@ -823,7 +800,6 @@ export class CustomerPetsService {
   private async captureNow(
     senderId: string,
     facts: PetFacts,
-    legacy: CustomerPet | undefined,
     fence: Fence,
     knownOnly: boolean,
   ): Promise<void> {
@@ -837,26 +813,18 @@ export class CustomerPetsService {
         scope.kind === 'unavailable' ||
         scope.kind === 'customer_pets_unknown'
       ) {
-        // G1: the legacy pet has no allergies; an allergy statement alone
-        // has nothing to record there.
-        if (knownOnly) {
-          this.logger.log(`pet allergies not stored: pets ${scope.kind}`);
-          return;
-        }
-        // B4: no pet store this turn, but the legacy single pet keeps the
-        // baseline merge-only profile write (another pet is never mixed in).
-        if (petFactsConflict(legacy, facts)) {
-          this.logger.log(`pet facts not stored: pets ${scope.kind}`);
-          return;
-        }
-        await this.recordLegacy(senderId, facts);
+        // Read-only this turn: nothing is written (T6b: the profile keeps
+        // no pet of its own any more).
+        this.logger.log(
+          `pet ${knownOnly ? 'allergies' : 'facts'} not stored: pets ${scope.kind}`,
+        );
         return;
       }
       if (!state.localKnown) {
         this.logger.log('pet facts not stored: local pets unknown');
         return;
       }
-      const candidates = this.candidates(state, legacy);
+      const candidates = this.candidates(state);
       if (knownOnly) {
         // G1: only the single known pet with that name.
         const named = this.named(candidates, facts.name ?? '');
@@ -887,21 +855,17 @@ export class CustomerPetsService {
 
   /**
    * The «Mascota conocida» prompt part for the sender's known ACTIVE pets
-   * (backend, then local, then the legacy one unless a store pet has its
-   * name). Only the legacy pet → exactly today's line.
+   * (backend, then local).
    */
-  promptLines(senderId: string, legacy?: CustomerPet): string | null {
+  promptLines(senderId: string): string | null {
     if (this.profiles.isForgotten(senderId)) return null;
     return knownPetsPrompt(
-      this.knownEntries(senderId, legacy).map((entry) => entry.view),
+      this.knownEntries(senderId).map((entry) => entry.view),
     );
   }
 
   /** The known pets behind the prompt lines and `knownPets`, in order. */
-  private knownEntries(
-    senderId: string,
-    legacy: CustomerPet | undefined,
-  ): KnownEntry[] {
+  private knownEntries(senderId: string): KnownEntry[] {
     const state = this.cache.get(senderId);
     const out: KnownEntry[] = [];
     if (state?.scope.kind === 'customer')
@@ -920,19 +884,6 @@ export class CustomerPetsService {
         view: localPetView(pet, now),
         createdAt: pet.createdAt,
       });
-    if (legacy !== undefined && Object.keys(legacy).length > 0) {
-      const name = legacy.name;
-      const shadowed =
-        name === undefined
-          ? out.length > 0
-          : out.some(
-              ({ view }) =>
-                view.name !== undefined &&
-                foldPetName(view.name) === foldPetName(name),
-            );
-      if (!shadowed)
-        out.push({ ref: 'legacy', source: 'legacy', view: legacy });
-    }
     return out;
   }
 
@@ -976,10 +927,7 @@ export class CustomerPetsService {
     }
   }
 
-  private candidates(
-    state: SenderPets,
-    legacy: CustomerPet | undefined,
-  ): Array<PetCandidate<Ref>> {
+  private candidates(state: SenderPets): Array<PetCandidate<Ref>> {
     const out: Array<PetCandidate<Ref>> = [];
     if (state.scope.kind === 'customer')
       for (const pet of state.scope.pets)
@@ -995,29 +943,6 @@ export class CustomerPetsService {
         ...speciesOf(factsSpecies(localPetFacts(pet, this.now()))),
         nameable: true,
       });
-    if (legacy !== undefined && Object.keys(legacy).length > 0) {
-      // B3: a legacy pet shadowed by a store pet with the same name and
-      // species is that pet: the facts go to the store pet.
-      const name = legacy.name;
-      const species = factsSpecies(legacy);
-      const shadowed =
-        name !== undefined &&
-        out.some(
-          (candidate) =>
-            candidate.name !== undefined &&
-            foldPetName(candidate.name) === foldPetName(name) &&
-            (species === undefined ||
-              candidate.species === undefined ||
-              candidate.species === species),
-        );
-      if (!shadowed)
-        out.push({
-          ref: { kind: 'legacy' },
-          ...(name === undefined ? {} : { name }),
-          ...speciesOf(species),
-          nameable: true,
-        });
-    }
     return out;
   }
 
@@ -1055,11 +980,6 @@ export class CustomerPetsService {
     facts: PetFacts,
     fence: Fence,
   ): Promise<boolean> {
-    if (ref.kind === 'legacy') {
-      // Until T6 the legacy single pet keeps its merge-only profile write.
-      await this.recordLegacy(senderId, facts);
-      return true;
-    }
     if (ref.kind === 'backend') {
       if (state.scope.kind !== 'customer') return false;
       const pet = state.scope.pets.find((candidate) => candidate.id === ref.id);
@@ -1095,14 +1015,6 @@ export class CustomerPetsService {
     if (state.scope.kind === 'customer')
       await this.uploadPending(senderId, fence);
     return true;
-  }
-
-  /** The legacy single pet's merge-only write (G1: it has no allergies). */
-  private async recordLegacy(senderId: string, facts: PetFacts): Promise<void> {
-    const { allergies, ...pet } = facts;
-    if (allergies !== undefined)
-      this.logger.log('pet allergies not stored: legacy pet');
-    if (hasPetFacts(pet)) await this.profiles.record(senderId, { pet });
   }
 
   private allergiesOverflow(): void {
@@ -1548,17 +1460,14 @@ export class CustomerPetsService {
       !state.localKnown
     )
       return 'unavailable';
-    const matches = this.named(
-      this.candidates(state, this.profiles.cached(senderId)?.pet),
-      name,
-    );
+    const matches = this.named(this.candidates(state), name);
     if (matches.length === 0) return 'none';
     if (matches.length > 1) return 'ambiguous';
     return this.forgetRef(senderId, state, matches[0].ref, reason, fence);
   }
 
   /** G2 / T4c-2b Q1: forgets one known pet by ref (backend archived with
-   *  the reason, local entry removed, legacy pet cleared). */
+   *  the reason, local entry removed). */
   private async forgetRef(
     senderId: string,
     state: SenderPets,
@@ -1567,8 +1476,6 @@ export class CustomerPetsService {
     fence: Fence,
   ): Promise<ForgetPetOutcome> {
     switch (ref.kind) {
-      case 'legacy':
-        return (await this.profiles.clearPet(senderId)) ? 'cleared' : 'failed';
       case 'local':
         return (await this.writeLocal(senderId, fence, (current) =>
           current.some((entry) => entry.id === ref.id)
@@ -1650,9 +1557,8 @@ export class CustomerPetsService {
   }
 
   /** G2: a local entry with the archived pet's name and species (pending,
-   *  hidden by B6) is that pet: removed so it is never uploaded later. The
-   *  legacy pet it shadowed (B3 rule) is that pet too: cleared, so it does
-   *  not resurface once the archived pet leaves the list. H7: a removal
+   *  hidden by B6) is that pet: removed so it is never uploaded later. H7:
+   *  a removal
    *  that does not land (or cannot be checked) is logged; I1: the upload's
    *  archived-twin check keeps it from upload and removes it later. */
   private async forgetTwinEntries(
@@ -1660,16 +1566,6 @@ export class CustomerPetsService {
     fence: Fence,
     pet: BackendPet,
   ): Promise<void> {
-    const legacy = this.profiles.cached(senderId)?.pet;
-    const legacySpecies =
-      legacy === undefined ? undefined : factsSpecies(legacy);
-    if (
-      legacy?.name !== undefined &&
-      foldPetName(legacy.name) === foldPetName(pet.name) &&
-      (legacySpecies === undefined || legacySpecies === backendSpecies(pet)) &&
-      !(await this.profiles.clearPet(senderId))
-    )
-      this.logger.warn('pet archive: legacy twin not cleared');
     const key = twinKey(pet.name, pet.species);
     if ((await this.removeTwinEntries(senderId, fence, key)) !== 'failed')
       return;
@@ -2007,19 +1903,16 @@ function twinKey(name: string, species: BackendPet['species']): string {
   return `${foldPetName(name)}|${backendSpecies({ species })}`;
 }
 
-/** T4c-2b: a `KnownPet` ref (`backend:<id>`, `local:<id>`, `legacy`). */
+/** T4c-2b: a `KnownPet` ref (`backend:<id>`, `local:<id>`). T6b: the old
+ *  `legacy` ref (a stored gate row of an older build) is no pet: `null`. */
 function parseRef(ref: string): Ref | null {
-  if (ref === 'legacy') return { kind: 'legacy' };
   const match = /^(backend|local):(.{1,64})$/.exec(ref);
   if (match === null) return null;
   return { kind: match[1] as 'backend' | 'local', id: match[2] };
 }
 
 function sameRef(a: Ref, b: Ref): boolean {
-  return (
-    a.kind === b.kind &&
-    (a.kind === 'legacy' || a.id === (b as { id: string }).id)
-  );
+  return a.kind === b.kind && a.id === b.id;
 }
 
 /** G4: the T4c-2 view of one known pet (only the members it has). */

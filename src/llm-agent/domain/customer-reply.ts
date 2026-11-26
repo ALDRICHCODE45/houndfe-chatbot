@@ -95,8 +95,10 @@ const BACKORDER_RESCHEDULE_DECLINE = 'backorder_reschedule_decline';
 const BACKORDER_WAIT = 'backorder_wait';
 // T4c-2a: the which-pet question; the tail is the pet ref.
 const PET_PICK = 'pet_pick';
-/** `backend:<id>`, `local:<id>`, `legacy`, `other` («Otra mascota» / «Es
- *  otra mascota») or `forgotten` (T4c-2b: a just-forgotten pet). */
+/** `backend:<id>`, `local:<id>`, `other` («Otra mascota» / «Es otra
+ *  mascota») or `forgotten` (T4c-2b: a just-forgotten pet). T6b: `legacy`
+ *  (the removed single profile pet) still parses, so a tap on an older
+ *  question is answered as stale instead of an unknown id. */
 const PET_PICK_REF =
   /^(?:legacy|other|forgotten|(?:backend|local):[A-Za-z0-9-]{1,64})$/;
 const BACKORDER_REFERENCE =

@@ -3,23 +3,24 @@ import type {
   CustomerStyle,
   CustomerTone,
 } from '../../llm-agent/domain/customer-style';
-import { knownPetPromptLine } from './pet-facts';
 
 /**
  * S1 persistent customer memory: a small per-sender profile that survives
  * restarts and idle resets — how to address the customer (name, usted/tú,
- * emojis, tone), their pet, and a pointer to their last order. It is not a
- * session transcript, and order data stays in the backend: `lastOrder` is
- * only folio + date + total for the greeting.
+ * emojis, tone) and a pointer to their last order. It is not a session
+ * transcript, and order data stays in the backend: `lastOrder` is only
+ * folio + date + total for the greeting. Pets live in the backend (or the
+ * local prospect list, see CustomerPetsService), never in the profile
+ * (T6b: the old single `pet` column is neither read nor written).
  *
  * Upserts are merge-only: a missing/null/empty patch value keeps the stored
- * one, so a turn can never erase what an earlier turn learned. The only ways
- * to drop data are `delete` ("olvida mis datos") and `clearPet` (T4c-1 G2:
- * «Bruno ya no está» about the legacy single pet).
+ * one, so a turn can never erase what an earlier turn learned. The only way
+ * to drop data is `delete` ("olvida mis datos").
  */
 
 export const CUSTOMER_PROFILE_STORE = Symbol('CUSTOMER_PROFILE_STORE');
 
+/** One statement's pet facts (the shape of `PetFacts` without allergies). */
 export interface CustomerPet {
   name?: string;
   species?: string;
@@ -45,7 +46,6 @@ export interface CustomerProfile {
   register: CustomerRegister;
   emojis: boolean;
   tone: CustomerTone;
-  pet?: CustomerPet;
   lastOrder?: CustomerLastOrder;
   updatedAt: string;
 }
@@ -57,7 +57,6 @@ export interface CustomerProfilePatch {
   register?: CustomerRegister | null;
   emojis?: boolean | null;
   tone?: CustomerTone | null;
-  pet?: { [K in keyof CustomerPet]?: string | null } | null;
   lastOrder?: CustomerLastOrder | null;
 }
 
@@ -68,7 +67,6 @@ export interface NormalizedCustomerProfilePatch {
   register?: CustomerRegister;
   emojis?: boolean;
   tone?: CustomerTone;
-  pet?: CustomerPet;
   lastOrder?: CustomerLastOrder;
 }
 
@@ -86,12 +84,6 @@ export interface CustomerProfileStore {
   ): Promise<CustomerProfile | null>;
   /** `true` when a profile existed and was deleted. */
   delete(senderId: string): Promise<boolean>;
-  /**
-   * T4c-1 G2: drops the legacy single pet only (every other field and the
-   * local pet list stay). `true` when a stored pet was cleared; never
-   * creates a row.
-   */
-  clearPet(senderId: string, now: Date): Promise<boolean>;
 }
 
 export const TEXT_LIMITS = {
@@ -109,7 +101,6 @@ export const PET_LIMITS: Record<keyof CustomerPet, number> = {
   notes: 200,
 };
 
-const PET_FIELDS = Object.keys(PET_LIMITS) as Array<keyof CustomerPet>;
 const REGISTERS: ReadonlySet<string> = new Set(['usted', 'tu']);
 const TONES: ReadonlySet<string> = new Set(['formal', 'neutral', 'casual']);
 const SENDER_ID = /^[0-9]{6,20}$/;
@@ -177,14 +168,6 @@ export function normalizeCustomerProfilePatch(
   if (typeof patch.emojis === 'boolean') out.emojis = patch.emojis;
   if (typeof patch.tone === 'string' && TONES.has(patch.tone))
     out.tone = patch.tone;
-  if (typeof patch.pet === 'object' && patch.pet !== null) {
-    const pet: CustomerPet = {};
-    for (const field of PET_FIELDS) {
-      const value = sanitizeProfileText(patch.pet[field], PET_LIMITS[field]);
-      if (value !== undefined) pet[field] = value;
-    }
-    if (Object.keys(pet).length > 0) out.pet = pet;
-  }
   const lastOrder = normalizeLastOrder(patch.lastOrder);
   if (lastOrder !== undefined) out.lastOrder = lastOrder;
   return out;
@@ -204,10 +187,6 @@ export function mergeCustomerProfile(
   now: Date,
 ): CustomerProfile {
   const next = normalizeCustomerProfilePatch(patch);
-  const pet =
-    existing?.pet === undefined && next.pet === undefined
-      ? undefined
-      : { ...existing?.pet, ...next.pet };
   const lastOrder = next.lastOrder ?? existing?.lastOrder;
   const displayName = next.displayName ?? existing?.displayName;
   const preferredName = next.preferredName ?? existing?.preferredName;
@@ -218,7 +197,6 @@ export function mergeCustomerProfile(
     register: next.register ?? existing?.register ?? 'usted',
     emojis: next.emojis ?? existing?.emojis ?? false,
     tone: next.tone ?? existing?.tone ?? 'neutral',
-    ...(pet === undefined ? {} : { pet }),
     ...(lastOrder === undefined ? {} : { lastOrder: { ...lastOrder } }),
     updatedAt: now.toISOString(),
   };
@@ -239,13 +217,6 @@ export function profilePatchIsNoop(
   ] as const;
   for (const key of scalars)
     if (patch[key] !== undefined && patch[key] !== existing[key]) return false;
-  if (patch.pet !== undefined)
-    for (const field of PET_FIELDS)
-      if (
-        patch.pet[field] !== undefined &&
-        patch.pet[field] !== existing.pet?.[field]
-      )
-        return false;
   if (patch.lastOrder !== undefined) {
     const stored = existing.lastOrder;
     if (
@@ -268,18 +239,9 @@ export function customerStyleSeed(profile: CustomerProfile): CustomerStyle {
 
 const HAS_LETTER = /\p{L}/u;
 
-const PET_LABELS: Record<keyof CustomerPet, string> = {
-  name: 'nombre',
-  species: 'especie',
-  breed: 'raza',
-  size: 'tamaño',
-  ageText: 'edad',
-  notes: 'notas',
-};
-
 /**
  * The compact "Cliente conocido:" system-prompt line, or `null` when no
- * name, pet or order is stored. Values are JSON-quoted customer data, never
+ * name or order is stored (pets have their own «Mascota conocida» lines). Values are JSON-quoted customer data, never
  * instructions; the phone number is never included.
  */
 export function knownCustomerPromptLine(
@@ -291,18 +253,6 @@ export function knownCustomerPromptLine(
     (candidate) => candidate !== undefined && HAS_LETTER.test(candidate),
   );
   if (name !== undefined) parts.push(`nombre ${JSON.stringify(name)}`);
-  const petFacts = PET_FIELDS.flatMap((field) => {
-    const value = profile.pet?.[field];
-    return value === undefined
-      ? []
-      : [`${PET_LABELS[field]} ${JSON.stringify(value)}`];
-  });
-  // The "Mascota conocida" line carries searchable pet facts on its own.
-  const petLine = knownPetPromptLine(profile.pet) !== null;
-  if (petLine && profile.pet?.name !== undefined)
-    parts.push(`mascota ${JSON.stringify(profile.pet.name)}`);
-  else if (!petLine && petFacts.length > 0)
-    parts.push(`mascota: ${petFacts.join(', ')}`);
   if (profile.lastOrder !== undefined)
     parts.push(
       `último pedido: folio ${JSON.stringify(profile.lastOrder.folio)} del ${profile.lastOrder.confirmedAt.slice(0, 10)}`,

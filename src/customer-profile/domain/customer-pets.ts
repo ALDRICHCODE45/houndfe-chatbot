@@ -30,7 +30,7 @@ import {
  * LOCAL list in its chatbot profile (`customer_profiles.pets`) until the
  * Customer exists, then they are uploaded with a deterministic idempotency
  * key and removed locally. Facts come from `extractPetFacts` (or the model's
- * rememberPetDetails), in the legacy `CustomerPet` shape.
+ * rememberPetDetails), in the `CustomerPet` facts shape.
  */
 
 export const LOCAL_PET_STORE = Symbol('LOCAL_PET_STORE');
@@ -39,9 +39,8 @@ export type PetStage = 'cachorro' | 'adulto' | 'senior';
 export type LocalSpecies = 'perro' | 'gato';
 
 /**
- * G1 (T4c-1): one statement's facts as captured. The legacy stored pet
- * (`CustomerPet`) has no allergies; the store keeps them on backend and
- * local pets only.
+ * G1 (T4c-1): one statement's facts as captured (`CustomerPet` plus the
+ * allergies, kept on backend and local pets).
  */
 export interface PetFacts extends CustomerPet {
   allergies?: string;
@@ -544,7 +543,7 @@ export interface PetCandidate<Ref> {
   ref: Ref;
   name?: string;
   species?: LocalSpecies | 'otro';
-  /** A nameless local/legacy pet that a new name may complete. */
+  /** A nameless local pet that a new name may complete. */
   nameable?: boolean;
 }
 

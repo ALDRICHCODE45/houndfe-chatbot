@@ -662,61 +662,10 @@ describe('CustomerPetsService (T4b)', () => {
       expect(text).not.toMatch(/alergia/i);
     });
 
-    it("only the legacy stored pet → exactly today's line", async () => {
-      const h = harness(notFound);
-      await h.service.prepare(SENDER);
-      const legacy = { name: 'Luna', species: 'perro', breed: 'labrador' };
-      const { knownPetPromptLine } = jest.requireActual<
-        typeof import('../domain/pet-facts')
-      >('../domain/pet-facts');
-      expect(h.service.promptLines(SENDER, legacy)).toBe(
-        knownPetPromptLine(legacy),
-      );
-    });
-
-    it('the legacy pet is hidden when a store pet has its name, shown next to another', async () => {
-      const h = harness(found([backend()]));
-      await h.service.prepare(SENDER);
-      expect(
-        h.service
-          .promptLines(SENDER, { name: 'bruno', species: 'perro' })
-          ?.match(/Mascota conocida:/g),
-      ).toHaveLength(1);
-      expect(
-        h.service
-          .promptLines(SENDER, { name: 'Luna', species: 'perro' })
-          ?.match(/Mascota conocida:/g),
-      ).toHaveLength(2);
-    });
-
     it('no pets → no line', async () => {
       const h = harness(found([]));
       await h.service.prepare(SENDER);
       expect(h.service.promptLines(SENDER)).toBeNull();
-    });
-  });
-
-  describe('legacy single pet (until T6)', () => {
-    it('facts about the legacy pet update it like today; another pet goes to the store', async () => {
-      const h = harness(notFound);
-      await h.profiles.record(SENDER, {
-        pet: { name: 'Luna', species: 'perro' },
-      });
-      await h.service.prepare(SENDER);
-      const legacy = () => h.profiles.cached(SENDER)?.pet;
-      await h.service.capture(
-        SENDER,
-        extractPetFacts('mi perrita Luna es labrador'),
-        legacy(),
-      );
-      expect(legacy()).toMatchObject({ name: 'Luna', breed: 'labrador' });
-      await h.service.capture(
-        SENDER,
-        extractPetFacts('mi perro Max es un husky'),
-        legacy(),
-      );
-      expect(legacy()).toMatchObject({ name: 'Luna', breed: 'labrador' });
-      await expect(h.local()).resolves.toMatchObject([{ name: 'Max' }]);
     });
   });
 
@@ -889,120 +838,6 @@ describe('CustomerPetsService (T4b-fix-B)', () => {
       const text = h.service.promptLines(SENDER) ?? '';
       expect(text).toContain('notas "come poco"');
       expect(text).not.toMatch(/internas|nunca las cite/);
-    });
-  });
-
-  describe('B3: a shadowed legacy pet is not a match candidate (review R3)', () => {
-    it('legacy and backend pet with the same name and species → the facts PATCH the backend pet, the legacy pet is untouched', async () => {
-      const h = harness(found([backend()]));
-      await h.profiles.record(SENDER, {
-        pet: { name: 'Bruno', species: 'perro' },
-      });
-      h.client.patchPet.mockResolvedValue({
-        kind: 'ok',
-        pet: backend({ version: 4 }),
-        warnings: [],
-      });
-      await h.service.prepare(SENDER);
-      await h.service.capture(
-        SENDER,
-        extractPetFacts('mi perrito Bruno ya tiene 2 años'),
-        h.profiles.cached(SENDER)?.pet,
-      );
-      expect(h.client.patchPet.mock.calls).toEqual([
-        [CUSTOMER_ID, backend().id, { version: 3, approxAge: { years: 2 } }],
-      ]);
-      expect(h.profiles.cached(SENDER)?.pet).toEqual({
-        name: 'Bruno',
-        species: 'perro',
-      });
-    });
-
-    it('legacy and local pet with the same name → the local pet gets the facts', async () => {
-      const h = harness(notFound);
-      await h.say('mi perrita Luna es una labrador');
-      await h.profiles.record(SENDER, {
-        pet: { name: 'Luna', species: 'perro' },
-      });
-      await h.service.capture(
-        SENDER,
-        extractPetFacts('mi perrita Luna tiene 3 años'),
-        h.profiles.cached(SENDER)?.pet,
-      );
-      expect((await h.local())[0]).toMatchObject({
-        name: 'Luna',
-        birthDate: '2023-01-01',
-      });
-      expect(h.profiles.cached(SENDER)?.pet).toEqual({
-        name: 'Luna',
-        species: 'perro',
-      });
-    });
-
-    it('a legacy pet of another species with the same name is still a candidate', async () => {
-      const h = harness(found([backend()]));
-      await h.profiles.record(SENDER, {
-        pet: { name: 'Bruno', species: 'gato' },
-      });
-      await h.service.prepare(SENDER);
-      await h.service.capture(
-        SENDER,
-        extractPetFacts('mi gato Bruno es siamés'),
-        h.profiles.cached(SENDER)?.pet,
-      );
-      expect(h.client.patchPet).not.toHaveBeenCalled();
-      expect(h.profiles.cached(SENDER)?.pet).toMatchObject({
-        name: 'Bruno',
-        breed: 'siamés',
-      });
-    });
-  });
-
-  describe('B4: read-only scopes still record legacy pet facts (review R3)', () => {
-    const legacyCase = async (lookup: CustomerLookupResponse | Error) => {
-      const h = harness(lookup);
-      await h.profiles.record(SENDER, {
-        pet: { name: 'Luna', species: 'perro' },
-      });
-      await h.service.prepare(SENDER);
-      await h.service.capture(
-        SENDER,
-        extractPetFacts('mi perrita Luna es labrador'),
-        h.profiles.cached(SENDER)?.pet,
-      );
-      return h;
-    };
-
-    it('lookup unavailable → the legacy pet is updated through the profile, no pet route or local write', async () => {
-      const h = await legacyCase(new Error('down'));
-      expect(h.profiles.cached(SENDER)?.pet).toMatchObject({
-        name: 'Luna',
-        breed: 'labrador',
-      });
-      expect(h.client.createPet).not.toHaveBeenCalled();
-      expect(h.client.patchPet).not.toHaveBeenCalled();
-      await expect(h.local()).resolves.toEqual([]);
-    });
-
-    it('`pets` absent → the legacy pet is updated through the profile', async () => {
-      const h = await legacyCase(found(undefined));
-      expect(h.profiles.cached(SENDER)?.pet).toMatchObject({
-        name: 'Luna',
-        breed: 'labrador',
-      });
-      await expect(h.local()).resolves.toEqual([]);
-    });
-
-    it('facts about another pet are not mixed into the legacy pet (baseline conflict rule)', async () => {
-      const h = await legacyCase(new Error('down'));
-      const before = h.profiles.cached(SENDER)?.pet;
-      expect(before).toMatchObject({ name: 'Luna', breed: 'labrador' });
-      await h.service.capture(
-        SENDER,
-        extractPetFacts('mi perro Max es un husky'),
-        before,
-      );
-      expect(h.profiles.cached(SENDER)?.pet).toEqual(before);
     });
   });
 
@@ -1532,27 +1367,38 @@ describe('CustomerPetsService (T4b-fix-2-C)', () => {
     });
   });
 
-  describe('C7: read-only scopes record the first pet (baseline)', () => {
+  describe('T6b: read-only scopes record nothing (the profile keeps no pet)', () => {
     it.each([
       ['lookup unavailable', new Error('down')],
       ['`pets` absent', found(undefined)],
     ] as const)(
-      '%s, no legacy pet → the facts become the legacy pet through the profile',
+      '%s → no profile write, no pet route, no local write; logged',
       async (_label, lookup) => {
         const h = harness(lookup);
+        const upsert = jest.spyOn(h.profileStore, 'upsert');
+        const log = jest.spyOn(Logger.prototype, 'log');
         await h.service.prepare(SENDER);
         await h.service.capture(
           SENDER,
           extractPetFacts('mi perrita Luna es labrador'),
-          undefined,
         );
-        expect(h.profiles.cached(SENDER)?.pet).toMatchObject({
+        await h.service.captureAllergy(SENDER, {
           name: 'Luna',
-          breed: 'labrador',
+          allergies: 'pollo',
         });
+        expect(upsert).not.toHaveBeenCalled();
+        await expect(h.profileStore.read(SENDER)).resolves.toBeNull();
         expect(h.client.createPet).not.toHaveBeenCalled();
         expect(h.client.patchPet).not.toHaveBeenCalled();
         await expect(h.local()).resolves.toEqual([]);
+        const kind =
+          lookup instanceof Error ? 'unavailable' : 'customer_pets_unknown';
+        expect(JSON.stringify(log.mock.calls)).toContain(
+          `pet facts not stored: pets ${kind}`,
+        );
+        expect(JSON.stringify(log.mock.calls)).toContain(
+          `pet allergies not stored: pets ${kind}`,
+        );
       },
     );
   });
@@ -2285,40 +2131,6 @@ describe('CustomerPetsService (T4c-1)', () => {
       ]);
     });
 
-    it('a legacy twin of the archived backend pet is cleared too: it never resurfaces in the prompt or knownPets (review R3)', async () => {
-      const h = harness(found([backend(), max()]));
-      await h.profiles.record(SENDER, {
-        pet: { name: 'Bruno', species: 'perro' },
-      });
-      h.client.archivePet.mockResolvedValue(archived(backend(), 'falleció'));
-      await h.service.prepare(SENDER);
-      await expect(
-        h.service.forgetPet(SENDER, 'Bruno', 'falleció'),
-      ).resolves.toBe('archived');
-      expect(h.profiles.cached(SENDER)?.pet).toBeUndefined();
-      const legacy = h.profiles.cached(SENDER)?.pet;
-      expect(h.service.promptLines(SENDER, legacy) ?? '').not.toContain(
-        'Bruno',
-      );
-      expect(h.service.knownPets(SENDER).map((pet) => pet.name)).toEqual([
-        'Max',
-      ]);
-    });
-
-    it('a legacy pet of another species with the same name is not cleared when the backend pet is archived', async () => {
-      const h = harness(found([backend(), max()]));
-      await h.profiles.record(SENDER, {
-        pet: { name: 'Bruno', species: 'gato' },
-      });
-      h.client.archivePet.mockResolvedValue(archived(backend()));
-      await h.service.prepare(SENDER);
-      await h.service.forgetPet(SENDER, 'Bruno');
-      expect(h.profiles.cached(SENDER)?.pet).toEqual({
-        name: 'Bruno',
-        species: 'gato',
-      });
-    });
-
     it('PET_VERSION_CONFLICT → rereads (ALL) and archives with the current version', async () => {
       const h = harness(found([backend()]));
       h.client.archivePet
@@ -2399,25 +2211,6 @@ describe('CustomerPetsService (T4c-1)', () => {
       expect(h.client.archivePet).not.toHaveBeenCalled();
     });
 
-    it('the legacy single pet → cleared (other profile fields kept)', async () => {
-      const h = harness(notFound);
-      await h.profiles.record(SENDER, {
-        preferredName: 'Ana',
-        pet: { name: 'Luna', species: 'perro', breed: 'labrador' },
-      });
-      await h.service.prepare(SENDER);
-      await expect(h.service.forgetPet(SENDER, 'Luna')).resolves.toBe(
-        'cleared',
-      );
-      const stored = await h.profileStore.read(SENDER);
-      expect(stored?.pet).toBeUndefined();
-      expect(stored?.preferredName).toBe('Ana');
-      expect(h.profiles.cached(SENDER)?.pet).toBeUndefined();
-      expect(
-        h.service.promptLines(SENDER, h.profiles.cached(SENDER)?.pet),
-      ).toBeNull();
-    });
-
     it('no pet with that name → none, nothing written', async () => {
       const h = harness(found([backend()]));
       await h.service.prepare(SENDER);
@@ -2474,16 +2267,13 @@ describe('CustomerPetsService (T4c-1)', () => {
         ],
         ['the list throws', () => Promise.reject(new TypeError('down'))],
       ])(
-        '%s → failed, logged; the pet, its local twin and its legacy twin stay',
+        '%s → failed, logged; the pet and its local twin stay',
         async (_label, list) => {
           const h = harness(found([]));
           h.client.createPet.mockRejectedValue(
             Object.assign(new Error('x'), { statusCode: 500 }),
           );
           await h.say('mi perrito Bruno es un pug');
-          await h.profiles.record(SENDER, {
-            pet: { name: 'Bruno', species: 'perro' },
-          });
           h.setLookup(found([backend()]));
           h.advance(2 * MINUTE);
           h.client.patchPet.mockRejectedValue(new TypeError('down'));
@@ -2505,10 +2295,6 @@ describe('CustomerPetsService (T4c-1)', () => {
             'backend',
           ]);
           await expect(h.local()).resolves.toMatchObject([{ name: 'Bruno' }]);
-          expect(h.profiles.cached(SENDER)?.pet).toEqual({
-            name: 'Bruno',
-            species: 'perro',
-          });
         },
       );
 
@@ -2721,7 +2507,7 @@ describe('CustomerPetsService (T4c-1)', () => {
         expect(JSON.stringify(warn.mock.calls)).not.toContain('twin');
       });
 
-      it('no twin entry and no legacy twin: nothing logged', async () => {
+      it('no twin entry: nothing logged', async () => {
         const h = harness(found([backend(), max()]));
         h.client.archivePet.mockResolvedValue(archived(backend()));
         await h.service.prepare(SENDER);
@@ -2729,22 +2515,6 @@ describe('CustomerPetsService (T4c-1)', () => {
           'archived',
         );
         expect(JSON.stringify(warn.mock.calls)).not.toContain('twin');
-      });
-
-      it('a legacy twin that cannot be cleared is logged (the archive stays done)', async () => {
-        const h = harness(found([backend(), max()]));
-        await h.profiles.record(SENDER, {
-          pet: { name: 'Bruno', species: 'perro' },
-        });
-        jest.spyOn(h.profiles, 'clearPet').mockResolvedValue(false);
-        h.client.archivePet.mockResolvedValue(archived(backend()));
-        await h.service.prepare(SENDER);
-        await expect(h.service.forgetPet(SENDER, 'Bruno')).resolves.toBe(
-          'archived',
-        );
-        expect(JSON.stringify(warn.mock.calls)).toContain(
-          'pet archive: legacy twin not cleared',
-        );
       });
     });
   });
@@ -2886,14 +2656,11 @@ describe('CustomerPetsService (T4c-1)', () => {
   });
 
   describe('G4: read accessors and ambiguous resolution for T4c-2', () => {
-    it('knownPets: backend, local and the unshadowed legacy pet, in prompt order', async () => {
+    it('knownPets: backend then local, in prompt order', async () => {
       const h = harness(found([backend({ allergies: 'Pollo' })]));
       h.client.createPet.mockRejectedValue(
         Object.assign(new Error('x'), { statusCode: 500 }),
       );
-      await h.profiles.record(SENDER, {
-        pet: { name: 'Luna', species: 'perrita', ageText: '3 años' },
-      });
       await h.service.prepare(SENDER);
       await h.service.capture(
         SENDER,
@@ -2916,18 +2683,10 @@ describe('CustomerPetsService (T4c-1)', () => {
           breed: 'siamés',
           source: 'local',
         },
-        {
-          ref: 'legacy',
-          name: 'Luna',
-          species: 'perro',
-          ageLabel: '3 años',
-          stage: 'adulto',
-          source: 'legacy',
-        },
       ]);
     });
 
-    it('T4c-2a S12: knownPetsByRecency puts the newest first (backend/local createdAt), the legacy pet last', async () => {
+    it('T4c-2a S12: knownPetsByRecency puts the newest first (backend/local createdAt)', async () => {
       const h = harness(
         found([
           backend({ createdAt: '2026-10-01T00:00:00.000Z' }),
@@ -2941,9 +2700,6 @@ describe('CustomerPetsService (T4c-1)', () => {
       h.client.createPet.mockRejectedValue(
         Object.assign(new Error('x'), { statusCode: 500 }),
       );
-      await h.profiles.record(SENDER, {
-        pet: { name: 'Luna', species: 'perrita' },
-      });
       await h.service.prepare(SENDER);
       await h.service.capture(
         SENDER,
@@ -2953,18 +2709,14 @@ describe('CustomerPetsService (T4c-1)', () => {
         'Bruno',
         'Max',
         'Michi',
-        'Luna',
       ]);
       expect(
         h.service.knownPetsByRecency(SENDER).map((pet) => pet.name),
-      ).toEqual(['Michi', 'Max', 'Bruno', 'Luna']);
+      ).toEqual(['Michi', 'Max', 'Bruno']);
     });
 
     it('T4c-2a P4: chosenPetPromptLine gives «Mascota de este pedido» with the pet facts and its search, null for an unknown ref', async () => {
       const h = harness(found([backend({ allergies: 'Pollo' })]));
-      await h.profiles.record(SENDER, {
-        pet: { name: 'Luna', species: 'perrita', ageText: '3 años' },
-      });
       await h.service.prepare(SENDER);
       expect(
         h.service.chosenPetPromptLine(SENDER, `backend:${backend().id}`),
@@ -2973,9 +2725,8 @@ describe('CustomerPetsService (T4c-1)', () => {
           'Búsqueda para esta mascota: «croquetas perro cachorro raza pequeña». ' +
           'Continúe la solicitud del cliente para esta mascota; no vuelva a preguntar para cuál es.',
       );
-      expect(h.service.chosenPetPromptLine(SENDER, 'legacy')).toContain(
-        'Mascota de este pedido (la eligió el cliente): "Luna", perro',
-      );
+      // T6b: the old `legacy` ref is no pet.
+      expect(h.service.chosenPetPromptLine(SENDER, 'legacy')).toBeNull();
       expect(h.service.chosenPetPromptLine(SENDER, `backend:${uuid(99)}`)).toBe(
         null,
       );
