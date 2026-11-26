@@ -24,7 +24,8 @@
     "eval:conversation": "ts-node -r tsconfig-paths/register scripts/eval/conversation-eval.ts",
     "e2e:human-requests": "ts-node -r tsconfig-paths/register scripts/e2e/human-requests-feed-e2e.ts",
     "e2e:conversation-mirror": "ts-node -r tsconfig-paths/register scripts/e2e/conversation-mirror-e2e.ts",
-    "e2e:backorder": "ts-node -r tsconfig-paths/register scripts/e2e/backorder-e2e.ts"
+    "e2e:backorder": "ts-node -r tsconfig-paths/register scripts/e2e/backorder-e2e.ts",
+    "e2e:pets": "ts-node -r tsconfig-paths/register scripts/e2e/pets-e2e.ts"
   },
   "pg-migrate": {
     "databaseUrl": "DATABASE_URL",

@@ -221,3 +221,48 @@ Steps (each prints PASS, WARN or FAIL with the HTTP status and the error code):
 6. Cleanup in a `finally` (also after a failure): cancel the sale (`ORDER_ERROR`) or the active backorder, adjust the stock back to 0 (`DATA_ENTRY_CORRECTION`), then verify stock 0 and no active backorder. Whatever it could not clean is printed as `NOT_CLEANED` and the exit code is 1. The RESTOCK decision and the test customer cannot be deleted and stay in the dev database.
 
 Exit code: 0 all steps passed and clean; 1 a step failed or something is not cleaned; 2 missing env or a refused base URL. Writes DEV data only.
+
+## pets-e2e
+
+Live rehearsal of multi-pet customer profiles (spec `odd/tasks/multi-pet-profiles.md` T7, S1-S9, S14-S16; contract `docs/contracts/customer-pets-bot-contract.md`) against the dev backend. It drives the chatbot's real `ChatbotApiHttpClient` (customers by-phone, pets, catalog search, evaluate-cart, checkout, order history, sale cancel). A staff session is used only as a fallback to cancel the test sale when the bot cancel is refused.
+
+```sh
+# load the dev environment into the shell first (never edit or print the env file)
+pnpm e2e:pets
+```
+
+Environment (never printed; every output line is redacted for the key, any `svc_…` value, `Bearer …` tokens and the staff password):
+
+| Variable                                 | Meaning                                                                                                                                  |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `CHATBOT_API_BASE_URL` (required)        | Must be plain `http://` on an allow-listed dev host (`localhost:3003`, `127.0.0.1:3003`; `DEV_HOST_ALLOW_LIST` in `pets-e2e-lib.ts`)     |
+| `SERVICE_KEY` (required)                 | Chatbot `svc_` key with `customers:read/write`, `pets:read/write/delete`, `catalog:read`, `pricing:evaluate`, checkout and `sales:write` |
+| `CHATBOT_API_BRANCH_ID`                  | Branch header; default the dev branch of the other e2e scripts                                                                           |
+| `CHATBOT_API_CASHIER_USER_ID`            | Sale cashier; default the dev bot cashier                                                                                                |
+| `E2E_PETS_PHONE`                         | Test phone (country code `52`); must be 10 digits starting with `555`; default `5550002222`                                              |
+| `E2E_PETS_PRODUCT_QUERIES`               | Comma-separated catalog searches used to pick 2 plain in-stock products; default `croquetas,premios,shampoo,juguete,collar,arena`        |
+| `E2E_STAFF_EMAIL` / `E2E_STAFF_PASSWORD` | Staff login for the cancel fallback only; default the documented dev demo account                                                        |
+
+Safety: before any write, a customer found by the test phone whose first name does not start with `E2E ` is refused (exit 1, nothing written). Only the test customer's pets named `Max` / `Bruno` are ever deleted; any other pet is left alone.
+
+Steps (each prints PASS, SKIP or FAIL with the HTTP status and the error code; the first FAIL stops the run and the cleanup still runs):
+
+1. `1a` by-phone lookup (refuses a non-test customer), `1b` `PUT customers/by-phone` (first name `E2E Pets`, a CDMX address), `1c` by-phone resolves to the same customer and carries `customer.pets` (else the credential lacks `pets:read`).
+2. `2` list pets `?status=ALL` and delete leftover `Max` / `Bruno` pets of earlier runs (with version; one reread on a conflict; 404 = gone).
+3. `3a` create Max (DOG, Labrador, LARGE, birth date YEAR → stored `YYYY-01-01`, `ageLabel` with `~`, `createdVia` CHATBOT, version 1) under an idempotency key; `3b` same key + body → 200 identical; `3c` changed body, same key → `409 IDEMPOTENCY_KEY_CONFLICT`.
+4. `4` create Bruno (DOG, Chihuahua, SMALL, MONTH precision → stored on the 1st) → `ageLabel` and `ageMonths` present.
+5. `5` by-phone `customer.pets` lists both, ACTIVE.
+6. `6a` PATCH Max allergies «pollo» with the version → version + 1; `6b` the stale version → `409 PET_VERSION_CONFLICT` with `currentVersion`.
+7. `7a` pickup checkout for the test customer with two different products (picked by catalog search: no variants, price, stock ≥ 2; prices from evaluate-cart), one line `petId` = Max and one without pet → 201; `7b` the same product on two lines with Max and Bruno → `400 INVALID_CHECKOUT_REQUEST`. Both SKIP when fewer than 2 products are found.
+8. `8a` order history `?petId=Max` contains the sale, the Max line has `pet {id, name}` and the other line `pet: null` (SKIP without a checkout); `8b` `?petId=Bruno` → `200 []`; `8c` unknown `petId` → `404 PET_NOT_FOUND`.
+9. `9a` archive Bruno with a reason → ARCHIVED; `9b` by-phone lists Max and not Bruno; `9c` restore → ACTIVE; `9d` archive again.
+10. `10a` delete Bruno with the version → 204; `10b` again → `404 PET_NOT_FOUND`.
+11. Cleanup in a `finally` (also after a failure): cancel every sale the run created (bot `cancelSale` `ORDER_ERROR`, staff cancel as fallback), delete every pet the run created, then verify no `Max` / `Bruno` pet is left. Whatever could not be cleaned is printed as `NOT_CLEANED`. The test customer stays (the chatbot API has no customer delete), and so do the cancelled sales in its history.
+
+Exit code: 0 every non-SKIP step passed and everything was cleaned; 1 a step failed, the run aborted or something is not cleaned; 2 missing env, a refused base URL or a refused test phone. Writes DEV data only.
+
+The pure parts (allow-list, phone and customer guards, redaction, step runner, exit code) are pinned by `pets-e2e-lib.spec.ts`. Jest's `rootDir` is `src`, so run it with:
+
+```sh
+pnpm test --roots '<rootDir>/../scripts/e2e' --runTestsByPath scripts/e2e/pets-e2e-lib.spec.ts
+```
