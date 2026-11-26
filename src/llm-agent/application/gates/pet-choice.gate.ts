@@ -37,8 +37,12 @@ export type PetChoicePurpose = (typeof PET_CHOICE_PURPOSES)[number];
  *  every known pet up to this cap). */
 export const PET_CHOICE_OPTIONS_MAX = 50;
 
+/** T6b: the ref older builds gave the single profile pet (removed). */
+const PET_CHOICE_LEGACY_REF = 'legacy';
+
 /**
- * One offered answer: a pet ref (`backend:<id>`, `local:<id>`, `legacy`),
+ * One offered answer: a pet ref (`backend:<id>`, `local:<id>`; T6b: the
+ * `legacy` ref of an older build's row is no longer offered, see `read`),
  * `other` («Otra mascota» / «Es otra mascota») or `forgotten` (T4c-2b: the
  * just-forgotten pet a diminutive may name), and its display text: the
  * pet's name, or the kind (breed/species) of a nameless pet. A typed answer
@@ -202,10 +206,20 @@ export class DurablePetChoice {
     this.choices.delete(senderId);
   }
 
-  /** The live question, or `null` when absent or expired. */
+  /** The live question, or `null` when absent or expired. T6b: an option
+   *  with the `legacy` ref (a row an older build stored for the single
+   *  profile pet, which no longer exists) is not offered any more: its tap
+   *  is stale and its text never answers. The durable row is untouched. */
   read(senderId: string): PetChoice | null {
     const live = this.live(senderId);
-    return live === null ? null : copy(live.choice);
+    if (live === null) return null;
+    const choice = copy(live.choice);
+    return {
+      ...choice,
+      options: choice.options.filter(
+        (option) => option.ref !== PET_CHOICE_LEGACY_REF,
+      ),
+    };
   }
 
   private live(senderId: string) {

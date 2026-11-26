@@ -10,12 +10,19 @@ describe('InMemoryCustomerProfileStore', () => {
     const store = new InMemoryCustomerProfileStore();
     const saved = await store.upsert(
       '5215550001111',
-      { pet: { name: 'Luna' } },
+      {
+        displayName: 'Ana',
+        lastOrder: {
+          folio: 'A-1',
+          confirmedAt: '2026-11-01T10:00:00.000Z',
+          totalCents: 1000,
+        },
+      },
       new Date('2026-11-07T00:00:00.000Z'),
     );
-    saved!.pet!.name = 'mutated';
+    saved!.lastOrder!.folio = 'mutated';
     await expect(store.read('5215550001111')).resolves.toMatchObject({
-      pet: { name: 'Luna' },
+      lastOrder: { folio: 'A-1' },
     });
   });
 });

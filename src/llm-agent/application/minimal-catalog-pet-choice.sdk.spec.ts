@@ -648,3 +648,83 @@ describe('T4c-2a-fix which-pet hardening (J1, J4)', () => {
     expect(sink.join('')).toContain('fewer_than_two_pets');
   });
 });
+
+describe('T6b a pet_choice row from an older build with the `legacy` ref', () => {
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  /** The row an older build stored when it offered the legacy single pet. */
+  const legacyRow = (w: ReturnType<typeof world>, purpose = 'request') =>
+    w.gateStore.put({
+      senderId: SENDER,
+      kind: 'pet_choice',
+      payload:
+        purpose === 'forget'
+          ? {
+              purpose: 'forget',
+              options: [
+                { ref: 'legacy', text: 'Luna' },
+                { ref: `backend:${MAX_ID}`, text: 'Luna' },
+              ],
+              name: 'Luna',
+            }
+          : {
+              purpose: 'request',
+              options: [
+                { ref: 'legacy', text: 'Luna' },
+                { ref: `backend:${MAX_ID}`, text: 'Max' },
+              ],
+              request: 'busco croquetas',
+            },
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+
+  it.each([
+    ['pets loaded', undefined],
+    ['lookup unavailable', 'fail' as const],
+    ['lookup over the budget', 'hang' as const],
+  ])(
+    '%s: the tap pet_pick:legacy loads without throwing, is stale and clears the gate',
+    async (_label, mode) => {
+      const w = world({ current: customer([pet({}), max()]), mode });
+      await legacyRow(w);
+      const h = w.boot();
+      const decision = await h.turn('Luna', [], 'pet_pick:legacy');
+      expect(decision.reply).toBe(STALE);
+      expect(h.seen).toHaveLength(0);
+      await expect(w.gateStore.get(SENDER, 'pet_choice')).resolves.toBeNull();
+    },
+    10_000,
+  );
+
+  it('the forget question: the tap on the legacy row is stale, nothing archived', async () => {
+    const w = world({ current: customer([pet({}), max()]), mode: 'fail' });
+    await legacyRow(w, 'forget');
+    const h = w.boot();
+    const decision = await h.turn('Luna', [], 'pet_pick:legacy');
+    expect(decision.reply).toBe(STALE);
+    await expect(w.gateStore.get(SENDER, 'pet_choice')).resolves.toBeNull();
+  });
+
+  it('the typed name of the legacy option is a new message (never the legacy pet), the gate cleared', async () => {
+    const w = world({ current: customer([pet({}), max()]), mode: 'fail' });
+    await legacyRow(w);
+    const h = w.boot();
+    await h.turn('Luna', [[say('¿En qué le ayudo?')]]);
+    expect(h.lastUser()).toBe('Luna');
+    expect(lineOf(h.system())).toBeUndefined();
+    await expect(w.gateStore.get(SENDER, 'pet_choice')).resolves.toBeNull();
+  });
+
+  it('the other options of the same row still answer it (J1: from the gate option)', async () => {
+    const w = world({ current: customer([pet({}), max()]), mode: 'fail' });
+    await legacyRow(w);
+    const h = w.boot();
+    await h.turn('para Max', [[say('Para Max…')]]);
+    expect(h.lastUser()).toBe('busco croquetas');
+    expect(lineOf(h.system())).toContain('"Max"');
+  });
+});

@@ -27,8 +27,8 @@ class LocalPetStoreTimeoutError extends Error {
 
 /**
  * T4b (S8): the prospect's local pet list in `customer_profiles.pets`
- * (migration 5700). Replace semantics in one statement; the legacy `pet`
- * column and every other column are never touched. An empty list clears an
+ * (migration 5700). Replace semantics in one statement; every other
+ * column is never touched. An empty list clears an
  * existing row and never creates a profile.
  *
  * F1: every call runs in its own transaction on a client taken from the

@@ -70,8 +70,6 @@ import {
 import {
   extractPetAllergy,
   extractPetFacts,
-  knownPetPromptLine,
-  petFactsConflict,
 } from '../../customer-profile/domain/pet-facts';
 import {
   customerStyleSeed,
@@ -483,7 +481,7 @@ const toolError = (kind: string) => ({ ok: false as const, error: kind });
 
 /** T4c-1 G2: the forgetPet tool result for each store outcome. */
 const forgetPetResult = (outcome: ForgetPetOutcome) =>
-  outcome === 'archived' || outcome === 'removed' || outcome === 'cleared'
+  outcome === 'archived' || outcome === 'removed'
     ? { ok: true as const, forgotten: true as const }
     : outcome === 'none'
       ? toolError('no_pet_with_that_name')
@@ -1228,7 +1226,7 @@ function customerTexts(turns: readonly MinimalCatalogTurn[]): string[] {
 // inquiry capabilities. No checkout, payment or inventory reservations.
 /**
  * T5a R1: the cart pet of a known BACKEND pet with a name (`ref`
- * `backend:<uuid>`); local and legacy pets never go on a cart line.
+ * `backend:<uuid>`); local pets never go on a cart line.
  */
 function backendCartPet(
   known: readonly KnownPet[],
@@ -1337,8 +1335,8 @@ export class MinimalCatalogAgentService {
     @Optional()
     private readonly backorderConfirm?: MinimalBackorderConfirmService,
     // Multi-pet T4b: backend pets for a Customer, a local list for a
-    // prospect; optional only as a test seam (without it the single stored
-    // pet of the profile is used as before).
+    // prospect; optional only as a test seam (T6b: without it no pet is
+    // known, remembered or forgotten; the module always provides it).
     @Optional()
     private readonly pets?: CustomerPetsService,
   ) {
@@ -2875,7 +2873,7 @@ export class MinimalCatalogAgentService {
    * T5b (S4): the pet a «lo de siempre para <nombre>» names: exactly one
    * known pet with that folded name (with 2+, the pet the customer chose in
    * the which-pet question when it is one of them). A backend pet is read by
-   * id; a local or legacy pet has no orders (`{ name }` only). Only an
+   * id; a local pet has no orders (`{ name }` only). Only an
    * explicit name gets here: the cart's current pet is never implied.
    */
   private async reorderPet(
@@ -4123,10 +4121,9 @@ export class MinimalCatalogAgentService {
     const profile = this.profiles.cached(senderId);
     const known = [
       knownCustomerPromptLine(profile),
-      // T4b: one line per known pet (backend, local and the legacy one).
-      this.pets === undefined
-        ? knownPetPromptLine(profile?.pet)
-        : this.pets.promptLines(senderId, profile?.pet),
+      // T4b: one line per known pet (backend, then local). T6b: without
+      // the pet store there are no pet lines (the profile has no pet).
+      this.pets?.promptLines(senderId) ?? null,
     ].filter((line): line is string => line !== null);
     return `\n\n${[PET_MEMORY_INSTRUCTIONS, ...known].join('\n')}`;
   }
@@ -4490,11 +4487,7 @@ export class MinimalCatalogAgentService {
         keep = true;
         return reply(PET_FORGET_PENDING_REPLY);
       }
-      if (
-        outcome === 'archived' ||
-        outcome === 'removed' ||
-        outcome === 'cleared'
-      ) {
+      if (outcome === 'archived' || outcome === 'removed') {
         keep = true;
         return reply(PET_FORGET_DONE_REPLY);
       }
@@ -4608,10 +4601,9 @@ export class MinimalCatalogAgentService {
     if (pets === undefined || !this.petListLoaded(senderId))
       return answered(PET_CHOICE_UNAVAILABLE_REPLY, false);
     const facts: PetFacts = { ...live.facts };
-    const legacy = this.profiles?.cached(senderId)?.pet;
     if (option.ref === PET_CHOICE_OTHER_REF) {
       const captured = await this.petWriteWithinBudget('capture', () =>
-        pets.capture(senderId, facts, legacy),
+        pets.capture(senderId, facts),
       );
       return captured === 'over_budget'
         ? answered(PET_DIMINUTIVE_PENDING_REPLY, false)
@@ -4621,7 +4613,7 @@ export class MinimalCatalogAgentService {
     const rest: PetFacts = { ...facts };
     delete rest.name;
     const outcome = await this.petWriteWithinBudget('capture', () =>
-      pets.captureForRef(senderId, option.ref, rest, legacy),
+      pets.captureForRef(senderId, option.ref, rest),
     );
     switch (outcome) {
       case 'applied':
@@ -4642,7 +4634,7 @@ export class MinimalCatalogAgentService {
 
   /**
    * T5a R2 (S17): the which-pet answer replaces the cart's current pet: the
-   * chosen backend pet, else none (a local or legacy pet, or a pet that is no
+   * chosen backend pet, else none (a local pet, or a pet that is no
    * longer known). With this turn's pets not loaded only a repeat of the
    * pet already chosen keeps it. Best effort: a failed write is logged and
    * the request continues (its lines then simply carry no chosen pet).
@@ -4672,7 +4664,7 @@ export class MinimalCatalogAgentService {
    * T5a R2 (S17): the backend pet the cart lines written now are for: the
    * pet the customer chose (kept on the cart) while still known, else the
    * only known pet when it is a backend pet. `undefined` when this turn's
-   * pets are not loaded, for prospects (local pets) and the legacy pet.
+   * pets are not loaded and for prospects (local pets).
    * Never from model input.
    */
   private async cartPet(senderId: string): Promise<CartPet | undefined> {
@@ -5129,37 +5121,41 @@ export class MinimalCatalogAgentService {
               presentedByApplication: true as const,
             };
           }
+          // T6b: without the pet store nothing is remembered (the profile
+          // keeps no pet of its own).
+          if (this.pets === undefined)
+            return { ok: true as const, remembered: false as const };
           // T4b: the matched pet of the pet store (never mixes two pets).
-          if (this.pets !== undefined) {
-            // T4b-fix A2: the pets of this turn are not loaded; no writes.
-            if (this.petsOverBudget.has(senderId))
-              return { ok: true as const, remembered: false as const };
-            // T4b-fix-2 D1: waits at most PET_PREPARE_BUDGET_MS (the capture
-            // may queue behind other pet work of the sender); past it the
-            // capture goes on in the background. A failure inside the
-            // budget is thrown as before.
-            const pets = this.pets;
-            const capture = (async () =>
-              pets.capture(senderId, pet, profiles.cached(senderId)?.pet))();
-            const outcome = await this.withinPetBudget(
-              capture.then(
-                () => ({ failed: false as const }),
-                (error: unknown) => ({ failed: true as const, error }),
-              ),
+          // T4b-fix A2: the pets of this turn are not loaded; no writes.
+          if (this.petsOverBudget.has(senderId))
+            return { ok: true as const, remembered: false as const };
+          // T4b-fix-2 D1: waits at most PET_PREPARE_BUDGET_MS (the capture
+          // may queue behind other pet work of the sender); past it the
+          // capture goes on in the background. A failure inside the
+          // budget is thrown as before.
+          const pets = this.pets;
+          const capture = (async () => pets.capture(senderId, pet))();
+          const outcome = await this.withinPetBudget(
+            capture.then(
+              (stored) => ({ failed: false as const, stored }),
+              (error: unknown) => ({ failed: true as const, error }),
+            ),
+          );
+          if (outcome === 'over_budget') {
+            this.logger.warn(
+              `customer pets capture over budget (${PET_PREPARE_BUDGET_MS} ms): continuing in the background`,
             );
-            if (outcome === 'over_budget') {
-              this.logger.warn(
-                `customer pets capture over budget (${PET_PREPARE_BUDGET_MS} ms): continuing in the background`,
-              );
-              void this.petsInBackground('capture', () => capture);
-              return {
-                ok: true as const,
-                remembered: false as const,
-                pending: true as const,
-              };
-            }
-            if (outcome.failed) throw outcome.error;
-          } else await profiles.record(senderId, { pet });
+            void this.petsInBackground('capture', () => capture);
+            return {
+              ok: true as const,
+              remembered: false as const,
+              pending: true as const,
+            };
+          }
+          if (outcome.failed) throw outcome.error;
+          // T6b review R4: the pet store could not keep it this turn.
+          if (outcome.stored === 'not_stored')
+            return { ok: true as const, remembered: false as const };
           return { ok: true as const, remembered: true as const };
         },
       }),
@@ -5211,7 +5207,7 @@ export class MinimalCatalogAgentService {
     };
   }
 
-  /** T4c-1 G2: the forgetPet tool body (store or legacy pet). */
+  /** T4c-1 G2: the forgetPet tool body. */
   private async forgetPetNow(
     senderId: string,
     name: string,
@@ -5221,21 +5217,9 @@ export class MinimalCatalogAgentService {
     | { ok: true; forgotten: false; pending: true }
     | { ok: false; error: string }
   > {
-    const profiles = this.profiles;
     const pets = this.pets;
-    // Without the pet store only the legacy single pet exists.
-    if (pets === undefined) {
-      const legacy = profiles?.cached(senderId)?.pet?.name;
-      if (
-        profiles === undefined ||
-        legacy === undefined ||
-        foldPetName(legacy) !== foldPetName(name)
-      )
-        return toolError('no_pet_with_that_name');
-      return (await profiles.clearPet(senderId))
-        ? { ok: true as const, forgotten: true as const }
-        : toolError('pet_memory_unavailable');
-    }
+    // T6b: without the pet store no pet is known (the profile has none).
+    if (pets === undefined) return toolError('no_pet_with_that_name');
     // T4b-fix A2: the pets of this turn are not loaded; no writes.
     if (this.petsOverBudget.has(senderId))
       return toolError('pet_memory_unavailable');
@@ -5290,21 +5274,11 @@ export class MinimalCatalogAgentService {
         patch.emojis = emojis;
       const name = explicitPreferredName(input.text);
       if (name !== null) patch.preferredName = name;
-      // Deterministic pet capture, in addition to rememberPetDetails; a
-      // different pet is skipped so two pets are never mixed. With the pet
-      // store (T4b) the facts go to the matched pet instead (below).
-      const pet = extractPetFacts(input.text);
-      if (
-        this.pets === undefined &&
-        !forgotPet &&
-        Object.keys(pet).length > 0 &&
-        !petFactsConflict(profiles.cached(input.senderId)?.pet, pet) &&
-        !this.petRecentlyForgotten(input.senderId, pet.name)
-      )
-        patch.pet = pet;
     }
     await profiles.record(input.senderId, patch);
     const pets = this.pets;
+    // Deterministic pet capture, in addition to rememberPetDetails: the
+    // facts go to the matched pet of the pet store (T4b; none without it).
     // T4b-fix A3: the capture runs in the background (never delays the
     // reply; a failure is logged). A2: none after an over-budget prepare.
     if (
@@ -5314,7 +5288,6 @@ export class MinimalCatalogAgentService {
       !this.petsOverBudget.has(input.senderId)
     ) {
       const { facts, allergy, joined } = statementPetFacts(input.text);
-      const legacy = profiles.cached(input.senderId)?.pet;
       // T4c-1-fix H1: a pet forgotten earlier in the turn (or the window)
       // is never captured again (with the same name, the allergy neither).
       // T4c-2b Q3: a diminutive of a known or just-forgotten pet is never
@@ -5344,7 +5317,7 @@ export class MinimalCatalogAgentService {
             this.logger.warn(
               'customer pets archived pet names unknown: the capture goes ahead',
             );
-          await pets.capture(input.senderId, facts, legacy);
+          await pets.capture(input.senderId, facts);
         });
       }
       if (
@@ -5353,7 +5326,7 @@ export class MinimalCatalogAgentService {
         !this.petRecentlyForgotten(input.senderId, allergy.name)
       )
         void this.petsInBackground('capture', () =>
-          pets.captureAllergy(input.senderId, allergy, legacy),
+          pets.captureAllergy(input.senderId, allergy),
         );
     }
   }

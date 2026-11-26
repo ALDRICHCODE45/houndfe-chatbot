@@ -5,7 +5,7 @@ import type { CustomerProfileStore } from '../domain/customer-profile';
  * Shared contract for every `LocalPetStore` adapter (T4b, S8): round-trip of
  * the prospect's local pet list, replace semantics (an uploaded entry is
  * removed), invalid entries dropped on read, invalid sender ids refused, the
- * profile's other columns (and the legacy `pet`) untouched.
+ * profile's other columns untouched.
  */
 export type LocalPetStoreFactory = () => Promise<{
   store: LocalPetStore;
@@ -76,16 +76,12 @@ export function runLocalPetStoreContract(
       await expect(profiles.read(SENDER)).resolves.toBeNull();
     });
 
-    it('keeps the profile and the legacy pet untouched', async () => {
-      await profiles.upsert(
-        SENDER,
-        { displayName: 'Ana', pet: { name: 'Toby', species: 'perro' } },
-        T1,
-      );
+    it('keeps the profile untouched', async () => {
+      await profiles.upsert(SENDER, { displayName: 'Ana', register: 'tu' }, T1);
       await store.write(SENDER, [luna], T1);
       await expect(profiles.read(SENDER)).resolves.toMatchObject({
         displayName: 'Ana',
-        pet: { name: 'Toby', species: 'perro' },
+        register: 'tu',
       });
     });
 

@@ -117,7 +117,7 @@ import { composeSaleFlowSystemPrompt } from '../sale-flow/domain/sale-flow-instr
     HumanDecisionsModule,
     // S5: PENDING zones register a DELIVERY_ZONE requester (always on).
     DeliveryZonesModule,
-    // S1: persistent customer memory (style, names, pet, last order).
+    // S1: persistent customer memory (style, names, last order).
     CustomerProfileModule,
     // Restock backorder S1: the backorder port and the late-bound holder of
     // the offer capability the RESTOCK estimate coordinator resolves.
