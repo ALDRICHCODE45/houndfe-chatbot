@@ -389,6 +389,37 @@ describe('checkout shipping contract (C1)', () => {
     };
     expect(normalizeCheckoutResponse(bare)).toEqual(bare);
   });
+  it('accepts the additive pickupLocation.location (branch contract): coordinates or null; absent on older replays', () => {
+    const pinned = {
+      ...contractPickup201,
+      pickupLocation: {
+        ...contractPickup201.pickupLocation,
+        location: { latitude: 19.4326, longitude: -99.1332 },
+      },
+    };
+    expect(normalizeCheckoutResponse(pinned)).toEqual(pinned);
+    expect(
+      normalizeCheckoutStatus({ status: 'succeeded', checkout: pinned }),
+    ).toEqual({ status: 'succeeded', checkout: pinned });
+    const unpinned = {
+      ...contractPickup201,
+      pickupLocation: { ...contractPickup201.pickupLocation, location: null },
+    };
+    expect(normalizeCheckoutResponse(unpinned)).toEqual(unpinned);
+    for (const location of [
+      { latitude: 91, longitude: 0 },
+      { latitude: 0, longitude: -181 },
+      { latitude: 19.4 },
+      { latitude: 19.4, longitude: -99.1, extra: 1 },
+      { latitude: '19.4', longitude: '-99.1' },
+    ])
+      expect(
+        normalizeCheckoutResponse({
+          ...contractPickup201,
+          pickupLocation: { ...contractPickup201.pickupLocation, location },
+        }),
+      ).toBeNull();
+  });
   it('pickup request: existing and new customer without deliveryAddress', () => {
     const items = [
       {

@@ -189,11 +189,21 @@ const pickupHours = z
     summary: text,
   })
   .strict();
+/** Branch contract: the store pin; null until staff set it. */
+const pickupCoordinates = z
+  .object({
+    latitude: z.number().finite().min(-90).max(90),
+    longitude: z.number().finite().min(-180).max(180),
+  })
+  .strict();
 const pickupLocation = z
   .object({
     name: text,
     address: pickupAddress.nullable(),
     hours: pickupHours.nullable(),
+    // Additive (branch contract): absent on replays of sales created before
+    // the backend added it, so optional as well as nullable.
+    location: pickupCoordinates.nullable().optional(),
   })
   .strict();
 export type CheckoutPickupLocation = z.infer<typeof pickupLocation>;

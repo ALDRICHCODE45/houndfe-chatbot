@@ -104,3 +104,7 @@ pickupLocation.address falls back to the free-text sucursal address (only `forma
 2. Not expired, else 409 `SHIPPING_QUOTE_EXPIRED`.
 3. Phone (digits), lines (product, variant, quantity, order-insensitive) and destination (exact 5-digit ZIP plus state/municipality/neighborhood, ignoring case, accents and spaces) match, else 409 `SHIPPING_QUOTE_MISMATCH` with every failing part in `mismatches`.
 4. Inside the transaction, with the quote locked: not used by another sale, else 409 `SHIPPING_QUOTE_ALREADY_USED` (expiry is re-checked here too).
+
+### `pickupLocation.location` (additive, 2026-11-26)
+
+Backend branch contract (`GET /chatbot-api/branch`, backend main ba138ae1) adds the store pin to the pickup response: `location: { latitude, longitude } | null` (null until staff set it via `PUT /tenants/:id/shipping-origin`). Replays of sales created before that change omit the key; the bot treats a missing key as null. Coordinates outside ±90/±180, non-numbers or extra keys fail closed like any other contract drift.
