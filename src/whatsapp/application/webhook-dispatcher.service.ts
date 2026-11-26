@@ -63,7 +63,10 @@ import {
   InboundMirrorOnly,
 } from '../domain/inbound-message';
 import { AUDIO_UNSUPPORTED_REPLY } from '../domain/inbound-reply-copy';
-import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
+import {
+  REPLY_LOCATION_TIMEOUT_MS,
+  WHATSAPP_SENDER,
+} from '../domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';
 import { RECENT_OUTBOUND } from '../domain/recent-outbound.store';
 import type { RecentOutboundStore } from '../domain/recent-outbound.store';
@@ -82,8 +85,9 @@ import {
 /**
  * T2-fix J1: the longest wait for the optional store pin after the text was
  * sent and the message marked seen (the webhook is not held longer).
+ * T2-fix-2 K4: defined with the sender port, which also bounds the request.
  */
-export const REPLY_LOCATION_TIMEOUT_MS = 5_000;
+export { REPLY_LOCATION_TIMEOUT_MS };
 
 /** Customer media that reopens the WhatsApp window and so triggers replays. */
 const WINDOW_REOPENING_MIRROR_TYPES: ReadonlySet<string> = new Set([
@@ -1012,7 +1016,9 @@ export class WebhookDispatcherService {
   /** T2 H3: best effort. A failed or unsupported pin is only logged; the
    * text it follows was sent once and is never repeated. T2-fix J1: the
    * wait is bounded by `REPLY_LOCATION_TIMEOUT_MS` (a late answer is still
-   * remembered as the bot's own outbound). Never throws. */
+   * remembered as the bot's own outbound). T2-fix-2 K4: the Meta request
+   * has the same timeout, so a hung pin ends; one accepted after the wait
+   * logs its own «sent late» line. Never throws. */
   private async sendReplyLocation(
     to: string,
     location: CustomerReplyLocation,
@@ -1021,11 +1027,16 @@ export class WebhookDispatcherService {
       this.whatsappSender,
     );
     if (sendLocation === undefined) return;
+    let timedOut = false;
     const sent = Promise.resolve()
       .then(() => sendLocation({ to, ...location }))
       .then(
         ({ providerMessageId }) => {
           this.recentOutbound.remember(providerMessageId);
+          if (timedOut)
+            this.logger.warn(
+              `reply location sent late (after the ${REPLY_LOCATION_TIMEOUT_MS} ms wait) for ${maskConversationRef(to)}; it may follow a later reply`,
+            );
           return 'sent' as const;
         },
         (error: unknown) => {
@@ -1036,13 +1047,14 @@ export class WebhookDispatcherService {
         },
       );
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<'timeout'>((resolve) => {
+    const timeout = new Promise<'timeout'>((resolve) => {
       timer = setTimeout(() => resolve('timeout'), REPLY_LOCATION_TIMEOUT_MS);
       timer.unref?.();
     });
-    const outcome = await Promise.race([sent, timedOut]);
+    const outcome = await Promise.race([sent, timeout]);
     clearTimeout(timer);
-    if (outcome === 'timeout')
+    timedOut = outcome === 'timeout';
+    if (timedOut)
       this.logger.warn(
         `reply location timed out after ${REPLY_LOCATION_TIMEOUT_MS} ms for ${maskConversationRef(to)}; the text was sent`,
       );

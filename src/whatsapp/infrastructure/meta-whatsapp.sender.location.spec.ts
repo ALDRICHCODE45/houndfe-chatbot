@@ -3,7 +3,10 @@ import { ConfigService } from '@nestjs/config';
 import { AxiosHeaders, type AxiosResponse } from 'axios';
 import { of, throwError } from 'rxjs';
 import type { OutboundTranscriptEntry } from '../../conversation-transcript/application/transcript-recorder';
-import { UnsupportedOutboundError } from '../domain/whatsapp-sender.port';
+import {
+  REPLY_LOCATION_TIMEOUT_MS,
+  UnsupportedOutboundError,
+} from '../domain/whatsapp-sender.port';
 import { MetaWhatsappSender } from './meta-whatsapp.sender';
 
 /**
@@ -111,6 +114,17 @@ describe('MetaWhatsappSender.sendLocation (T2 H3)', () => {
           .location,
       ),
     ).toEqual(['latitude', 'longitude']);
+  });
+
+  it('T2-fix-2 K4: the pin request has its own timeout (REPLY_LOCATION_TIMEOUT_MS); a text send keeps the default', async () => {
+    post.mockReturnValue(of(axiosResponse({ messages: [{ id: 'wamid.x' }] })));
+    await sender.sendLocation({ to: TO, latitude: 1, longitude: 1 });
+    await sender.sendText({ to: TO, text: 'Hola' });
+    expect(REPLY_LOCATION_TIMEOUT_MS).toBe(5_000);
+    expect(post.mock.calls[0][2]).toEqual(
+      expect.objectContaining({ timeout: REPLY_LOCATION_TIMEOUT_MS }),
+    );
+    expect(post.mock.calls[1][2]).not.toHaveProperty('timeout');
   });
 
   it.each([

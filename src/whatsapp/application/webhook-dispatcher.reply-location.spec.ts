@@ -105,8 +105,6 @@ function setup(
   return { service, sender, order, recentOutbound, dedup };
 }
 
-const order = (h: { order: string[] }) => h.order;
-
 describe('WebhookDispatcherService reply location (T2 H3)', () => {
   afterEach(() => jest.restoreAllMocks());
 
@@ -198,7 +196,7 @@ describe('WebhookDispatcherService reply location (T2 H3)', () => {
       h.sender.sendLocation.mockImplementationOnce(async () => {
         // At the moment the pin goes out, the turn is already DONE.
         expect(h.dedup.markSeen).toHaveBeenCalledWith('wamid.in');
-        order(h).push('location');
+        h.order.push('location');
         return { providerMessageId: 'wamid.pin' };
       });
       await h.service.dispatch(textEvent('¿dónde están?'));
@@ -215,7 +213,7 @@ describe('WebhookDispatcherService reply location (T2 H3)', () => {
         location: PIN,
       });
       h.sender.sendLocation.mockImplementationOnce(() => {
-        order(h).push('location');
+        h.order.push('location');
         return new Promise<never>(() => undefined);
       });
       let done = false;
@@ -235,6 +233,49 @@ describe('WebhookDispatcherService reply location (T2 H3)', () => {
       const logged = warn.mock.calls.map(([line]) => String(line)).join('\n');
       expect(logged).toContain('reply location timed out');
       expect(logged).not.toContain(SENDER);
+    });
+
+    it('K4: a pin that completes after the timeout logs a distinct «late» line (and is remembered)', async () => {
+      jest.useFakeTimers();
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      const h = setup({
+        reply: 'Nos encuentra en *Sucursal Centro*',
+        location: PIN,
+      });
+      let answer: (value: { providerMessageId: string }) => void = () =>
+        undefined;
+      h.sender.sendLocation.mockImplementationOnce(() => {
+        h.order.push('location');
+        return new Promise((resolve) => {
+          answer = resolve;
+        });
+      });
+      const dispatched = h.service.dispatch(textEvent('¿dónde están?'));
+      await jest.advanceTimersByTimeAsync(5_000);
+      await dispatched;
+      answer({ providerMessageId: 'wamid.pin.late' });
+      await jest.advanceTimersByTimeAsync(0);
+      const logged = warn.mock.calls.map(([line]) => String(line)).join('\n');
+      expect(logged).toContain('reply location timed out');
+      expect(logged).toContain('reply location sent late');
+      expect(logged).not.toContain(SENDER);
+      expect(h.recentOutbound.remember).toHaveBeenCalledWith('wamid.pin.late');
+      expect(h.sender.sendText).toHaveBeenCalledTimes(1);
+    });
+
+    it('K4: a pin answered in time logs no «late» line', async () => {
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      const h = setup({
+        reply: 'Nos encuentra en *Sucursal Centro*',
+        location: PIN,
+      });
+      await h.service.dispatch(textEvent('¿dónde están?'));
+      const logged = warn.mock.calls.map(([line]) => String(line)).join('\n');
+      expect(logged).not.toContain('reply location');
     });
   });
 });

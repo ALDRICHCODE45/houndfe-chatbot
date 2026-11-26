@@ -59,6 +59,14 @@ export interface OutboundDocument extends OutboundOriginOption {
  * pin. Latitude in [-90, 90], longitude in [-180, 180]; `name` and `address`
  * are optional labels shown on the pin.
  */
+/**
+ * T2-fix J1 / T2-fix-2 K4: the longest wait for the optional store pin: the
+ * dispatcher's bound after the text was sent and the message marked seen,
+ * and the pin HTTP request's own timeout in the Meta sender (so a hung
+ * request ends instead of landing after the next reply).
+ */
+export const REPLY_LOCATION_TIMEOUT_MS = 5_000;
+
 export interface OutboundLocation extends OutboundOriginOption {
   to: string;
   latitude: number;

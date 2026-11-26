@@ -26,6 +26,7 @@ import {
   OutboundOrigin,
   OutboundTemplate,
   OutboundText,
+  REPLY_LOCATION_TIMEOUT_MS,
   SendResult,
   UnsupportedOutboundError,
   WhatsappSenderPort,
@@ -48,6 +49,11 @@ interface SendOptions {
   origin?: OutboundOrigin;
   /** Media mime type, recorded with a media-id send. */
   mimeType?: string;
+  /**
+   * T2-fix-2 K4: the request's own timeout (ms). Only the store pin sets
+   * it; every other send keeps the HTTP client's defaults.
+   */
+  timeoutMs?: number;
 }
 
 const ORIGINS: ReadonlySet<string> = new Set(['BOT', 'STAFF', 'TEMPLATE']);
@@ -164,7 +170,8 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
             : { address: message.address }),
         },
       },
-      { origin: message.origin },
+      // T2-fix-2 K4: a hung pin request ends (the dispatcher's same bound).
+      { origin: message.origin, timeoutMs: REPLY_LOCATION_TIMEOUT_MS },
     );
   }
 
@@ -371,10 +378,13 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
         'meta.sandboxRecipientNormalizationEnabled',
       ) === true;
 
-    const response = await this.postMessage({
-      ...payload,
-      to: normalizeSandboxRecipient(payload.to, sandboxNormalization),
-    });
+    const response = await this.postMessage(
+      {
+        ...payload,
+        to: normalizeSandboxRecipient(payload.to, sandboxNormalization),
+      },
+      options.timeoutMs,
+    );
 
     // T2: the moment Meta accepted the send, before any local bookkeeping.
     const acceptedAt = new Date();
@@ -456,6 +466,7 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
 
   private async postMessage(
     payload: MetaMessagePayload,
+    timeoutMs?: number,
   ): Promise<MetaSendResponse> {
     try {
       const response = await lastValueFrom(
@@ -466,6 +477,7 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
             headers: {
               Authorization: `Bearer ${this.configService.getOrThrow<AppConfig['meta']['accessToken']>('meta.accessToken')}`,
             },
+            ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
           },
         ),
       );
