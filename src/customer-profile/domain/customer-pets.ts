@@ -298,14 +298,36 @@ interface NormalizedFacts {
   notes?: string;
 }
 
+/** T7: a fact value with no letter or digit («.», «-», «…») is absent. */
+const HAS_LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
+
+/** T7: «(es) alérgico al» / «alérgica a la»… before the allergen. */
+const ALLERGY_LEAD =
+  /^(?:es\s+)?al[eé]rgic[oa]s?(?:\s+(?:a\s+las|a\s+los|a\s+la|al|a))?(?=\s|$)\s*/iu;
+
+function petFactText(value: unknown, max: number): string | undefined {
+  const text = sanitizeProfileText(value, max);
+  return text !== undefined && HAS_LETTER_OR_DIGIT.test(text)
+    ? text
+    : undefined;
+}
+
+/** T7: the allergen only («alérgico al pollo» → «pollo»). */
+function allergenText(value: unknown): string | undefined {
+  const text = petFactText(value, PET_ALLERGIES_MAX);
+  return text === undefined
+    ? undefined
+    : petFactText(text.replace(ALLERGY_LEAD, ''), PET_ALLERGIES_MAX);
+}
+
 function normalizeFacts(facts: PetFacts): NormalizedFacts {
   const out: NormalizedFacts = {};
-  const name = sanitizeProfileText(facts.name, PET_LIMITS.name);
+  const name = petFactText(facts.name, PET_LIMITS.name);
   if (name !== undefined) out.name = name;
   const species =
     facts.species === undefined ? undefined : petSpeciesWord(facts.species);
   if (species !== undefined) out.species = species;
-  const breed = sanitizeProfileText(facts.breed, PET_LIMITS.breed);
+  const breed = petFactText(facts.breed, PET_LIMITS.breed);
   if (breed !== undefined) out.breed = breed;
   const size = facts.size === undefined ? undefined : petSizeWord(facts.size);
   if (size !== undefined) out.size = size;
@@ -313,9 +335,9 @@ function normalizeFacts(facts: PetFacts): NormalizedFacts {
   if (approxAge !== undefined) out.approxAge = approxAge;
   const stage = stageFromText(facts.ageText);
   if (stage !== undefined) out.stage = stage;
-  const allergies = sanitizeProfileText(facts.allergies, PET_ALLERGIES_MAX);
+  const allergies = allergenText(facts.allergies);
   if (allergies !== undefined) out.allergies = allergies;
-  const notes = sanitizeProfileText(facts.notes, PET_LIMITS.notes);
+  const notes = petFactText(facts.notes, PET_LIMITS.notes);
   if (notes !== undefined) out.notes = notes;
   return out;
 }
