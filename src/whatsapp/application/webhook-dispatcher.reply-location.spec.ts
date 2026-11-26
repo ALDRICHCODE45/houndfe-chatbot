@@ -75,7 +75,9 @@ function setup(
     claim: jest.fn(async () => 'claim-token'),
     release: jest.fn(async () => undefined),
     purgeBefore: jest.fn(async () => 0),
-    markSeen: jest.fn(async () => undefined),
+    markSeen: jest.fn(async () => {
+      order.push('markSeen');
+    }),
   };
   // The handoff mode is read before each send; `humanAfterText` flips it to
   // HUMAN once the text went out.
@@ -103,6 +105,8 @@ function setup(
   return { service, sender, order, recentOutbound, dedup };
 }
 
+const order = (h: { order: string[] }) => h.order;
+
 describe('WebhookDispatcherService reply location (T2 H3)', () => {
   afterEach(() => jest.restoreAllMocks());
 
@@ -113,7 +117,7 @@ describe('WebhookDispatcherService reply location (T2 H3)', () => {
     });
     await h.service.dispatch(textEvent('¿dónde están?'));
 
-    expect(h.order).toEqual(['text', 'onSent', 'location']);
+    expect(h.order).toEqual(['text', 'onSent', 'markSeen', 'location']);
     expect(h.sender.sendText).toHaveBeenCalledWith({
       to: SENDER,
       text: 'Nos encuentra en *Sucursal Centro*',
@@ -131,7 +135,7 @@ describe('WebhookDispatcherService reply location (T2 H3)', () => {
       location: PIN,
     });
     await h.service.dispatch(textEvent('SÍ'));
-    expect(h.order).toEqual(['interactive', 'onSent', 'location']);
+    expect(h.order).toEqual(['interactive', 'onSent', 'markSeen', 'location']);
   });
 
   it('a failed pin send is logged; the text went out once and is not repeated', async () => {
@@ -147,7 +151,7 @@ describe('WebhookDispatcherService reply location (T2 H3)', () => {
     await h.service.dispatch(textEvent('¿dónde están?'));
 
     expect(h.sender.sendText).toHaveBeenCalledTimes(1);
-    expect(h.order).toEqual(['text', 'onSent']);
+    expect(h.order).toEqual(['text', 'onSent', 'markSeen']);
     expect(h.recentOutbound.remember).not.toHaveBeenCalledWith('wamid.pin');
     const logged = warn.mock.calls.map(([line]) => String(line)).join('\n');
     expect(logged).toContain('reply location failed');
@@ -162,7 +166,7 @@ describe('WebhookDispatcherService reply location (T2 H3)', () => {
     });
     delete (h.sender as Partial<typeof h.sender>).sendLocation;
     await h.service.dispatch(textEvent('¿dónde están?'));
-    expect(h.order).toEqual(['text', 'onSent']);
+    expect(h.order).toEqual(['text', 'onSent', 'markSeen']);
   });
 
   it('the conversation switched to HUMAN after the text: the pin is dropped', async () => {
@@ -172,14 +176,65 @@ describe('WebhookDispatcherService reply location (T2 H3)', () => {
       { humanAfterText: true },
     );
     await h.service.dispatch(textEvent('¿dónde están?'));
-    expect(h.order).toEqual(['text', 'onSent']);
+    expect(h.order).toEqual(['text', 'onSent', 'markSeen']);
     expect(h.sender.sendLocation).not.toHaveBeenCalled();
   });
 
   it('a reply without a location sends exactly what it sent before', async () => {
     const h = setup({ reply: 'Hola' });
     await h.service.dispatch(textEvent('hola'));
-    expect(h.order).toEqual(['text', 'onSent']);
+    expect(h.order).toEqual(['text', 'onSent', 'markSeen']);
     expect(h.sender.sendLocation).not.toHaveBeenCalled();
+  });
+
+  describe('T2-fix J1: the pin goes after markSeen, bounded by a timeout', () => {
+    afterEach(() => jest.useRealTimers());
+
+    it('the message is marked seen BEFORE the pin is sent (a crash there never replays the text)', async () => {
+      const h = setup({
+        reply: 'Nos encuentra en *Sucursal Centro*',
+        location: PIN,
+      });
+      h.sender.sendLocation.mockImplementationOnce(async () => {
+        // At the moment the pin goes out, the turn is already DONE.
+        expect(h.dedup.markSeen).toHaveBeenCalledWith('wamid.in');
+        order(h).push('location');
+        return { providerMessageId: 'wamid.pin' };
+      });
+      await h.service.dispatch(textEvent('¿dónde están?'));
+      expect(h.order).toEqual(['text', 'onSent', 'markSeen', 'location']);
+    });
+
+    it('a pin that never answers times out after 5 s: the text went out once, markSeen first', async () => {
+      jest.useFakeTimers();
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      const h = setup({
+        reply: 'Nos encuentra en *Sucursal Centro*',
+        location: PIN,
+      });
+      h.sender.sendLocation.mockImplementationOnce(() => {
+        order(h).push('location');
+        return new Promise<never>(() => undefined);
+      });
+      let done = false;
+      const dispatched = h.service
+        .dispatch(textEvent('¿dónde están?'))
+        .then(() => {
+          done = true;
+        });
+      await jest.advanceTimersByTimeAsync(4_999);
+      expect(done).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      await dispatched;
+      expect(done).toBe(true);
+      expect(h.sender.sendText).toHaveBeenCalledTimes(1);
+      expect(h.order).toEqual(['text', 'onSent', 'markSeen', 'location']);
+      expect(h.dedup.release).not.toHaveBeenCalled();
+      const logged = warn.mock.calls.map(([line]) => String(line)).join('\n');
+      expect(logged).toContain('reply location timed out');
+      expect(logged).not.toContain(SENDER);
+    });
   });
 });
