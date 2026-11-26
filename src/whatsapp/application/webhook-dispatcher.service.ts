@@ -29,6 +29,7 @@ import {
 import {
   interactiveReplyText,
   type CustomerReply,
+  type CustomerReplyLocation,
   type CustomerReplyMedia,
 } from '../../llm-agent/domain/customer-reply';
 import { ProductImageRecognitionService } from '../../product-image/application/product-image-recognition.service';
@@ -62,7 +63,10 @@ import {
   InboundMirrorOnly,
 } from '../domain/inbound-message';
 import { AUDIO_UNSUPPORTED_REPLY } from '../domain/inbound-reply-copy';
-import { WHATSAPP_SENDER } from '../domain/whatsapp-sender.port';
+import {
+  REPLY_LOCATION_TIMEOUT_MS,
+  WHATSAPP_SENDER,
+} from '../domain/whatsapp-sender.port';
 import type { WhatsappSenderPort } from '../domain/whatsapp-sender.port';
 import { RECENT_OUTBOUND } from '../domain/recent-outbound.store';
 import type { RecentOutboundStore } from '../domain/recent-outbound.store';
@@ -77,6 +81,13 @@ import {
   fingerprintMessageId,
   sanitizeErrorText,
 } from '../../common/log-safe';
+
+/**
+ * T2-fix J1: the longest wait for the optional store pin after the text was
+ * sent and the message marked seen (the webhook is not held longer).
+ * T2-fix-2 K4: defined with the sender port, which also bounds the request.
+ */
+export { REPLY_LOCATION_TIMEOUT_MS };
 
 /** Customer media that reopens the WhatsApp window and so triggers replays. */
 const WINDOW_REOPENING_MIRROR_TYPES: ReadonlySet<string> = new Set([
@@ -147,6 +158,10 @@ const WINDOW_REOPENING_MIRROR_TYPES: ReadonlySet<string> = new Set([
  *      sendImage (an image failure only warns). S4:
  *      a reply with buttons/list goes out through the optional
  *      sendInteractive; when absent or failing, the same text is sent.
+ *      T2 H3: a store pin goes AFTER the text via the optional
+ *      sendLocation (a pin failure only warns; the text is never repeated).
+ *      T2-fix J1: the pin follows step 7 (the message is already DONE) and
+ *      is bounded by REPLY_LOCATION_TIMEOUT_MS.
  *   7. RECENT_OUTBOUND.remember + WEBHOOK_DEDUP.markSeen (claim → DONE) —
  *      only after the message was handled; a failed send releases the claim
  *      so Meta re-delivers and retries.
@@ -979,7 +994,74 @@ export class WebhookDispatcherService {
     // an observation failure can never undo the accepted send.
     minimal.onSent?.();
     for (const id of providerMessageIds) this.recentOutbound.remember(id);
+    // T2-fix J1: the text is the turn; it is marked seen (DONE) before the
+    // optional pin, so a crash or a hung pin never redelivers (and repeats)
+    // the text.
     await this.markSeenSafely(message.messageId);
+    // T2 H3: the store pin goes after the text, best effort. The text is
+    // already out, so the mode is re-read as after a partial send (a read
+    // error drops the pin, never throws).
+    const textAlreadySent = true;
+    if (
+      minimal.location !== undefined &&
+      !(await this.mutedAfterPartial(
+        message,
+        'reply location',
+        textAlreadySent,
+      ))
+    )
+      await this.sendReplyLocation(message.senderId, minimal.location);
+  }
+
+  /** T2 H3: best effort. A failed or unsupported pin is only logged; the
+   * text it follows was sent once and is never repeated. T2-fix J1: the
+   * wait is bounded by `REPLY_LOCATION_TIMEOUT_MS` (a late answer is still
+   * remembered as the bot's own outbound). T2-fix-2 K4: the Meta request
+   * has the same timeout, so a hung pin ends; one accepted after the wait
+   * logs its own «sent late» line. Never throws. */
+  private async sendReplyLocation(
+    to: string,
+    location: CustomerReplyLocation,
+  ): Promise<void> {
+    const sendLocation = this.whatsappSender.sendLocation?.bind(
+      this.whatsappSender,
+    );
+    if (sendLocation === undefined) return;
+    let timedOut = false;
+    const sent = Promise.resolve()
+      .then(() => sendLocation({ to, ...location }))
+      .then(
+        ({ providerMessageId }) => {
+          this.recentOutbound.remember(providerMessageId);
+          if (timedOut)
+            this.logger.warn(
+              `reply location sent late (after the ${REPLY_LOCATION_TIMEOUT_MS} ms wait) for ${maskConversationRef(to)}; it may follow a later reply`,
+            );
+          return 'sent' as const;
+        },
+        (error: unknown) => {
+          this.logger.warn(
+            `reply location failed for ${maskConversationRef(to)}; the text was sent: ${describeError(error)}`,
+          );
+          return 'failed' as const;
+        },
+      );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => {
+        // Set here, not after the race: a send resolving in the microtask
+        // window right after the timer still logs as late.
+        timedOut = true;
+        resolve('timeout');
+      }, REPLY_LOCATION_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    const outcome = await Promise.race([sent, timeout]);
+    clearTimeout(timer);
+    if (outcome === 'timeout')
+      this.logger.warn(
+        `reply location timed out after ${REPLY_LOCATION_TIMEOUT_MS} ms for ${maskConversationRef(to)}; the text was sent`,
+      );
   }
 
   /**

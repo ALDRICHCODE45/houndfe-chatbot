@@ -29,6 +29,7 @@ import {
   settleBackground,
   type EvalWorld,
 } from './harness';
+import { EVAL_BRANCH_WITHOUT_LOCATION } from './fixtures/fake-api';
 import { SCENARIOS, type Scenario, type ScenarioTurn } from './scenarios';
 
 /**
@@ -64,6 +65,8 @@ interface TurnRecord {
   images: string[];
   /** S4 buttons/list sent with the reply text, as one transcript line. */
   interactive: string | null;
+  /** T2 H3: the store pin sent after the text, as one transcript line. */
+  pin: string | null;
   tools: string[];
   llmCalls: number;
   gate: string | null;
@@ -235,6 +238,9 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
   };
   const world = createEvalWorld(scenario.customer);
   const { api } = world;
+  // T2 H6: the branch before staff set its coordinates (no pin).
+  if (scenario.branch === 'without_location')
+    api.branch = EVAL_BRANCH_WITHOUT_LOCATION;
   let { agent } = buildHarness(world, meter);
   const record: ScenarioRecord = {
     scenario,
@@ -275,6 +281,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     let reply = '';
     let images: string[] = [];
     let interactive: string | null = null;
+    let pin: string | null = null;
     let error: string | undefined;
     try {
       const decision = await agent.tryHandle({
@@ -294,6 +301,10 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
         (media) => `${media.caption ?? '(sin pie)'} <${media.url}>`,
       );
       interactive = describeInteractive(decision.interactive);
+      pin =
+        decision.location === undefined
+          ? null
+          : `${decision.location.name ?? '(sin nombre)'} (${decision.location.latitude}, ${decision.location.longitude})`;
       // The reply reached WhatsApp: arm any pending confirmation.
       decision.onSent?.();
       // T7: background pet writes belong to this turn's backend activity.
@@ -319,6 +330,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
       reply,
       images,
       interactive,
+      pin,
       tools: [...meter.tools],
       llmCalls: meter.calls,
       gate: gateLabel(reply, meter.calls),
@@ -389,6 +401,7 @@ function transcript(records: ScenarioRecord[], startedAt: string): string {
           ? ['> _(no reply)_']
           : t.reply.split('\n').map((l) => `> ${l}`)),
         ...(t.interactive === null ? [] : ['>', `> ${t.interactive}`]),
+        ...(t.pin === null ? [] : ['>', `> 📍 Ubicación: ${t.pin}`]),
         '',
       );
       lines.push(

@@ -693,3 +693,34 @@ describe('pay in store: the tap (S3)', () => {
     expect(reply(decision)).not.toContain('le apartamos');
   });
 });
+
+describe('T2 H4: the store pin rides with the order-created decision', () => {
+  const COORDINATES = { latitude: 19.4326, longitude: -99.1332 };
+
+  it('a pickup branch with coordinates → the decision carries the pin; the text is today’s', async () => {
+    const today = reply(await setup().placeOrder());
+    const h = setup();
+    const created = (await h.api.createCheckout()) as Record<string, unknown>;
+    h.api.createCheckout.mockImplementationOnce(() =>
+      Promise.resolve({
+        ...created,
+        pickupLocation: { ...LOCATION, location: COORDINATES },
+      } as never),
+    );
+    h.api.createCheckout.mockClear();
+    const placed = await h.placeOrder();
+    expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+    expect(reply(placed)).toBe(today);
+    expect((placed as { location?: unknown }).location).toEqual({
+      ...COORDINATES,
+      name: 'Sucursal Centro',
+      address:
+        'Av. Juárez 123, Centro, Cuauhtémoc, Ciudad de México, C.P. 06000',
+    });
+  });
+
+  it('no coordinates → no pin on the decision', async () => {
+    const placed = await setup().placeOrder();
+    expect(placed).not.toHaveProperty('location');
+  });
+});

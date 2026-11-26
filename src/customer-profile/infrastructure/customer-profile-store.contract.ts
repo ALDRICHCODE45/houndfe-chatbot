@@ -100,6 +100,66 @@ export function runCustomerProfileStoreContract(
       await expect(store.read(SENDER)).resolves.toEqual(expected);
     });
 
+    it('T3-fix E1: keeps the suggestions pause merge-only; the latest write wins', async () => {
+      const in30Days = '2026-12-07T12:00:00.000Z';
+      const in1Day = '2026-11-08T12:00:00.000Z';
+      await store.upsert(SENDER, { suggestionsPausedUntil: in30Days }, T1);
+      await store.upsert(SENDER, { register: 'tu' }, T2);
+      await expect(store.read(SENDER)).resolves.toMatchObject({
+        register: 'tu',
+        suggestionsPausedUntil: in30Days,
+      });
+      // Latest write wins, even an earlier instant.
+      await store.upsert(SENDER, { suggestionsPausedUntil: in1Day }, T2);
+      await expect(store.read(SENDER)).resolves.toMatchObject({
+        suggestionsPausedUntil: in1Day,
+      });
+    });
+
+    it('T3-fix E1: a pause-only write keeps every other column as it was', async () => {
+      const full = {
+        displayName: 'Ana',
+        preferredName: 'Anita',
+        register: 'tu' as const,
+        emojis: true,
+        tone: 'casual' as const,
+        lastOrder: {
+          folio: 'A-1',
+          confirmedAt: '2026-11-01T10:00:00.000Z',
+          totalCents: 1000,
+        },
+      };
+      await store.upsert(SENDER, full, T1);
+      const paused = await store.upsert(
+        SENDER,
+        { suggestionsPausedUntil: '2026-12-08T12:00:00.000Z' },
+        T2,
+      );
+      const expected = {
+        senderId: SENDER,
+        ...full,
+        suggestionsPausedUntil: '2026-12-08T12:00:00.000Z',
+        updatedAt: T2.toISOString(),
+      };
+      expect(paused).toEqual(expected);
+      await expect(store.read(SENDER)).resolves.toEqual(expected);
+      // And a first write of only the pause creates the usted defaults.
+      await expect(
+        store.upsert(
+          OTHER,
+          { suggestionsPausedUntil: '2026-12-08T12:00:00.000Z' },
+          T1,
+        ),
+      ).resolves.toEqual({
+        senderId: OTHER,
+        register: 'usted',
+        emojis: false,
+        tone: 'neutral',
+        suggestionsPausedUntil: '2026-12-08T12:00:00.000Z',
+        updatedAt: T1.toISOString(),
+      });
+    });
+
     it('the latest explicit style and order win', async () => {
       await store.upsert(SENDER, { register: 'tu', emojis: true }, T1);
       await store.upsert(

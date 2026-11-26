@@ -8,6 +8,8 @@
  * `TITLE_EMOJI_LINE`), while every other emoji follows the customer's style.
  */
 
+import type { CustomerReplyLocation } from './customer-reply';
+
 /** S3: the only emojis a server-owned title may carry. */
 export const TITLE_EMOJI = Object.freeze({
   summary: '🧾',
@@ -82,6 +84,71 @@ export function itemLine(label: string): string {
 /** S2: a detail line of an item, indented under its bullet. */
 export function itemDetail(text: string): string {
   return `${ITEM_DETAIL_INDENT}${text}`;
+}
+
+/**
+ * T3-fix E8: `text` unchanged when it has at most `max` characters; else
+ * cut between words to at most `max` characters, plus «…» (so at most
+ * `max + 1` characters in all). A caller with a hard cap that includes the
+ * ellipsis passes `cap - 1` (see `capLabel`).
+ */
+export function truncateOnWord(text: string, max: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  const head = chars.slice(0, max).join('');
+  const cut = chars[max] === ' ' ? head : head.replace(/\s+\S*$/, '');
+  return `${(cut === '' ? head : cut).trimEnd()}…`;
+}
+
+/**
+ * T2-fix J8: the store pin's labels are short captions under the map: the
+ * branch name is capped at this many characters and the address at
+ * `STORE_PIN_ADDRESS_MAX_CHARS`, cut on a word boundary with «…» (a long
+ * backend value never makes Meta refuse the pin).
+ */
+export const STORE_PIN_NAME_MAX_CHARS = 100;
+export const STORE_PIN_ADDRESS_MAX_CHARS = 250;
+
+/** T2-fix J8: `text` in at most `max` characters, the «…» included
+ * (`truncateOnWord` adds it after its `max - 1`). */
+const capLabel = (text: string, max: number): string =>
+  Array.from(text).length <= max ? text : truncateOnWord(text, max - 1);
+
+/** T2 H3/H4: the branch as the store pin needs it (any source). */
+export interface StorePinSource {
+  name: string;
+  address: { formatted: string } | null;
+  location?: { latitude: number; longitude: number } | null;
+}
+
+/**
+ * T2 H3/H4: the WhatsApp location message for a branch: its coordinates,
+ * labelled with the plain name and address (final dots dropped, as in
+ * `storeLines`; capped, T2-fix J8; an empty label is left out). `undefined`
+ * without coordinates (missing or null): no pin is ever invented.
+ */
+export function storePin(
+  source: StorePinSource,
+): CustomerReplyLocation | undefined {
+  const location = source.location;
+  if (location === null || location === undefined) return undefined;
+  const name = capLabel(
+    withoutFinalDot(plain(source.name)),
+    STORE_PIN_NAME_MAX_CHARS,
+  );
+  const address =
+    source.address === null
+      ? ''
+      : capLabel(
+          withoutFinalDot(plain(source.address.formatted)),
+          STORE_PIN_ADDRESS_MAX_CHARS,
+        );
+  return {
+    latitude: location.latitude,
+    longitude: location.longitude,
+    ...(name === '' ? {} : { name }),
+    ...(address === '' ? {} : { address }),
+  };
 }
 
 /** The pickup branch as the store block needs it (structural, any source). */

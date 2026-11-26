@@ -1,6 +1,9 @@
 import { Inject, Injectable, Optional } from '@nestjs/common';
 import { toMexicanState } from '../domain/mexican-state';
-import type { CustomerReplyInteractive } from '../domain/customer-reply';
+import type {
+  CustomerReplyInteractive,
+  CustomerReplyLocation,
+} from '../domain/customer-reply';
 import {
   CHATBOT_API_CLIENT,
   type ChatbotApiClient,
@@ -143,6 +146,8 @@ export interface MinimalCheckoutReply {
   interactive?: CustomerReplyInteractive;
   /** The payment offer this reply made; a later yes answers it. */
   paymentOffer?: { saleId: string };
+  /** T2 H4: the store pin sent after the text (pickup order created). */
+  location?: CustomerReplyLocation;
 }
 
 export type MinimalCheckoutRevalidation = 'ok' | 'reselect' | 'unavailable';

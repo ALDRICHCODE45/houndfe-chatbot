@@ -73,6 +73,7 @@ import {
 } from '../../customer-profile/domain/pet-facts';
 import {
   customerStyleSeed,
+  isValidProfileSenderId,
   knownCustomerPromptLine,
   type CustomerProfilePatch,
 } from '../../customer-profile/domain/customer-profile';
@@ -81,6 +82,7 @@ import {
   isForgetMyDataRequest,
 } from '../../customer-profile/domain/customer-profile-signals';
 import type {
+  ComplementPrice,
   MinimalCatalogTurn,
   ReorderOfferContext,
 } from '../domain/minimal-catalog-session.store';
@@ -106,6 +108,7 @@ import {
   shortMxn,
   type CustomerReply,
   type CustomerReplyInteractive,
+  type CustomerReplyLocation,
   type CustomerReplyMedia,
   type InteractiveChoiceContext,
   type InteractiveReplyIntent,
@@ -230,7 +233,13 @@ import {
   money,
   plain,
   sectionTitle,
+  storeLines,
+  storePin,
+  truncateOnWord,
 } from '../domain/whatsapp-format';
+import type { BranchInfo } from '../../chatbot-api/domain/dtos/branch.dto';
+import { ChatbotApiError } from '../../chatbot-api/domain/errors';
+import { sanitizeErrorText } from '../../common/log-safe';
 import {
   searchWithBroadening,
   type BroadenedSearchInfo,
@@ -331,7 +340,7 @@ const INSTRUCTIONS =
   'sustituye únicamente datos verificados por herramienta: "¡Hola! Encontré {nombre} en ' +
   'nuestro catálogo. ¿Buscaba esa presentación?" (de tú: "¿Buscabas esa presentación?"); tras out_of_stock verificado: "Por ahora, ' +
   '{nombre} está agotado." Sin cierre automático ("Si necesita...", "No dude...", ' +
-  '"estoy aquí..."), sin upsell ni aviso forzado, sin emoji al informar agotado, sin saludar ' +
+  '"estoy aquí..."), sin aviso forzado, sin ofrecer otros productos por tu cuenta (una sugerencia complementaria solo con suggestComplement, si está disponible), sin emoji al informar agotado, sin saludar ' +
   'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
 
 /** S3: the structured customer reply (text + optional media) of one turn. */
@@ -636,6 +645,138 @@ const ASK_TEAM_INSTRUCTIONS_FRAGMENT =
   'el resultado: nunca afirmes que el equipo ya respondió. Mientras el ' +
   'cliente espera, sigue ayudando con lo demás.';
 
+/**
+ * T2 H5 / T2-fix J2 (one helper, the whole fragment): store location and
+ * hours come from the backend branch read; the application appends the
+ * store block to the reply (the model never writes an address or hours).
+ * Offered only with the tool (see `storeInfoRunFor`). T2-fix-2 K1: during a
+ * purchase «paso a recoger» / «lo recojo» choose pickup (chooseStorePickup).
+ */
+function storeInfoInstructions(askTeamAvailable: boolean): string {
+  return (
+    '\n\nHerramienta getStoreInfo: si el cliente pregunta dónde está la tienda, ' +
+    'la dirección, el horario, si abren hoy o algún día, o si puede pasar a ' +
+    'recoger, llame getStoreInfo sin argumentos; la aplicación agrega a su ' +
+    'mensaje la dirección, el horario y la ubicación. Nunca escriba una ' +
+    'dirección ni un horario de memoria: conteste lo demás que haya pedido y ' +
+    'deje esa parte a la aplicación. Si el cliente está eligiendo entre ' +
+    'envío a domicilio y recoger en tienda, «paso a recoger» o «lo recojo» ' +
+    'eligen recoger en tienda: llame chooseStorePickup, no getStoreInfo; use ' +
+    'getStoreInfo solo si además pregunta dónde están o el horario. ' +
+    'Si responde store_info_deferred, la ' +
+    'aplicación lo contestará después: no lo mencione. Si responde ' +
+    'store_info_unavailable, la aplicación avisa que por ahora no puede ' +
+    'confirmarlo' +
+    (askTeamAvailable ? ' y ofrece consultarlo con el equipo (askTeam).' : '.')
+  );
+}
+
+/**
+ * T2-fix J5: the server line when the branch cannot be read (or has
+ * neither address nor hours), in place of any model text about the store;
+ * `offerTeam` adds the askTeam offer (the route exists and was not used).
+ */
+const STORE_INFO_UNAVAILABLE_LINE =
+  'Por ahora no puedo confirmar la dirección ni el horario de la sucursal.';
+function storeInfoUnavailableLine(
+  style: CustomerStyle,
+  offerTeam: boolean,
+): string {
+  if (!offerTeam) return STORE_INFO_UNAVAILABLE_LINE;
+  const offer =
+    style.register === 'tu'
+      ? 'Si quieres, lo consulto con el equipo.'
+      : 'Si quiere, lo consulto con el equipo.';
+  return `${STORE_INFO_UNAVAILABLE_LINE} ${offer}`;
+}
+
+/** T2-fix J6: a failed branch read for the log (status and error code). */
+function describeBranchReadError(error: unknown): string {
+  if (!(error instanceof Error)) return 'unknown';
+  if (!(error instanceof ChatbotApiError)) return error.name;
+  const code =
+    error.errorCode === null
+      ? 'none'
+      : sanitizeErrorText(error.errorCode).slice(0, 64);
+  return `${error.name} status=${error.statusCode ?? 'none'} errorCode=${code}`;
+}
+
+/**
+ * T2-fix J2: tools whose call never answers the customer by itself (K2: a
+ * run with only these keeps the store part as the whole reply). Keep in
+ * step with the registrations: each listed tool says so where it is
+ * registered (`storeInfoTools`, `declineTools`); a new tool that answers
+ * nothing on its own must be added here.
+ */
+const STORE_NEUTRAL_TOOLS: ReadonlySet<string> = new Set([
+  'getStoreInfo',
+  'declineSuggestions',
+]);
+
+/** T2-fix J2: the run called a tool that answers something besides the store. */
+function answeringToolCalled(result: {
+  steps?: ReadonlyArray<{ toolCalls?: ReadonlyArray<{ toolName?: unknown }> }>;
+}): boolean {
+  return (result.steps ?? []).some((step) =>
+    (step.toolCalls ?? []).some(
+      (call) =>
+        typeof call.toolName !== 'string' ||
+        !STORE_NEUTRAL_TOOLS.has(call.toolName),
+    ),
+  );
+}
+
+/** T2 H2: the store block's lead («Nos encuentra en *<sucursal>*»). */
+function storeInfoReply(branch: BranchInfo, style: CustomerStyle): string {
+  const lead =
+    style.register === 'tu' ? 'Nos encuentras en ' : 'Nos encuentra en ';
+  return storeLines(lead, branch).join('\n');
+}
+
+// T3 (S4-S6): one complementary product after a cart add, validated and
+// presented by the application (never in the model's text).
+const COMPLEMENT_INSTRUCTIONS_FRAGMENT =
+  '\n\nHerramienta suggestComplement: solo en un turno en que agregó un producto al carrito, y como máximo una vez, ' +
+  'puede proponer UN producto que complemente lo agregado (no lo sustituya ni sea el mismo; por ejemplo arena con alimento de gato, o premios), ' +
+  'que ya haya leído con searchCatalog en esta conversación, que no esté agotado ni en el carrito y que sea adecuado para la mascota conocida (especie, etapa, alergias; nunca para una mascota que ya no está). ' +
+  'Pase su productId EXACTO (y variantId si eligió una presentación). Si no hay uno claramente útil, no la llame. ' +
+  'Nunca la llame si en esta conversación el cliente rechazó una sugerencia o pidió no recibir sugerencias. ' +
+  'La aplicación agrega la sugerencia a su mensaje: no la mencione ni la repita en su texto.';
+// T3-fix E1 (S7): the customer said no to suggestions. T3-fix-2 G1: offered
+// whenever the profile can keep the pause (any turn, not only around a
+// suggestion); its result never changes the reply.
+const DECLINE_INSTRUCTIONS_FRAGMENT =
+  '\n\nHerramienta declineSuggestions: llámela una vez si el cliente rechaza una sugerencia de producto o pide no recibir sugerencias. ' +
+  'No cambia su respuesta: conteste al cliente con normalidad y calidez, sin anunciar que dejará de sugerir y sin prometer nada.';
+/** T3 (S6): a shown suggestion pauses suggestions this long (persisted). */
+export const COMPLEMENT_INTERVAL_MS = 24 * 60 * 60_000;
+/** T3-fix E1 (S7): a decline pauses suggestions this long (persisted). */
+export const COMPLEMENT_DECLINE_PAUSE_MS = 30 * 24 * 60 * 60_000;
+/** T3-fix E3: a suggestable product's price was read this recently. */
+const COMPLEMENT_PRICE_MAX_AGE_MS = 24 * 60 * 60_000;
+/**
+ * T3-fix E8: catalog names can be very long (brand + line + flavour +
+ * size); the suggestion is one discreet line, so the name is capped at
+ * this many characters, cut on a word boundary with «…».
+ */
+const COMPLEMENT_NAME_MAX_CHARS = 80;
+
+/** T3 (D3): the server-owned suggestion line, in the customer's style. */
+function complementLine(
+  suggestion: { name: string; priceCents: number },
+  style: CustomerStyle,
+): string {
+  const tu = style.register === 'tu';
+  const name = truncateOnWord(
+    plain(suggestion.name).replace(/\s+/g, ' ').trim(),
+    COMPLEMENT_NAME_MAX_CHARS,
+  );
+  return (
+    `${style.emojis ? '💡 ' : ''}Por si ${tu ? 'te' : 'le'} sirve: ${bold(name)} ` +
+    `(${money(suggestion.priceCents)}) suele ir bien con lo que ${tu ? 'elegiste' : 'eligió'}.`
+  );
+}
+
 // Payment questions after an order: the application owns the bank details.
 const PAYMENT_INSTRUCTIONS_FRAGMENT =
   '\n\nHerramienta getPaymentDetails: el cliente ya tiene un pedido registrado. ' +
@@ -751,6 +892,30 @@ type RestockRun = {
 
 type ExpirationReply = { attempted: boolean; value: string | null };
 type PaymentRun = { attempted: boolean; value: MinimalPaymentReply | null };
+/**
+ * T2 H2: one branch read per run. `read` is the client's getBranch (the run
+ * exists only when the tool is offered: the single gate is
+ * `storeInfoRunFor`); `value` is the read the reply shows; `unavailable`
+ * marks a failed or unconfigured read (T2-fix J5).
+ */
+type StoreInfoRun = {
+  read: () => Promise<BranchInfo>;
+  attempted: boolean;
+  value: BranchInfo | null;
+  unavailable: boolean;
+};
+/**
+ * T3: the one validated complementary suggestion of a run. `claimed` is
+ * taken synchronously before any await (E5); `declined` is set by
+ * declineSuggestions in the same run (E1).
+ */
+type ComplementRun = {
+  value: { productId: string; name: string; priceCents: number } | null;
+  claimed: boolean;
+  declined: boolean;
+};
+/** T3-fix E1: the one decline of a run. */
+type DeclineRun = { attempted: boolean };
 // T4c-2a P2: one which-pet question per run; the application presents it.
 // T4c-2b: also the forget and diminutive questions (`reply` is the
 // unstyled question text).
@@ -785,16 +950,29 @@ type ProductImageRun = {
   added: Set<string>;
   /** S4: catalog prices (`priceKey` → cents) for list row titles. */
   prices: Map<string, number>;
+  /**
+   * T3-fix-2 G2: suggestion-only prices with their read instant, from every
+   * catalog read (any turn), most recent last; persisted on every turn.
+   */
+  complementPrices: Map<string, ComplementPrice>;
 };
 
-/** S4: remember a catalog item's prices, most recent last. */
+/**
+ * S4: remember a catalog item's prices, most recent last. T3-fix-2 G2: also
+ * the suggestion-only copy read at `readAt` (a missing price as `null`).
+ */
 function recordPrices(
   prices: Map<string, number>,
   item: CatalogItemResponse,
+  complementPrices: Map<string, ComplementPrice>,
+  readAt: number,
 ): void {
   const put = (key: string, cents: unknown) => {
-    if (typeof cents !== 'number' || !Number.isSafeInteger(cents) || cents < 0)
-      return;
+    const valid =
+      typeof cents === 'number' && Number.isSafeInteger(cents) && cents >= 0;
+    complementPrices.delete(key);
+    complementPrices.set(key, { priceCents: valid ? cents : null, readAt });
+    if (!valid) return;
     prices.delete(key);
     prices.set(key, cents);
   };
@@ -816,6 +994,8 @@ type CartReply = ExpirationReply & {
   source?: 'cart' | 'read' | 'reviewCheckout';
   // A real write left a non-empty cart in this run.
   mutated?: boolean;
+  /** T3: the cart's product ids after the run's last add/set write. */
+  cartProductIds?: ReadonlySet<string>;
 };
 
 // One server-owned checkout presentation per SDK run.
@@ -1194,6 +1374,77 @@ function withApplicationReply(
     return parts.length === 0 ? [] : [{ ...message, content: parts }];
   });
   return [...kept, { role: 'assistant', content: reply }];
+}
+
+/** What a recorded turn keeps besides its messages (see `recordTurn`). */
+type TurnRecordExtras = {
+  catalogPrices?: Record<string, number>;
+  complementPrices?: Record<string, ComplementPrice>;
+  interactiveChoice?: InteractiveChoiceContext;
+  reorderOffer?: ReorderOfferContext;
+  paymentOffer?: { saleId: string };
+  catalogRestockOffer?: CatalogRestockOffer & { acceptsYes: boolean };
+  petChoice?: PetChoice;
+};
+
+/**
+ * T2-fix J2/J3/J5: the store part of a run: the styled store block and its
+ * pin after a good read, or the fixed unavailable line.
+ */
+type StorePart = { text: string; location?: CustomerReplyLocation };
+
+/**
+ * T2-fix-2 K5: one reply of a model run, before the run's single exit step
+ * adds the store part and records the turn.
+ * - `store`: `append` (default) puts the store part after the reply and
+ *   after an interactive text fallback (buttons and lists stay as they
+ *   are); `replace` sends the store part instead of the reply (a pure
+ *   store question, K2); `defer` leaves it out (the which-pet question
+ *   re-runs the request after the answer, which answers it then, K3).
+ * - `history`: `reply` (default) records the sent reply as the assistant
+ *   message; `application` keeps the run's tool messages with the sent
+ *   reply as the final text; `model` keeps the model's own messages, or
+ *   does as `application` when the store part changed the reply.
+ */
+type RunReply = {
+  decision: CustomerReply & { onSent?: () => void };
+  store?: 'append' | 'replace' | 'defer';
+  history?:
+    | { kind: 'reply' }
+    | { kind: 'application' | 'model'; messages: ModelMessage[] };
+  record?: TurnRecordExtras;
+};
+
+/**
+ * T2-fix-2 K5: `decision` with the run's store part composed as `mode`
+ * says (see `RunReply`). The store pin rides on the reply unless the
+ * decision already carries a location. No part, or `defer`: unchanged.
+ */
+function withStorePart<T extends CustomerReply>(
+  decision: T,
+  part: StorePart | null,
+  mode: 'append' | 'replace' | 'defer',
+): T {
+  if (part === null || mode === 'defer') return decision;
+  const append = (text: string) => `${text}\n\n${part.text}`;
+  const fallback = decision.interactive?.textFallback;
+  return {
+    ...decision,
+    reply: mode === 'replace' ? part.text : append(decision.reply),
+    ...(mode === 'append' &&
+    decision.interactive !== undefined &&
+    fallback !== undefined
+      ? {
+          interactive: {
+            ...decision.interactive,
+            textFallback: append(fallback),
+          },
+        }
+      : {}),
+    ...(part.location === undefined || decision.location !== undefined
+      ? {}
+      : { location: part.location }),
+  };
 }
 
 /** S13: the catalog reads of one run whose options the application renders. */
@@ -1637,6 +1888,10 @@ export class MinimalCatalogAgentService {
                     style,
                   ),
                 }),
+            // T2 H4: the pickup order's store pin, sent after the text.
+            ...(answered.location === undefined
+              ? {}
+              : { location: answered.location }),
           };
         }
       }
@@ -1692,7 +1947,8 @@ export class MinimalCatalogAgentService {
       this.order!.offerStatus(senderId) !== null
     )
       return null;
-    if ((await this.cart.storedLines(senderId)).length === 0) return null;
+    if (((await this.cart.storedLines(senderId)) ?? []).length === 0)
+      return null;
     if ((await this.cart.shippingMode(senderId)) !== null) return null;
     const reference = await this.cart.fingerprint(senderId);
     if (reference === null) return null;
@@ -1758,6 +2014,8 @@ export class MinimalCatalogAgentService {
       ...(result.interactive === undefined
         ? {}
         : { interactive: styleInteractivePrompt(result.interactive, style) }),
+      // T2-fix J7: the store pin of a pickup order this step reached.
+      ...(result.location === undefined ? {} : { location: result.location }),
     };
   }
 
@@ -1795,6 +2053,7 @@ export class MinimalCatalogAgentService {
       ...(result.interactive === undefined
         ? {}
         : { interactive: result.interactive }),
+      ...(result.location === undefined ? {} : { location: result.location }),
       ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
       ...(result.silent === true ? { silent: true as const } : {}),
     };
@@ -2278,7 +2537,7 @@ export class MinimalCatalogAgentService {
   private async cartIsEmpty(senderId: string): Promise<boolean> {
     return this.cart === undefined
       ? true
-      : (await this.cart.storedLines(senderId)).length === 0;
+      : ((await this.cart.storedLines(senderId)) ?? []).length === 0;
   }
 
   /**
@@ -2331,6 +2590,7 @@ export class MinimalCatalogAgentService {
         ...(result.interactive === undefined
           ? {}
           : { interactive: styleInteractivePrompt(result.interactive, style) }),
+        ...(result.location === undefined ? {} : { location: result.location }),
       };
     };
     const pendingSummary =
@@ -2918,6 +3178,7 @@ export class MinimalCatalogAgentService {
       reply: string;
       onSent?: () => void;
       interactive?: CustomerReplyInteractive;
+      location?: CustomerReplyLocation;
     },
   ): MinimalCatalogAgentDecision {
     const reply = applyCustomerStyle(
@@ -2938,6 +3199,8 @@ export class MinimalCatalogAgentService {
       ...(result.interactive === undefined
         ? {}
         : { interactive: result.interactive }),
+      // T2-fix J7: forwarded like the other optional parts.
+      ...(result.location === undefined ? {} : { location: result.location }),
     });
   }
 
@@ -3159,9 +3422,40 @@ export class MinimalCatalogAgentService {
       presented: new Map(),
       added: new Set(),
       prices: new Map(Object.entries(turns.at(-1)?.catalogPrices ?? {})),
+      complementPrices: new Map(
+        Object.entries(turns.at(-1)?.complementPrices ?? {}),
+      ),
     };
     const persistedPrices = (): Record<string, number> =>
       Object.fromEntries([...imageRun.prices].slice(-CATALOG_PRICES_MAX));
+    // T3-fix-2 G2: only reads of the last 24 h (an unknown read time is
+    // dropped), the most recent CATALOG_PRICES_MAX.
+    const persistedComplementPrices = (): Record<string, ComplementPrice> => {
+      const nowMs = this.suggestionNowMs();
+      return Object.fromEntries(
+        [...imageRun.complementPrices]
+          .filter(
+            ([, entry]) => nowMs - entry.readAt < COMPLEMENT_PRICE_MAX_AGE_MS,
+          )
+          .slice(-CATALOG_PRICES_MAX),
+      );
+    };
+    // T3-fix-2 G2: every turn this run records keeps the suggestion prices
+    // its catalog reads saw (a non-cart «¿tienen arena?» included).
+    const recordTurn = (
+      ...[
+        senderId,
+        messages,
+        ids,
+        cartContext,
+        images,
+        interactive,
+      ]: Parameters<MinimalCatalogAgentService['recordTurn']>
+    ): void =>
+      this.recordTurn(senderId, messages, ids, cartContext, images, {
+        ...interactive,
+        complementPrices: persistedComplementPrices(),
+      });
     const persistedImages = (): ProductImageContext =>
       boundProductImageContext({
         known: Object.fromEntries(imageRun.known),
@@ -3245,6 +3539,9 @@ export class MinimalCatalogAgentService {
       placed !== null && placed.paid !== true
         ? { attempted: false, value: null }
         : null;
+    // T2 H2: offered whenever the client can read the branch (T2-fix-2
+    // K1: on every turn again).
+    const storeInfoRun = this.storeInfoRunFor();
     // T4c-2a P2: asked only with 2+ known pets, pets loaded this turn, and
     // no pet already chosen for this request.
     const petChoiceRun: PetChoiceRun | null =
@@ -3258,6 +3555,17 @@ export class MinimalCatalogAgentService {
       this.cart && this.checkoutAvailable()
         ? { attempted: false, value: null }
         : null;
+    const complementRun: ComplementRun | null = this.complementAvailable(
+      input.senderId,
+      placed !== null && placed.paid !== true,
+    )
+      ? { value: null, claimed: false, declined: false }
+      : null;
+    // T3-fix-2 G1: «no me ofrezcas nada» counts at any time, so the decline
+    // tool is offered whenever the profile can keep the 30-day pause.
+    const declineRun: DeclineRun | null = this.profileWritable(input.senderId)
+      ? { attempted: false }
+      : null;
     const reorderRun: ReorderRun | null = this.cart
       ? { attempted: false, value: null }
       : null;
@@ -3379,8 +3687,13 @@ export class MinimalCatalogAgentService {
         cartInstructions +
         (askTeamRun === null ? '' : ASK_TEAM_INSTRUCTIONS_FRAGMENT) +
         (paymentRun === null ? '' : PAYMENT_INSTRUCTIONS_FRAGMENT) +
+        (storeInfoRun === null
+          ? ''
+          : storeInfoInstructions(askTeamRun !== null)) +
         (paidOrder ? PAID_ORDER_INSTRUCTIONS_FRAGMENT : '') +
         (paidOrderNewCart ? PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT : '') +
+        (complementRun === null ? '' : COMPLEMENT_INSTRUCTIONS_FRAGMENT) +
+        (declineRun === null ? '' : DECLINE_INSTRUCTIONS_FRAGMENT) +
         this.memoryInstructions(input.senderId) +
         (chosenPet === undefined ? '' : `\n${chosenPet}`) +
         restockOfferContext +
@@ -3419,6 +3732,26 @@ export class MinimalCatalogAgentService {
         ...this.petChoiceTools(input, petChoiceRun, memoryRun, styled, traceId),
         ...this.askTeamTools(input, askTeamRun, traceId),
         ...this.paymentTools(input, paymentRun, traceId),
+        ...this.storeInfoTools(
+          storeInfoRun,
+          // T2-fix J3: the which-pet / memory question keeps the request
+          // and re-runs it after the answer: the store part waits for it.
+          () => petChoiceRun?.value != null || memoryRun.value !== null,
+          traceId,
+        ),
+        ...this.complementTools(
+          complementRun,
+          allowedIds,
+          imageRun,
+          cartReply,
+          traceId,
+        ),
+        ...this.declineTools(
+          input.senderId,
+          declineRun,
+          complementRun,
+          traceId,
+        ),
       },
       stopWhen: stepCountIs(this.maxSteps),
       // S3 (cost protection): every production call is output-capped.
@@ -3468,6 +3801,42 @@ export class MinimalCatalogAgentService {
         'agent_retry',
       );
     }
+    // T2-fix J2/J3/J5: the store part of this run (the branch block and its
+    // pin, or the fixed unavailable line). T2-fix-2 K5: every reply below
+    // leaves through `finish`, the ONE step that composes the store part
+    // (`withStorePart`) and records the turn; no branch threads it by hand.
+    // A turn that did not call getStoreInfo (or got store_info_deferred)
+    // has none, so every reply is then byte-identical to before.
+    const storePart = this.storeReplyPart(
+      storeInfoRun,
+      style,
+      styled,
+      askTeamRun !== null && askTeamRun.value === null,
+    );
+    const finish = (
+      turn: RunReply,
+    ): CustomerReply & { onSent?: () => void } => {
+      const mode = turn.store ?? 'append';
+      const decision = withStorePart(turn.decision, storePart, mode);
+      const history = turn.history ?? { kind: 'reply' };
+      const changed = storePart !== null && mode !== 'defer';
+      recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          ...(history.kind === 'reply'
+            ? [{ role: 'assistant' as const, content: decision.reply }]
+            : history.kind === 'application' || changed
+              ? withApplicationReply(history.messages, decision.reply)
+              : history.messages),
+        ],
+        [...currentIds],
+        persistedCartContext(),
+        persistedImages(),
+        turn.record,
+      );
+      return decision;
+    };
     const prepared = restockRun?.outcome ?? null;
     const expirationResult = expirationReply?.value ?? null;
     if (expirationResult !== null || prepared !== null) {
@@ -3478,55 +3847,29 @@ export class MinimalCatalogAgentService {
             ? prepared.question
             : RESTOCK_CAUTIOUS_REPLY),
       );
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-      );
-      return expirationResult === null && prepared?.kind === 'offer'
-        ? { reply, onSent: prepared.onSent }
-        : { reply };
+      return finish({
+        decision:
+          expirationResult === null && prepared?.kind === 'offer'
+            ? { reply, onSent: prepared.onSent }
+            : { reply },
+      });
     }
     const paymentReply = paymentRun?.value ?? null;
     if (paymentReply !== null) {
       // The server-owned bank details (or the unavailable notice); model text
       // never carries them.
-      const reply = styled(paymentReply.reply);
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-        paymentReply.paymentOffer === undefined
-          ? {}
-          : { paymentOffer: paymentReply.paymentOffer },
-      );
-      return { reply };
+      return finish({
+        decision: { reply: styled(paymentReply.reply) },
+        record:
+          paymentReply.paymentOffer === undefined
+            ? {}
+            : { paymentOffer: paymentReply.paymentOffer },
+      });
     }
     const teamReply = askTeamRun?.value ?? null;
     if (teamReply !== null) {
       // S6: the server-owned create outcome; model text never claims it.
-      const reply = styled(teamReply);
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-      );
-      return { reply };
+      return finish({ decision: { reply: styled(teamReply) } });
     }
     // T4c-2b Q3: a statement naming a diminutive («mi perrito Brunito…»)
     // of a known, just-forgotten or (K3) archived pet asks before any write;
@@ -3562,19 +3905,16 @@ export class MinimalCatalogAgentService {
       // model's own text is dropped. The question and the original request
       // are kept in the durable pet_choice gate (T4c-2b: or the forget /
       // diminutive question and its data).
-      const reply = styled(petChoice.reply);
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-        { petChoice: petChoice.choice },
-      );
-      return { reply, interactive: petChoice.interactive };
+      // T2-fix-2 K3: the store part always waits, whatever the call order:
+      // the answer re-runs the request, which answers it then (once).
+      return finish({
+        decision: {
+          reply: styled(petChoice.reply),
+          interactive: petChoice.interactive,
+        },
+        store: 'defer',
+        record: { petChoice: petChoice.choice },
+      });
     }
     const reorder = reorderRun?.value ?? null;
     if (reorder !== null) {
@@ -3582,35 +3922,29 @@ export class MinimalCatalogAgentService {
       // belong to this reply only.
       const reply = styled(reorder.reply);
       for (const productId of reorder.productIds) currentIds.add(productId);
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-        reorder.offer === null ? {} : { reorderOffer: reorder.offer },
-      );
-      if (reorder.offer === null) return { reply };
+      const record =
+        reorder.offer === null ? {} : { reorderOffer: reorder.offer };
+      if (reorder.offer === null) return finish({ decision: { reply } });
       const interactive = reorderConfirmationButtons(
         reorder.offer.reference,
         styled(REORDER_BUTTONS_PROMPT),
       );
-      return {
-        reply,
-        interactive:
-          interactive.type === 'buttons'
-            ? {
-                ...interactive,
-                buttons: interactive.buttons.map((button) => ({
-                  ...button,
-                  title: applyCustomerRegister(button.title, style),
-                })),
-              }
-            : interactive,
-      };
+      return finish({
+        decision: {
+          reply,
+          interactive:
+            interactive.type === 'buttons'
+              ? {
+                  ...interactive,
+                  buttons: interactive.buttons.map((button) => ({
+                    ...button,
+                    title: applyCustomerRegister(button.title, style),
+                  })),
+                }
+              : interactive,
+        },
+        record,
+      });
     }
     const checkoutResult = checkoutRun?.value ?? null;
     if (checkoutResult !== null) {
@@ -3640,19 +3974,12 @@ export class MinimalCatalogAgentService {
           ? checkoutResult.reply
           : `${cartPart}\n\n${checkoutResult.reply}`,
       );
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-      );
-      return checkoutResult.onSent === undefined
-        ? { reply }
-        : { reply, onSent: checkoutResult.onSent };
+      return finish({
+        decision:
+          checkoutResult.onSent === undefined
+            ? { reply }
+            : { reply, onSent: checkoutResult.onSent },
+      });
     }
     const continued =
       cartReply.mutated === true && priorShipping !== null
@@ -3664,28 +3991,44 @@ export class MinimalCatalogAgentService {
         : null;
     if (continued !== null) {
       const reply = styled(continued.reply);
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-      );
-      return continued.onSent === undefined
-        ? { reply }
-        : { reply, onSent: continued.onSent };
+      return finish({
+        decision:
+          continued.onSent === undefined
+            ? { reply }
+            : { reply, onSent: continued.onSent },
+      });
     }
     if (cartReply.value !== null) {
       // S2: a cart summary closes with the next-step question and buttons.
       const invites = cartReply.value.endsWith(MINIMAL_CART_SUMMARY_TAIL);
-      const reply = styled(
-        invites
-          ? `${cartReply.value}\n\n${MINIMAL_CART_NEXT_STEP_QUESTION}`
-          : cartReply.value,
-      );
+      // T3 (D3): the validated suggestion goes right before the question;
+      // E4: never a product this run put in the cart after the check.
+      const suggestion = complementRun?.value ?? null;
+      const line =
+        suggestion !== null &&
+        complementRun?.declined !== true &&
+        invites &&
+        cartReply.mutated === true &&
+        !imageRun.added.has(suggestion.productId) &&
+        cartReply.cartProductIds?.has(suggestion.productId) !== true
+          ? complementLine(suggestion, style)
+          : null;
+      // Any turn without the line keeps the reply byte-identical. T3-fix-2
+      // G3 invariant: with the line, the reply is exactly the no-line reply
+      // with `line\n\n` inserted before the styled next-step question
+      // (applyCustomerStyle works line by line and the question carries no
+      // emoji, so styling the two parts apart equals styling them together).
+      // T2-fix J3: the store part follows the whole cart reply (`finish`).
+      const reply =
+        line === null
+          ? styled(
+              invites
+                ? `${cartReply.value}\n\n${MINIMAL_CART_NEXT_STEP_QUESTION}`
+                : cartReply.value,
+            )
+          : `${styled(cartReply.value)}\n\n${line}\n\n${styled(MINIMAL_CART_NEXT_STEP_QUESTION)}`;
+      if (line !== null)
+        await this.pauseSuggestions(input.senderId, COMPLEMENT_INTERVAL_MS);
       const nextStep = invites
         ? await this.cartNextStepInteractive(input.senderId, style)
         : undefined;
@@ -3702,29 +4045,21 @@ export class MinimalCatalogAgentService {
         imageRun.added.size === 1
           ? productImage([...imageRun.added][0])
           : undefined;
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-        {
+      return finish({
+        decision: {
+          reply,
+          ...(media === undefined ? {} : { media }),
+          ...(list === null
+            ? nextStep === undefined
+              ? {}
+              : { interactive: nextStep }
+            : { interactive: list.interactive }),
+        },
+        record: {
           catalogPrices: persistedPrices(),
           ...(list === null ? {} : { interactiveChoice: list.context }),
         },
-      );
-      return {
-        reply,
-        ...(media === undefined ? {} : { media }),
-        ...(list === null
-          ? nextStep === undefined
-            ? {}
-            : { interactive: nextStep }
-          : { interactive: list.interactive }),
-      };
+      });
     }
     if (this.hasInvalidCartToolCall(result)) {
       // A cart tool whose arguments failed SDK validation never executed; the
@@ -3734,36 +4069,18 @@ export class MinimalCatalogAgentService {
         this.logger,
         `minimal_catalog tool cart argument rejected before execute trace=${traceId}`,
       );
-      const reply = styled(CART_OPERATION_CLARIFICATION);
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-      );
-      return { reply };
+      return finish({
+        decision: { reply: styled(CART_OPERATION_CLARIFICATION) },
+      });
     }
     if (this.hasInvalidToolCall(result, CHECKOUT_TOOL_NAMES)) {
       traceLog(
         this.logger,
         `minimal_catalog tool checkout argument rejected before execute trace=${traceId}`,
       );
-      const reply = styled(CHECKOUT_TOOL_CLARIFICATION);
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-      );
-      return { reply };
+      return finish({
+        decision: { reply: styled(CHECKOUT_TOOL_CLARIFICATION) },
+      });
     }
     // S3: exactly one product presented by this run's catalog reads (the
     // only hit, or the only one the text names) carries its photo.
@@ -3805,26 +4122,29 @@ export class MinimalCatalogAgentService {
       // L31: one emoji on the closing only when the customer uses them.
       const reply = limitCustomerEmojis(rendered.text, style);
       const media = photoFor(reply);
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          ...withApplicationReply(result.responseMessages, reply),
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-        rendered.restockOffer === null
-          ? {}
-          : {
-              catalogRestockOffer: {
-                ...rendered.restockOffer,
-                acceptsYes: rendered.restockAcceptsYes,
+      // T2-fix J2: the options first, then the store part (`finish`).
+      return finish({
+        decision: media === undefined ? { reply } : { reply, media },
+        history: { kind: 'application', messages: result.responseMessages },
+        record:
+          rendered.restockOffer === null
+            ? {}
+            : {
+                catalogRestockOffer: {
+                  ...rendered.restockOffer,
+                  acceptsYes: rendered.restockAcceptsYes,
+                },
               },
-            },
-      );
-      return media === undefined ? { reply } : { reply, media };
+      });
     }
+    // T2-fix J2 / T2-fix-2 K2: the reply would be the model's text. When
+    // getStoreInfo was the run's only answering tool (a pure store
+    // question), the store part alone answers: the block, or the fixed
+    // unavailable line in place of any model text about the store (J5).
+    // With another answering tool, the model's text is kept and the store
+    // part (block or fixed line) follows it.
+    if (storePart !== null && !answeringToolCalled(result))
+      return finish({ decision: { reply: storePart.text }, store: 'replace' });
     let text = result.text;
     let responseMessages: ModelMessage[] = result.responseMessages;
     if (text.trim() === '') {
@@ -3858,33 +4178,19 @@ export class MinimalCatalogAgentService {
         input.inboundEvent,
       );
       const reply = styled(real.reply);
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-      );
-      return real.onSent === undefined
-        ? { reply }
-        : { reply, onSent: real.onSent };
+      return finish({
+        decision:
+          real.onSent === undefined
+            ? { reply }
+            : { reply, onSent: real.onSent },
+      });
     }
     if (text.trim() === '') {
-      const reply = styled(EMPTY_REPLY_FALLBACK);
-      this.recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-      );
-      return { reply };
+      // T2-fix J2: with a store part, it is the answer.
+      return finish({
+        decision: { reply: styled(EMPTY_REPLY_FALLBACK) },
+        store: 'replace',
+      });
     }
     // Same carry when the model wrote the offer itself (a stock check after
     // the search skips the rendered options): exactly one product presented
@@ -3900,16 +4206,15 @@ export class MinimalCatalogAgentService {
         `minimal_catalog cart_pending armed=stated_count trace=${traceId}`,
       );
     const media = photoFor(text);
-    this.recordTurn(
-      input.senderId,
-      [{ role: 'user', content: input.text }, ...responseMessages],
-      [...currentIds],
-      persistedCartContext(),
-      persistedImages(),
-    );
     // The prompt styles model text; only the emoji guard applies here.
     const reply = limitCustomerEmojis(text, style);
-    return media === undefined ? { reply } : { reply, media };
+    // T2-fix J2: the model's answer, then the store part (`finish`); the
+    // history keeps the model's messages, or the full reply with a store
+    // part.
+    return finish({
+      decision: media === undefined ? { reply } : { reply, media },
+      history: { kind: 'model', messages: responseMessages },
+    });
   }
 
   /**
@@ -4194,6 +4499,206 @@ export class MinimalCatalogAgentService {
     };
   }
 
+  /**
+   * T3 (D4): the suggestion tool is offered only with a cart and a loaded
+   * profile (the persisted 24 h marker), no suggestion in the window, and no
+   * order summary, checkout confirmation or payment step pending.
+   */
+  private complementAvailable(senderId: string, unpaidOrder: boolean): boolean {
+    return (
+      this.cart !== undefined &&
+      this.profileWritable(senderId) &&
+      !unpaidOrder &&
+      (this.order?.offerStatus(senderId) ?? null) === null &&
+      !(
+        this.checkoutAvailable() &&
+        this.checkout!.confirmationStatus(senderId)?.stage === 'pending'
+      ) &&
+      !this.profiles!.suggestionsPaused(senderId)
+    );
+  }
+
+  /** T3: a loaded, storable, not forgotten profile keeps the pause. */
+  private profileWritable(senderId: string): boolean {
+    const profiles = this.profiles;
+    return (
+      profiles !== undefined &&
+      isValidProfileSenderId(senderId) &&
+      profiles.isLoaded(senderId) &&
+      !profiles.isForgotten(senderId)
+    );
+  }
+
+  /**
+   * T3-fix-2 G5: the one clock of the suggestion rules (price age and
+   * pause): the profile service's injected clock. Without profiles no
+   * suggestion tool is offered, so the fallback only stamps unused reads.
+   */
+  private suggestionNowMs(): number {
+    return this.profiles?.nowMs() ?? Date.now();
+  }
+
+  /**
+   * T3-fix E2: pause suggestions for `durationMs`. The service pauses
+   * in-process first; a failed durable write is logged, never thrown, so
+   * the reply is never dropped. T3-fix-2 G8: `false` when the pause is
+   * process-only.
+   */
+  private async pauseSuggestions(
+    senderId: string,
+    durationMs: number,
+  ): Promise<boolean> {
+    try {
+      return (
+        (await this.profiles?.pauseSuggestionsFor(senderId, durationMs)) ??
+        false
+      );
+    } catch (error) {
+      this.logger.warn(
+        `minimal_catalog suggestions pause failed: ${error instanceof Error ? error.name : 'unknown'}`,
+      );
+      return false;
+    }
+  }
+
+  /** T3-fix E1 (S7): the customer said no to suggestions → 30-day pause. */
+  private declineTools(
+    senderId: string,
+    run: DeclineRun | null,
+    complementRun: ComplementRun | null,
+    traceId: string,
+  ): ToolSet {
+    if (run === null) return {};
+    return {
+      // Listed in STORE_NEUTRAL_TOOLS: it answers nothing by itself.
+      declineSuggestions: tool({
+        description:
+          'Registra que el cliente rechazó una sugerencia de producto o pidió no recibir sugerencias. No cambia su respuesta.',
+        inputSchema: z.strictObject({}),
+        execute: async () => {
+          if (run.attempted) return toolError('already_declined');
+          run.attempted = true;
+          if (complementRun !== null) complementRun.declined = true;
+          const durable = await this.pauseSuggestions(
+            senderId,
+            COMPLEMENT_DECLINE_PAUSE_MS,
+          );
+          // T3-fix-2 G8 (accepted limit): the 30 days then hold only in this
+          // process; logged with the trace id, never the phone.
+          if (!durable)
+            this.logger.warn(
+              `minimal_catalog tool declineSuggestions durable_write=failed pause=process_only trace=${traceId}`,
+            );
+          traceLog(
+            this.logger,
+            `minimal_catalog tool declineSuggestions result=ok trace=${traceId}`,
+          );
+          return { ok: true as const };
+        },
+      }),
+    };
+  }
+
+  /** T3 (D2/D3): one checked complementary product per run. */
+  private complementTools(
+    run: ComplementRun | null,
+    allowedIds: ReadonlySet<string>,
+    imageRun: ProductImageRun,
+    cartReply: CartReply,
+    traceId: string,
+  ): ToolSet {
+    if (run === null) return {};
+    const refuse = (code: string) => {
+      traceLog(
+        this.logger,
+        `minimal_catalog tool suggestComplement result=denied code=${code} trace=${traceId}`,
+      );
+      return toolError(code);
+    };
+    return {
+      suggestComplement: tool({
+        description:
+          'Propone UN producto complementario a lo que se acaba de agregar al carrito (leído con searchCatalog en esta conversación). La aplicación lo valida y lo presenta.',
+        inputSchema: z.strictObject({
+          productId: z.uuid(),
+          variantId: z.uuid().optional(),
+        }),
+        execute: async ({ productId, variantId }) => {
+          // E5: claim the run's one slot before any await.
+          if (run.claimed || run.value !== null)
+            return refuse('already_suggested');
+          if (run.declined) return refuse('declined');
+          if (imageRun.added.size === 0) return refuse('no_cart_add');
+          if (!allowedIds.has(productId)) return refuse('unknown_product');
+          if (imageRun.added.has(productId)) return refuse('same_product');
+          if (cartReply.cartProductIds?.has(productId) === true)
+            return refuse('in_cart');
+          // T3-fix-2 G6: the price is checked from this chat's catalog reads
+          // before the slot is claimed or stock is read.
+          const key = priceKey(productId, variantId);
+          const priced = imageRun.complementPrices.get(key);
+          const readVariants = [...imageRun.complementPrices.keys()].some(
+            (k) => k.startsWith(`${productId}|`) && k !== priceKey(productId),
+          );
+          if (variantId === undefined && readVariants)
+            return refuse('variant_required');
+          if (variantId !== undefined && priced === undefined && readVariants)
+            return refuse('unknown_product');
+          if (priced?.priceCents == null) return refuse('unknown_price');
+          // E3: only a price read within 24 h (an earlier day's read, or an
+          // unknown read time, is stale).
+          if (
+            !(
+              this.suggestionNowMs() - priced.readAt <
+              COMPLEMENT_PRICE_MAX_AGE_MS
+            )
+          )
+            return refuse('stale_product');
+          const priceCents = priced.priceCents;
+          run.claimed = true;
+          const release = (code: string) => {
+            run.claimed = false;
+            return refuse(code);
+          };
+          let stock: Awaited<ReturnType<ChatbotApiClient['getStock']>>;
+          try {
+            stock = await this.chatbotApi.getStock(productId);
+          } catch {
+            return release('unverified');
+          }
+          if (stock.productId !== productId) return release('unverified');
+          const variant =
+            variantId === undefined
+              ? undefined
+              : stock.variants.find((v) => v.variantId === variantId);
+          if (variantId !== undefined && variant === undefined)
+            return release('unknown_product');
+          if (variant === undefined && stock.variants.length > 0)
+            return release('variant_required');
+          const status = safeStatus((variant ?? stock).stock.status);
+          if (status === 'out_of_stock') return release('out_of_stock');
+          if (status === 'unknown') return release('unverified');
+          if (run.declined) return release('declined');
+          run.value = {
+            productId,
+            name:
+              variant === undefined
+                ? stock.name
+                : variant.name.startsWith(stock.name)
+                  ? variant.name
+                  : `${stock.name} ${variant.name}`,
+            priceCents,
+          };
+          traceLog(
+            this.logger,
+            `minimal_catalog tool suggestComplement result=ok trace=${traceId}`,
+          );
+          return { ok: true as const, presentedByApplication: true as const };
+        },
+      }),
+    };
+  }
+
   /** One payment-details answer per run; the reply is application-owned. */
   private paymentTools(
     input: {
@@ -4227,6 +4732,118 @@ export class MinimalCatalogAgentService {
           traceLog(
             this.logger,
             `minimal_catalog tool getPaymentDetails trace=${traceId}`,
+          );
+          return { ok: true as const, presentedByApplication: true as const };
+        },
+      }),
+    };
+  }
+
+  /**
+   * T2-fix J2/J3/J5: the store part a run appends to its reply: the styled
+   * store block and the pin (coordinates only) after a good read; the fixed
+   * unavailable line (with the askTeam offer when `offerTeam`) after a
+   * failed or unconfigured one; `null` when getStoreInfo was not called,
+   * was deferred or the tool was not offered.
+   */
+  private storeReplyPart(
+    run: StoreInfoRun | null,
+    style: CustomerStyle,
+    styled: (text: string) => string,
+    offerTeam: boolean,
+  ): StorePart | null {
+    if (run === null) return null;
+    if (run.value !== null) {
+      const location = storePin(run.value);
+      const text = styled(storeInfoReply(run.value, style));
+      return location === undefined ? { text } : { text, location };
+    }
+    return run.unavailable
+      ? { text: storeInfoUnavailableLine(style, offerTeam) }
+      : null;
+  }
+
+  /**
+   * T2 H2: the store-info run of this turn, or `null` when the tool and its
+   * instruction are not offered (a client without the branch read). The
+   * single getBranch gate. T2-fix-2 K1: offered on every turn, a checkout
+   * step pending or not (the instruction routes «paso a recoger» while
+   * choosing delivery or pickup to chooseStorePickup).
+   */
+  private storeInfoRunFor(): StoreInfoRun | null {
+    const getBranch = this.chatbotApi.getBranch?.bind(this.chatbotApi);
+    if (getBranch === undefined) return null;
+    return {
+      read: getBranch,
+      attempted: false,
+      value: null,
+      unavailable: false,
+    };
+  }
+
+  /**
+   * T2 H2: one store-info answer per run (pattern of getPaymentDetails):
+   * the application owns the store part of the reply. Results:
+   * - `{ok, presentedByApplication}`: the store block (and the pin) is
+   *   appended to whatever reply wins the turn (T2-fix J2/J3; one exit,
+   *   T2-fix-2 K5);
+   * - `store_info_settled`: a second call in the same run (nothing new);
+   * - `store_info_deferred` (T2-fix J3): the which-pet / memory question
+   *   already won the turn; it keeps the request and re-runs it after the
+   *   answer, so the store part is answered then (nothing is read now).
+   *   T2-fix-2 K3: a call BEFORE the question still reads, but the
+   *   question's reply never carries the store part (`defer`);
+   * - `store_info_unavailable`: a failed or drifted read, or a branch with
+   *   neither address nor hours; the application says so with a fixed line
+   *   (T2-fix J5) and the model never states an address or hours.
+   */
+  private storeInfoTools(
+    run: StoreInfoRun | null,
+    deferred: () => boolean,
+    traceId: string,
+  ): ToolSet {
+    if (run === null) return {};
+    return {
+      // Listed in STORE_NEUTRAL_TOOLS: it answers nothing by itself.
+      getStoreInfo: tool({
+        description:
+          'Dirección, horario y ubicación de la tienda (sucursal). ' +
+          'Llámela cuando pregunte dónde están, a qué hora abren o cierran, ' +
+          'si abren un día o si puede pasar a recoger. La aplicación responde al cliente.',
+        inputSchema: z.strictObject({}),
+        execute: async () => {
+          if (run.attempted) return toolError('store_info_settled');
+          run.attempted = true;
+          if (deferred()) {
+            traceLog(
+              this.logger,
+              `minimal_catalog tool getStoreInfo deferred=pet_question trace=${traceId}`,
+            );
+            return toolError('store_info_deferred');
+          }
+          let branch: BranchInfo;
+          try {
+            branch = await run.read();
+          } catch (error) {
+            // T2-fix J6: the upstream status and error code, never a body.
+            run.unavailable = true;
+            this.logger.warn(
+              `minimal_catalog tool getStoreInfo read failed trace=${traceId}: ${describeBranchReadError(error)}`,
+            );
+            return toolError('store_info_unavailable');
+          }
+          if (branch.address === null && branch.hours === null) {
+            // T2-fix J6: a branch staff never configured, not an outage.
+            run.unavailable = true;
+            this.logger.warn(
+              `minimal_catalog tool getStoreInfo branch_unconfigured (no address, no hours) trace=${traceId}`,
+            );
+            return toolError('store_info_unavailable');
+          }
+          run.value = branch;
+          traceLog(
+            this.logger,
+            `minimal_catalog tool getStoreInfo pin=${branch.location !== null} trace=${traceId}`,
           );
           return { ok: true as const, presentedByApplication: true as const };
         },
@@ -5468,14 +6085,7 @@ export class MinimalCatalogAgentService {
     verifiedProductIds: string[],
     cartContext?: MinimalCartConversationContext,
     productImages?: ProductImageContext,
-    interactive: {
-      catalogPrices?: Record<string, number>;
-      interactiveChoice?: InteractiveChoiceContext;
-      reorderOffer?: ReorderOfferContext;
-      paymentOffer?: { saleId: string };
-      catalogRestockOffer?: CatalogRestockOffer & { acceptsYes: boolean };
-      petChoice?: PetChoice;
-    } = {},
+    interactive: TurnRecordExtras = {},
   ): void {
     // T4c-2a: the which-pet question answers only the next message too.
     if (this.petChoices !== undefined) {
@@ -5504,6 +6114,9 @@ export class MinimalCatalogAgentService {
     const images = productImages ?? turns.at(-1)?.productImages;
     // S4: prices carry forward; a list only belongs to the turn that sent it.
     const prices = interactive.catalogPrices ?? turns.at(-1)?.catalogPrices;
+    // T3-fix-2 G2: the suggestion-only prices carry forward the same way.
+    const complementPrices =
+      interactive.complementPrices ?? turns.at(-1)?.complementPrices;
     this.sessionStore.write(senderId, [
       ...prior,
       {
@@ -5512,6 +6125,7 @@ export class MinimalCatalogAgentService {
         ...(inherited === undefined ? {} : { cartContext: inherited }),
         ...(images === undefined ? {} : { productImages: images }),
         ...(prices === undefined ? {} : { catalogPrices: prices }),
+        ...(complementPrices === undefined ? {} : { complementPrices }),
         ...(interactive.interactiveChoice === undefined
           ? {}
           : { interactiveChoice: interactive.interactiveChoice }),
@@ -5567,13 +6181,17 @@ export class MinimalCatalogAgentService {
   ): Promise<MinimalCheckoutReply> {
     const join = (...parts: Array<string | null>) =>
       parts.filter((part): part is string => part !== null).join('\n\n');
+    // T2-fix J7: a recovered pickup order keeps its store pin.
     const withLead = (
       prefix: string | null,
       prepared: MinimalCheckoutReply,
-    ): MinimalCheckoutReply =>
-      prepared.onSent === undefined
-        ? { reply: join(prefix, prepared.reply) }
-        : { reply: join(prefix, prepared.reply), onSent: prepared.onSent };
+    ): MinimalCheckoutReply => ({
+      reply: join(prefix, prepared.reply),
+      ...(prepared.onSent === undefined ? {} : { onSent: prepared.onSent }),
+      ...(prepared.location === undefined
+        ? {}
+        : { location: prepared.location }),
+    });
     const first = await this.order!.prepareOrder(senderId, inboundEvent);
     if (
       first.reply !== MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY ||
@@ -5829,7 +6447,13 @@ export class MinimalCatalogAgentService {
               allowedIds.add(item.productId);
               currentIds.add(item.productId);
               imageRun?.presented.set(item.productId, item.name);
-              if (imageRun !== null) recordPrices(imageRun.prices, item);
+              if (imageRun !== null)
+                recordPrices(
+                  imageRun.prices,
+                  item,
+                  imageRun.complementPrices,
+                  this.suggestionNowMs(),
+                );
               if (
                 imageRun !== null &&
                 isSendableProductImageUrl(item.imageUrl)
@@ -6041,10 +6665,46 @@ export class MinimalCatalogAgentService {
             : 'cart';
       if (kind !== 'read') clarificationAcknowledged = true;
     };
+    // T3: the cart's product ids after this run's last successful write.
+    const refreshCartProductIds = (result: MinimalCartResult): void => {
+      if (result.ok)
+        cartReply.cartProductIds = new Set(
+          result.items.map((item) => item.productId),
+        );
+    };
+    // T3-fix E6: units of one line (product + presentation) in a cart;
+    // T3-fix-2 G4: `null` when unknown (unreadable cart or a line without
+    // a quantity).
+    const lineUnits = (
+      lines: ReadonlyArray<{
+        productId: string;
+        variantId?: string;
+        quantity?: number;
+      }> | null,
+      identity: MinimalCartSelectionIdentity,
+    ): number | null => {
+      if (lines === null) return null;
+      let units = 0;
+      for (const line of lines) {
+        if (
+          line.productId !== identity.productId ||
+          (line.variantId ?? '') !== (identity.variantId ?? '')
+        )
+          continue;
+        if (typeof line.quantity !== 'number') return null;
+        units += line.quantity;
+      }
+      return units;
+    };
     const applyIntent = async (
       identity: ResolvedCartSelection,
       intent: MinimalCartQuantityIntent,
       defaulted = false,
+      before: ReadonlyArray<{
+        productId: string;
+        variantId?: string;
+        quantity?: number;
+      }> | null,
     ): Promise<MinimalCartResult> => {
       if (cart === undefined || conversation === null)
         return { ok: false, error: 'cart_unavailable' };
@@ -6079,6 +6739,7 @@ export class MinimalCatalogAgentService {
         mutationAcknowledged = true;
         if (result.ok && intent.operation === 'add' && magnitude > 0)
           imageRun?.added.add(identity.productId);
+        refreshCartProductIds(result);
         return result;
       }
       const result = await cart.setItem(
@@ -6096,8 +6757,18 @@ export class MinimalCatalogAgentService {
       cartReply.source = 'cart';
       cartReply.mutated = result.ok && result.items.length > 0;
       mutationAcknowledged = true;
-      if (result.ok && intent.operation === 'set' && (intent.quantity ?? 0) > 0)
+      // E6: a set adds only when it raises the line's units; G4: unknown
+      // previous units never count as an add (fail closed).
+      const unitsBefore = lineUnits(before, identity);
+      const unitsAfter = result.ok ? lineUnits(result.items, identity) : null;
+      if (
+        intent.operation === 'set' &&
+        unitsBefore !== null &&
+        unitsAfter !== null &&
+        unitsAfter > unitsBefore
+      )
         imageRun?.added.add(identity.productId);
+      refreshCartProductIds(result);
       return result;
     };
     // F10: a cart tool on a message with no cart request at all ("Quiero
@@ -6130,7 +6801,8 @@ export class MinimalCatalogAgentService {
       // operation in the same run, and it never overwrites the first reply.
       if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
         return toolError('cart_line_settled');
-      const lines = (await cart?.storedLines(context.senderId)) ?? [];
+      const stored = (await cart?.storedLines(context.senderId)) ?? null;
+      const lines = stored ?? [];
       // A pet statement is never a cart write, whatever numbers it carries.
       if (conversation.isPetStatementOnly()) return misplacedCartCall(lines)!;
       const grounded = conversation.ground(identity, proposal, lines);
@@ -6157,6 +6829,7 @@ export class MinimalCatalogAgentService {
         grounded.selection,
         grounded.intent,
         grounded.defaulted,
+        stored,
       );
     };
     /**
@@ -6452,7 +7125,8 @@ export class MinimalCatalogAgentService {
               }
               if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
                 return toolError('cart_line_settled');
-              const lines = (await cart.storedLines(context.senderId)) ?? [];
+              const stored = await cart.storedLines(context.senderId);
+              const lines = stored ?? [];
               if (conversation.isPetStatementOnly())
                 return misplacedCartCall(lines)!;
               const grounded = conversation.prepare(
@@ -6473,6 +7147,7 @@ export class MinimalCatalogAgentService {
                     grounded.selection,
                     grounded.intent,
                     grounded.defaulted,
+                    stored,
                   );
                 }
                 acknowledge(

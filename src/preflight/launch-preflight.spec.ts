@@ -1,3 +1,5 @@
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   CLIENT_ROUTES,
   CORE_CONFIG_NAMES,
@@ -225,6 +227,13 @@ describe('runLaunchPreflight', () => {
     expect(REQUIRED_MIGRATIONS).toContain(
       '4500000000000_human_request_feed_retention.js',
     );
+  });
+
+  it('T3-fix E9: requires every migration on disk (the bot reads all of them)', () => {
+    const onDisk = readdirSync(join(__dirname, '../../migrations')).filter(
+      (name) => name.endsWith('.js'),
+    );
+    expect([...REQUIRED_MIGRATIONS].sort()).toEqual(onDisk.sort());
   });
 
   it('requires the webhook dedup claims migration', () => {

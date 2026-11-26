@@ -65,6 +65,58 @@ describe('CustomerProfileService', () => {
     await expect(service.forget(SENDER)).resolves.toBe(false);
   });
 
+  it('T3-fix E1: pauseSuggestions persists the pause; suggestionsPaused reads it across a restart', async () => {
+    const store = new InMemoryCustomerProfileStore();
+    const service = new CustomerProfileService(store, clock);
+    await service.load(SENDER);
+    const until = NOW.getTime() + 30 * 24 * 60 * 60_000;
+    expect(service.suggestionsPaused(SENDER)).toBe(false);
+    await service.pauseSuggestions(SENDER, until);
+    expect(service.suggestionsPaused(SENDER)).toBe(true);
+    await expect(store.read(SENDER)).resolves.toMatchObject({
+      suggestionsPausedUntil: new Date(until).toISOString(),
+    });
+    const restarted = new CustomerProfileService(store, clock);
+    await restarted.load(SENDER);
+    expect(restarted.suggestionsPaused(SENDER)).toBe(true);
+    expect(restarted.suggestionsPaused(SENDER, until - 1)).toBe(true);
+    expect(restarted.suggestionsPaused(SENDER, until)).toBe(false);
+  });
+
+  it('T3-fix E2: a failed pause write still pauses in this process and never throws', async () => {
+    const store = new InMemoryCustomerProfileStore();
+    jest.spyOn(store, 'upsert').mockRejectedValue(new Error('db down'));
+    const service = new CustomerProfileService(store, clock);
+    await service.load(SENDER);
+    const until = NOW.getTime() + 24 * 60 * 60_000;
+    const pending = service.pauseSuggestions(SENDER, until);
+    // In-process pause BEFORE the durable write settles.
+    expect(service.suggestionsPaused(SENDER)).toBe(true);
+    // T3-fix-2 G8: the caller learns the pause is process-only.
+    await expect(pending).resolves.toBe(false);
+    expect(service.suggestionsPaused(SENDER)).toBe(true);
+  });
+
+  it('T3-fix-2 G8: pauseSuggestionsFor resolves true once the pause is stored (also when unchanged)', async () => {
+    const store = new InMemoryCustomerProfileStore();
+    const service = new CustomerProfileService(store, clock);
+    await service.load(SENDER);
+    const day = 24 * 60 * 60_000;
+    await expect(service.pauseSuggestionsFor(SENDER, day)).resolves.toBe(true);
+    await expect(service.pauseSuggestionsFor(SENDER, day)).resolves.toBe(true);
+    await expect(store.read(SENDER)).resolves.toMatchObject({
+      suggestionsPausedUntil: new Date(NOW.getTime() + day).toISOString(),
+    });
+  });
+
+  it('T3-fix-2 G5: nowMs is the injected clock the pause uses', () => {
+    const service = new CustomerProfileService(
+      new InMemoryCustomerProfileStore(),
+      clock,
+    );
+    expect(service.nowMs()).toBe(NOW.getTime());
+  });
+
   it('styleFor reads the stored style, null when there is no profile', async () => {
     const store = new InMemoryCustomerProfileStore();
     const service = new CustomerProfileService(store, clock);

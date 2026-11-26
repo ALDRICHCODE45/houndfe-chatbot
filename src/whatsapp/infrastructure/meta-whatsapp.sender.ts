@@ -21,10 +21,12 @@ import {
   OutboundDocument,
   OutboundImage,
   OutboundInteractive,
+  OutboundLocation,
   OutboundMediaFile,
   OutboundOrigin,
   OutboundTemplate,
   OutboundText,
+  REPLY_LOCATION_REQUEST_TIMEOUT_MS,
   SendResult,
   UnsupportedOutboundError,
   WhatsappSenderPort,
@@ -47,6 +49,11 @@ interface SendOptions {
   origin?: OutboundOrigin;
   /** Media mime type, recorded with a media-id send. */
   mimeType?: string;
+  /**
+   * T2-fix-2 K4: the request's own timeout (ms). Only the store pin sets
+   * it; every other send keeps the HTTP client's defaults.
+   */
+  timeoutMs?: number;
 }
 
 const ORIGINS: ReadonlySet<string> = new Set(['BOT', 'STAFF', 'TEMPLATE']);
@@ -141,6 +148,31 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
         },
       },
       { origin: message.origin },
+    );
+  }
+
+  /** T2 H3: the store pin as a native WhatsApp location message. */
+  async sendLocation(message: OutboundLocation): Promise<SendResult> {
+    this.assertLocationMessage(message);
+
+    return this.send(
+      {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: message.to,
+        type: 'location',
+        location: {
+          latitude: message.latitude,
+          longitude: message.longitude,
+          ...(message.name === undefined ? {} : { name: message.name }),
+          ...(message.address === undefined
+            ? {}
+            : { address: message.address }),
+        },
+      },
+      // T2-fix-2 K4: a hung pin request ends; longer than the dispatcher's
+      // wait so a late accepted pin is still remembered (see the port).
+      { origin: message.origin, timeoutMs: REPLY_LOCATION_REQUEST_TIMEOUT_MS },
     );
   }
 
@@ -347,10 +379,13 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
         'meta.sandboxRecipientNormalizationEnabled',
       ) === true;
 
-    const response = await this.postMessage({
-      ...payload,
-      to: normalizeSandboxRecipient(payload.to, sandboxNormalization),
-    });
+    const response = await this.postMessage(
+      {
+        ...payload,
+        to: normalizeSandboxRecipient(payload.to, sandboxNormalization),
+      },
+      options.timeoutMs,
+    );
 
     // T2: the moment Meta accepted the send, before any local bookkeeping.
     const acceptedAt = new Date();
@@ -432,6 +467,7 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
 
   private async postMessage(
     payload: MetaMessagePayload,
+    timeoutMs?: number,
   ): Promise<MetaSendResponse> {
     try {
       const response = await lastValueFrom(
@@ -442,6 +478,7 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
             headers: {
               Authorization: `Bearer ${this.configService.getOrThrow<AppConfig['meta']['accessToken']>('meta.accessToken')}`,
             },
+            ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
           },
         ),
       );
@@ -568,6 +605,26 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
       (message.caption !== undefined && typeof message.caption !== 'string')
     ) {
       throw new UnsupportedOutboundError('Invalid outbound image message');
+    }
+    this.assertOrigin(message.origin);
+  }
+
+  private assertLocationMessage(message: OutboundLocation): void {
+    const coordinate = (value: unknown, max: number) =>
+      typeof value === 'number' &&
+      Number.isFinite(value) &&
+      Math.abs(value) <= max;
+    const label = (value: unknown) =>
+      value === undefined || (typeof value === 'string' && value.trim() !== '');
+    if (
+      typeof message?.to !== 'string' ||
+      message.to === '' ||
+      !coordinate(message.latitude, 90) ||
+      !coordinate(message.longitude, 180) ||
+      !label(message.name) ||
+      !label(message.address)
+    ) {
+      throw new UnsupportedOutboundError('Invalid outbound location message');
     }
     this.assertOrigin(message.origin);
   }
@@ -726,6 +783,9 @@ function transcriptEntry(
         },
       };
     }
+    case 'location':
+      // T2 H3: the pin as sent, so the inbox can show which place it was.
+      return { ...base, details: { location: field(payload.location) } };
     case 'template': {
       const template = field(payload.template);
       const components = Array.isArray(template?.components)

@@ -1,4 +1,5 @@
 import type { ChatbotApiClient } from '../../../src/chatbot-api/domain/chatbot-api.client';
+import type { BranchInfo } from '../../../src/chatbot-api/domain/dtos/branch.dto';
 import type { CartItemInput } from '../../../src/chatbot-api/domain/dtos/pricing.dto';
 import type {
   CheckoutContextAddress,
@@ -161,6 +162,33 @@ export function petOrder(pets: readonly EvalPetSeed[]): OrderHistoryResponse {
   };
 }
 
+/** T2 H6: the branch the fake backend reads (`GET /chatbot-api/branch`),
+ *  the same store as the pickup checkout, with its pin. */
+export const EVAL_BRANCH: BranchInfo = {
+  name: 'Tienda de mascotas HoundFe — Sucursal Centro',
+  address: {
+    addressLine1: 'Av. Insurgentes Sur 1000',
+    addressLine2: null,
+    neighborhood: 'Del Valle',
+    municipality: 'Benito Juárez',
+    state: 'Ciudad de México',
+    postalCode: '03100',
+    formatted:
+      'Av. Insurgentes Sur 1000, Del Valle, Benito Juárez, Ciudad de México, 03100',
+  },
+  hours: {
+    timeZone: 'America/Mexico_City',
+    days: [],
+    summary: 'Lunes a sábado: 09:00–19:00. Domingo: 10:00–14:00.',
+  },
+  location: { latitude: 19.3907, longitude: -99.1716 },
+};
+/** T2 H6: the same branch before staff set its coordinates (no pin). */
+export const EVAL_BRANCH_WITHOUT_LOCATION: BranchInfo = {
+  ...EVAL_BRANCH,
+  location: null,
+};
+
 const notFound = (method: string) =>
   Promise.reject(new Error(`eval fake: ${method} is not part of the eval`));
 
@@ -181,6 +209,8 @@ export class EvalFakeApi implements ChatbotApiClient {
   /** Order history (latest first); one previous order for an existing
    *  customer, preceded by an order for its pets when it has any (T7). */
   history: OrderHistoryResponse[];
+  /** T2 H6: what `getBranch` answers (a scenario may pick the pinless one). */
+  branch: BranchInfo = EVAL_BRANCH;
 
   constructor(private readonly customer: FixtureCustomer) {
     const pets = customer.kind === 'existing' ? (customer.pets ?? []) : [];
@@ -463,6 +493,13 @@ export class EvalFakeApi implements ChatbotApiClient {
       isActive: true,
       updatedAt: '2026-10-01T00:00:00.000Z',
     });
+  }
+
+  getBranch(): Promise<BranchInfo> {
+    this.events.push(
+      `getBranch → ${this.branch.location === null ? 'no pin' : 'with pin'}`,
+    );
+    return Promise.resolve(structuredClone(this.branch));
   }
 
   upsertCustomer() {

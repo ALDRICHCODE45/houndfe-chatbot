@@ -47,6 +47,8 @@ export interface CustomerProfile {
   emojis: boolean;
   tone: CustomerTone;
   lastOrder?: CustomerLastOrder;
+  /** T3-fix (S6, S7): no complementary suggestion before this (ISO). */
+  suggestionsPausedUntil?: string;
   updatedAt: string;
 }
 
@@ -58,6 +60,7 @@ export interface CustomerProfilePatch {
   emojis?: boolean | null;
   tone?: CustomerTone | null;
   lastOrder?: CustomerLastOrder | null;
+  suggestionsPausedUntil?: string | null;
 }
 
 /** A patch after `normalizeCustomerProfilePatch`: only values to write. */
@@ -68,6 +71,7 @@ export interface NormalizedCustomerProfilePatch {
   emojis?: boolean;
   tone?: CustomerTone;
   lastOrder?: CustomerLastOrder;
+  suggestionsPausedUntil?: string;
 }
 
 export interface CustomerProfileStore {
@@ -170,6 +174,12 @@ export function normalizeCustomerProfilePatch(
     out.tone = patch.tone;
   const lastOrder = normalizeLastOrder(patch.lastOrder);
   if (lastOrder !== undefined) out.lastOrder = lastOrder;
+  const pausedMs =
+    typeof patch.suggestionsPausedUntil === 'string'
+      ? Date.parse(patch.suggestionsPausedUntil)
+      : NaN;
+  if (!Number.isNaN(pausedMs))
+    out.suggestionsPausedUntil = new Date(pausedMs).toISOString();
   return out;
 }
 
@@ -190,6 +200,9 @@ export function mergeCustomerProfile(
   const lastOrder = next.lastOrder ?? existing?.lastOrder;
   const displayName = next.displayName ?? existing?.displayName;
   const preferredName = next.preferredName ?? existing?.preferredName;
+  // T3-fix: the latest pause written wins (even an earlier instant).
+  const suggestionsPausedUntil =
+    next.suggestionsPausedUntil ?? existing?.suggestionsPausedUntil;
   return {
     senderId,
     ...(displayName === undefined ? {} : { displayName }),
@@ -198,6 +211,7 @@ export function mergeCustomerProfile(
     emojis: next.emojis ?? existing?.emojis ?? false,
     tone: next.tone ?? existing?.tone ?? 'neutral',
     ...(lastOrder === undefined ? {} : { lastOrder: { ...lastOrder } }),
+    ...(suggestionsPausedUntil === undefined ? {} : { suggestionsPausedUntil }),
     updatedAt: now.toISOString(),
   };
 }
@@ -214,6 +228,7 @@ export function profilePatchIsNoop(
     'register',
     'emojis',
     'tone',
+    'suggestionsPausedUntil',
   ] as const;
   for (const key of scalars)
     if (patch[key] !== undefined && patch[key] !== existing[key]) return false;

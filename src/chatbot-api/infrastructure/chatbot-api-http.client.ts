@@ -131,6 +131,7 @@ import {
   type CheckoutStatus,
 } from '../domain/dtos/checkout.dto';
 import type { PaymentDetail } from '../domain/dtos/payment-details.dto';
+import { parseBranchInfo, type BranchInfo } from '../domain/dtos/branch.dto';
 import {
   normalizePayInStoreHold,
   type PayInStoreHold,
@@ -287,6 +288,8 @@ export const SCHEDULING_TIMEOUTS_MS = {
   slots: 10_000,
   reschedule: 10_000,
 } as const;
+/** T2 H1: how long a good branch read is reused (failures never are). */
+export const BRANCH_CACHE_TTL_MS = 5 * 60_000;
 /** Largest error body read back from a failed streamed download. */
 const STREAMED_ERROR_BODY_MAX_BYTES = 4096;
 const STREAMED_ERROR_BODY_READ_MS = 2_000;
@@ -865,6 +868,41 @@ export class ChatbotApiHttpClient
       { method: 'GET', url: '/chatbot-api/payment-details' },
       { retryable: true },
     );
+  }
+
+  /** T2 H1: the last good branch read and when it stops being fresh. */
+  private branchCache: { value: BranchInfo; expiresAtMs: number } | null = null;
+
+  /**
+   * T2 H1: `GET /chatbot-api/branch` (scope `catalog:read`). Safe GET retry
+   * policy, HTTP 200 with a strictly parsed body. A good read is kept for
+   * `BRANCH_CACHE_TTL_MS` (store data changes rarely and every store
+   * question would otherwise spend the credential's rate limit); a failure
+   * is never cached, so the next question reads again. Callers get a copy.
+   */
+  async getBranch(): Promise<BranchInfo> {
+    const cached = this.branchCache;
+    if (cached !== null && Date.now() < cached.expiresAtMs)
+      return structuredClone(cached.value);
+    const response = await this.requestWithResponse<unknown>(
+      { method: 'GET', url: '/chatbot-api/branch' },
+      { retryable: true },
+    );
+    const body = response.data;
+    const branch = parseBranchInfo(body);
+    if (response.status !== 200 || branch === null) {
+      throw new UpstreamError(
+        'Chatbot API branch response was invalid',
+        response.status,
+        body,
+        extractErrorCode(body),
+      );
+    }
+    this.branchCache = {
+      value: branch,
+      expiresAtMs: Date.now() + BRANCH_CACHE_TTL_MS,
+    };
+    return structuredClone(branch);
   }
 
   /**

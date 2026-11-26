@@ -60,6 +60,8 @@ A pickup order sends `sale.shipping = {mode: "pickup"}` with `expectedTotalCents
 
 After a pickup order is created, the order-created message adds the backend `pickupLocation`: “Recójalo en {name}: {address.formatted}.” and, when hours are configured, “Horario: {hours.summary}”. A null address prints only “Recójalo en {name}.”; null hours or a missing `pickupLocation` omit those parts (nothing is invented). The same applies to an order recovered through `GET /checkouts/status`, which returns the cached checkout body.
 
+When the checkout `pickupLocation` has coordinates (`location: {latitude, longitude}`, see [branch location](contracts/branch-location.md)), the order-created reply also carries the store pin: a WhatsApp location message sent right after the text (and its payment buttons), labelled with the branch name and address. A missing or null `location` sends no pin and leaves the text byte-identical. A failed or timed-out pin send is only logged (the pin goes after the inbound is marked seen, so the text is never repeated). The customer can ask where the store is or its hours at any time, a checkout step pending or not: the `getStoreInfo` tool appends the same store block and pin from `GET /chatbot-api/branch` to the turn's reply. While delivery or pickup is being chosen, «paso a recoger» / «lo recojo» still choose pickup (`chooseStorePickup`, the prompt says so), byte-identical to before (see [branch location](contracts/branch-location.md)).
+
 A `savedCorrected` draft quotes the corrected ZIP and other location fields,
 never its stale base snapshot. Its quote destination is a location fingerprint
 (`kind: 'new'`), just like a confirmed new address. Changes require delivery

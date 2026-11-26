@@ -44,6 +44,8 @@ export interface Scenario {
   expectOrders?: number;
   /** WhatsApp contact profile name sent with every turn (S1). */
   profileName?: string;
+  /** T2 H6: the branch the fake backend reads; default with its pin. */
+  branch?: 'with_location' | 'without_location';
 }
 
 /**
@@ -384,6 +386,61 @@ export const SCENARIOS: Scenario[] = [
       {
         text: 'Y Bruno ya no está, falleció la semana pasada',
         expectBackend: [/^archivePet\(Bruno v\d+ .*→ ARCHIVED/],
+      },
+    ],
+  },
+  {
+    id: 'cat-food-suggests-litter',
+    title:
+      'gato: alimento → sugiere arena una vez (T3: one server line after the add, none on the next add)',
+    customer: existing('03100'),
+    turns: [
+      'Hola, busco croquetas Whiskas para mi gato y también arena para gato',
+      {
+        text: 'Agrégueme una bolsa de las Whiskas al carrito, por favor',
+        expectReply: /Por si le sirve: \*Arena para Gato/,
+      },
+      // At most one suggestion per 24 h: this add carries no line.
+      'Agregue otra bolsa de Whiskas',
+    ],
+  },
+  {
+    id: 'store-location-hours',
+    title:
+      '«¿Dónde están y a qué hora abren?»: the backend branch, the store block and the pin (T2)',
+    customer: existing('03100'),
+    turns: [
+      {
+        text: 'Buenas tardes, ¿dónde están y a qué hora abren?',
+        expectBackend: [/^getBranch → with pin$/],
+        requireReply: /Insurgentes Sur 1000[\s\S]*\*Horario:\*/,
+      },
+    ],
+  },
+  {
+    id: 'store-location-no-pin',
+    title:
+      'Same question before staff set the coordinates: the store block, no pin (T2)',
+    customer: existing('03100'),
+    branch: 'without_location',
+    turns: [
+      {
+        text: '¿Dónde queda la tienda? ¿Abren el domingo?',
+        expectBackend: [/^getBranch → no pin$/],
+        requireReply: /Insurgentes Sur 1000/,
+      },
+    ],
+  },
+  {
+    id: 'store-location-with-catalog',
+    title:
+      '«¿Tienen arena para gato y dónde están?»: the catalog answer, then the store block (T2-fix J2)',
+    customer: existing('03100'),
+    turns: [
+      {
+        text: '¿Tienen arena para gato y dónde están?',
+        expectBackend: [/^getBranch → with pin$/],
+        requireReply: /Arena[\s\S]*Insurgentes Sur 1000/,
       },
     ],
   },

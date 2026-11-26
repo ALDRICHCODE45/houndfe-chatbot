@@ -2586,6 +2586,49 @@ describe('store pickup without delivery data (C1)', () => {
     expect(reply).toContain('*Folio:* B-0042');
     expect(reply).not.toContain('Recójalo');
   });
+
+  describe('T2 H4: the store pin on the order-created reply', () => {
+    const placeWith = async (pickupLocation: unknown) => {
+      const h = setup();
+      await h.seedCart();
+      await offerOrder(h);
+      h.api.createCheckout.mockResolvedValueOnce(pickupCreated(pickupLocation));
+      return yes(h);
+    };
+
+    it('a pickupLocation with coordinates attaches the pin; the text is byte-identical', async () => {
+      const pinned = await placeWith({
+        ...location,
+        location: { latitude: 19.4326, longitude: -99.1332 },
+      });
+      const today = await placeWith(location);
+      expect(pinned?.location).toEqual({
+        latitude: 19.4326,
+        longitude: -99.1332,
+        name: 'Sucursal Centro',
+        address:
+          'Av. Juárez 123, Centro, Cuauhtémoc, Ciudad de México, C.P. 06000',
+      });
+      expect(pinned?.reply).toBe(today?.reply);
+      expect(pinned?.interactive).toEqual(today?.interactive);
+    });
+
+    it.each([
+      ['missing (older replays)', location],
+      ['null (staff have not set it)', { ...location, location: null }],
+    ])('location %s → no pin', async (_name, pickupLocation) => {
+      const placed = await placeWith(pickupLocation);
+      expect(placed?.reply).toContain('Recójalo en *Sucursal Centro*');
+      expect(placed).not.toHaveProperty('location');
+    });
+
+    it('a response without pickupLocation never carries a pin', async () => {
+      const h = setup();
+      await h.seedCart();
+      await offerOrder(h);
+      expect(await yes(h)).not.toHaveProperty('location');
+    });
+  });
 });
 
 describe('checkout quote errors (C1)', () => {

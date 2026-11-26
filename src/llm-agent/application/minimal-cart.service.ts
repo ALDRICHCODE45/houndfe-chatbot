@@ -268,20 +268,25 @@ export class MinimalCartService {
     }
   }
 
-  /** Stored line identities without a backend read; `[]` when unreadable. */
+  /** Stored line identities (and units) without a backend read; `null` when
+   *  unreadable (T3-fix-2 G4: callers that compare units fail closed). */
   async storedLines(
     senderId: string,
-  ): Promise<Array<Pick<CartItem, 'productId' | 'variantId'>>> {
+  ): Promise<Array<
+    Pick<CartItem, 'productId' | 'variantId' | 'quantity'>
+  > | null> {
     try {
       const cart = this.read(
         (await this.store.get(senderId))?.data.minimalCart,
       );
-      return (cart?.items ?? []).map(({ productId, variantId }) => ({
+      if (cart === null) return null;
+      return cart.items.map(({ productId, variantId, quantity }) => ({
         productId,
         ...(variantId ? { variantId } : {}),
+        quantity,
       }));
     } catch {
-      return [];
+      return null;
     }
   }
 
