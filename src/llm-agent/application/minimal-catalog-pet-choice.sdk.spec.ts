@@ -738,8 +738,9 @@ describe('T6b a pet_choice row from an older build with the `legacy` ref', () =>
   /**
    * T2-fix J3: the which-pet question keeps the original request (its tap
    * re-runs it), so a store question asked after it in the same run is
-   * deferred to that re-run; a store block the run already promised rides
-   * on the question (text and text fallback), buttons unchanged.
+   * deferred to that re-run. T2-fix-2 K3: whatever the call order, the
+   * question goes out alone (buttons unchanged) and the store part is
+   * answered once, after the tap.
    */
   describe('T2-fix J3: which-pet question and the store block', () => {
     // The fake backend's branch (scripts/eval EvalFakeApi default).
@@ -765,7 +766,7 @@ describe('T6b a pet_choice row from an older build with the `legacy` ref', () =>
       expect(decision).not.toHaveProperty('location');
     });
 
-    it('getStoreInfo first → the question, then the store block (also in the text fallback) and the pin', async () => {
+    it('K3: getStoreInfo first → still deferred: the question alone (no block, no pin); the tap answers the store part once', async () => {
       const base = await world({ current: customer([pet({}), max()]) })
         .boot()
         .turn(TEXT, ask());
@@ -773,19 +774,18 @@ describe('T6b a pet_choice row from an older build with the `legacy` ref', () =>
       const decision = await h.turn(TEXT, [
         [call('getStoreInfo'), call('askWhichPet'), say('¿Para cuál?')],
       ]);
-      expect(decision.reply).toBe(`${base.reply}\n\n${STORE}`);
-      const interactive = decision.interactive as {
-        buttons: unknown;
-        prompt: string;
-        textFallback: string;
-      };
-      const baseInteractive = base.interactive as typeof interactive;
-      expect(interactive.buttons).toEqual(baseInteractive.buttons);
-      expect(interactive.prompt).toBe(baseInteractive.prompt);
-      expect(interactive.textFallback).toBe(
-        `${baseInteractive.textFallback}\n\n${STORE}`,
+      expect(decision.reply).toBe(base.reply);
+      expect(decision.interactive).toEqual(base.interactive);
+      expect(decision).not.toHaveProperty('location');
+      // The tap re-runs the original request: the store part comes now, once.
+      const tapped = await h.turn(
+        'Max (Labrador, adul…',
+        [[call('getStoreInfo'), say('Para Max, Nupec adulto.')]],
+        `pet_pick:backend:${MAX_ID}`,
       );
-      expect(decision.location).toEqual({
+      expect(tapped.reply.split(STORE)).toHaveLength(2);
+      expect(tapped.reply.endsWith(STORE)).toBe(true);
+      expect(tapped.location).toEqual({
         latitude: 19.3907,
         longitude: -99.1716,
         name: 'Tienda de mascotas HoundFe — Sucursal Centro',

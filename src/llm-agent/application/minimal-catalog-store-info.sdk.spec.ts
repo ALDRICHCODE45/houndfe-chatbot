@@ -3,8 +3,10 @@ import type { ConfigService } from '@nestjs/config';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import type { BranchInfo } from '../../chatbot-api/domain/dtos/branch.dto';
+import type { ChatbotApiClient } from '../../chatbot-api/domain/chatbot-api.client';
+import type { CatalogItemResponse } from '../../chatbot-api/domain/dtos/catalog.dto';
+import type { CartItemInput } from '../../chatbot-api/domain/dtos/pricing.dto';
 import { UpstreamError } from '../../chatbot-api/domain/errors';
-import { EvalFakeApi } from '../../../scripts/eval/fixtures/fake-api';
 import { InMemoryConversationStore } from '../../conversation/infrastructure/in-memory-conversation.store';
 import { MinimalCartSelections } from '../domain/minimal-cart-selections';
 import { InMemoryMinimalCatalogSessionStore } from '../infrastructure/in-memory-minimal-catalog-session.store';
@@ -71,6 +73,89 @@ const ref = (p: number): string => {
 // Catalog fixture id 9: arena de sílice.
 const SILICE = 9;
 
+/**
+ * T2-fix-2 K5: the spec's own catalog (no scripts/eval import): two cat
+ * litters, found by any query that names «arena».
+ */
+const LITTERS: ReadonlyArray<{
+  n: number;
+  name: string;
+  priceCents: number;
+  status: 'available' | 'low_stock';
+  quantity: number;
+}> = [
+  {
+    n: 8,
+    name: 'Arena para Gato Aglomerante Sin Aroma 10 kg',
+    priceCents: 21900,
+    status: 'available',
+    quantity: 20,
+  },
+  {
+    n: SILICE,
+    name: 'Arena para Gato de Sílice 3.8 L',
+    priceCents: 17900,
+    status: 'low_stock',
+    quantity: 2,
+  },
+];
+const litterItem = (litter: (typeof LITTERS)[number]): CatalogItemResponse => ({
+  productId: product(litter.n),
+  name: litter.name,
+  brand: "Pet's Choice",
+  imageUrl: `https://cdn.example.test/products/${product(litter.n)}.jpg`,
+  description: 'Arena para gato.',
+  price: {
+    priceCents: litter.priceCents,
+    fromPriceCents: null,
+    promoPriceCents: null,
+    promotionEvaluationStatus: 'needs_human_review',
+  },
+  stock: { status: litter.status, quantity: litter.quantity },
+  packageInfo: { weightGrams: null, dimensions: null },
+  variants: [],
+});
+const litterById = (productId: string) =>
+  LITTERS.find((litter) => product(litter.n) === productId);
+
+/** The fake backend: catalog, stock, pricing and the branch read. */
+function storeFakeApi(getBranch: () => Promise<BranchInfo>) {
+  return {
+    searchCatalog: (q: string) =>
+      Promise.resolve(/arena/i.test(q) ? LITTERS.map(litterItem) : []),
+    getStock: (productId: string) => {
+      const litter = litterById(productId);
+      if (litter === undefined) return Promise.reject(new Error('404'));
+      return Promise.resolve({
+        productId,
+        name: litter.name,
+        stock: { status: litter.status, quantity: litter.quantity },
+        variants: [],
+      });
+    },
+    evaluateCart: (items: CartItemInput[]) =>
+      Promise.resolve({
+        items: items.map((item) => {
+          const unit = litterById(item.productId)?.priceCents ?? 0;
+          return {
+            productId: item.productId,
+            variantId: item.variantId ?? null,
+            quantity: item.quantity,
+            unitPriceCents: unit,
+            originalPriceCents: unit * item.quantity,
+            finalPriceCents: unit * item.quantity,
+            appliedPromotionTitle: null,
+            discountAmountCents: 0,
+          };
+        }),
+        promotionEvaluationStatus: 'fully_evaluated' as const,
+        customerResolution: 'not_found' as const,
+      }),
+    getCustomerByPhone: () => Promise.resolve({ found: false, customer: null }),
+    getBranch,
+  } as Partial<ChatbotApiClient>;
+}
+
 const step = (content: unknown[], finish = 'tool-calls') => ({
   content,
   finishReason: { unified: finish, raw: undefined },
@@ -99,15 +184,14 @@ function world(
     team?: true;
   } = {},
 ) {
-  const api = new EvalFakeApi({ kind: 'new' });
   const getBranch = jest.fn(() =>
     options.branch instanceof Error
       ? Promise.reject(options.branch)
       : Promise.resolve(structuredClone(options.branch ?? BRANCH)),
   );
-  if (options.noBranchRead === true)
-    (api as Partial<EvalFakeApi>).getBranch = undefined;
-  else api.getBranch = getBranch;
+  const fake = storeFakeApi(getBranch);
+  if (options.noBranchRead === true) delete fake.getBranch;
+  const api = fake as ChatbotApiClient;
   const config = {
     get: (key: string) =>
       key === 'chatbotApi.cashierUserId'
@@ -390,6 +474,35 @@ describe('T2: store location and hours (getStoreInfo)', () => {
       expect(decision.reply).toBe(`${base.reply}\n\n${UNAVAILABLE}`);
     });
 
+    it('K2: «¿la arena 9 tiene existencias? ¿y dónde están?» with the backend down → the stock answer kept, then the fixed line', async () => {
+      const stockAnswer = 'Sí, la arena de sílice tiene existencias.';
+      const w = world({ branch: new UpstreamError('invalid', 502) });
+      const decision = await w.turn(
+        '¿La arena de sílice tiene existencias? ¿Y dónde están?',
+        [
+          [
+            search('arena sílice'),
+            call('checkStock', { productId: product(SILICE) }),
+            call('getStoreInfo'),
+            say(stockAnswer),
+          ],
+        ],
+      );
+      expect(w.storeOutputs()).toEqual([
+        { ok: false, error: 'store_info_unavailable' },
+      ]);
+      expect(decision.reply).toBe(`${stockAnswer}\n\n${UNAVAILABLE}`);
+      expect(w.lastRecorded()).toBe(decision.reply);
+    });
+
+    it('K1: the fragment says «paso a recoger» while choosing delivery or pickup chooses pickup (chooseStorePickup)', async () => {
+      const w = world();
+      await w.turn('Hola', [[say('Hola')]]);
+      expect(w.systems[0]).toContain(
+        'Si el cliente está eligiendo entre envío a domicilio y recoger en tienda, «paso a recoger» o «lo recojo» eligen recoger en tienda: llame chooseStorePickup, no getStoreInfo',
+      );
+    });
+
     it('J6: a failed read logs the upstream status and error code; an unconfigured branch logs its own line', async () => {
       const warn = jest
         .spyOn(Logger.prototype, 'warn')
@@ -436,17 +549,20 @@ describe('T2: store location and hours (getStoreInfo)', () => {
       expect(longName.charAt(pin.name!.length - 1)).toBe(' ');
     });
 
-    it('J7: [Recoger en tienda] continuing to an order reply with a pin forwards the pin', async () => {
-      const api = new EvalFakeApi({ kind: 'new' });
+    /** T2-fix J7 / T2-fix-2 K5: an agent on fakes whose order step returns a placed pickup order (its reply carries the store pin, T2 H4). */
+    const pickupOrderAgent = (
+      parts: {
+        cart?: Partial<MinimalCartService>;
+        sessions?: InMemoryMinimalCatalogSessionStore;
+      } = {},
+    ) => {
       const config = {
         get: (key: string) =>
           key === 'chatbotApi.cashierUserId'
             ? ''
             : { model: 'm', maxSteps: 8, historyTurns: 12 },
       } as unknown as ConfigService;
-      // The order recovered by the summary step is a placed pickup order
-      // (its reply carries the store pin, T2 H4).
-      const order = {
+      const placedPickupOrder = {
         enabled: true,
         offerStatus: () => null,
         dismiss: () => undefined,
@@ -459,25 +575,60 @@ describe('T2: store location and hours (getStoreInfo)', () => {
       } as unknown as MinimalShippingService;
       const cart = {
         fingerprint: () => Promise.resolve('ref1'),
+        ...parts.cart,
       } as unknown as MinimalCartService;
-      const agent = new MinimalCatalogAgentService(
-        api,
+      return new MinimalCatalogAgentService(
+        storeFakeApi(() => Promise.resolve(BRANCH)) as ChatbotApiClient,
         () => Promise.reject(new Error('no model')),
         new CostGuardService(100000),
         config,
-        new InMemoryMinimalCatalogSessionStore(),
+        parts.sessions ?? new InMemoryMinimalCatalogSessionStore(),
         undefined,
         undefined,
         cart,
         undefined,
-        order,
+        placedPickupOrder,
         shipping,
       );
-      const decision = await agent.tryHandle({
+    };
+
+    it('J7: [Recoger en tienda] continuing to an order reply with a pin forwards the pin', async () => {
+      const decision = await pickupOrderAgent().tryHandle({
         senderId: SENDER,
         text: 'Recoger en tienda',
         interactiveReplyId: 'fulfil_pickup:ref1',
       });
+      expect(decision.reply).toContain('*¡Pedido registrado!* ✅');
+      expect(decision.location).toEqual(PIN);
+    });
+
+    it('K5: a «sí» to the reorder offer continuing to a pickup order reply forwards its pin (answerReorder)', async () => {
+      const sessions = new InMemoryMinimalCatalogSessionStore();
+      sessions.write(SENDER, [
+        {
+          messages: [
+            { role: 'user', content: 'lo mismo de la vez pasada' },
+            { role: 'assistant', content: '¿Se lo agrego?' },
+          ],
+          verifiedProductIds: [],
+          reorderOffer: {
+            reference: 'r1',
+            items: [{ productId: product(SILICE), quantity: 1 }],
+          },
+        },
+      ]);
+      const addItems = jest.fn(() =>
+        Promise.resolve({ ok: true, items: [], totalCents: 0 }),
+      );
+      const decision = await pickupOrderAgent({
+        sessions,
+        // The checkout already chose pickup: the yes continues to the order.
+        cart: {
+          addItems,
+          shippingMode: () => Promise.resolve('pickup'),
+        } as unknown as Partial<MinimalCartService>,
+      }).tryHandle({ senderId: SENDER, text: 'sí' });
+      expect(addItems).toHaveBeenCalledTimes(1);
       expect(decision.reply).toContain('*¡Pedido registrado!* ✅');
       expect(decision.location).toEqual(PIN);
     });

@@ -65,6 +65,7 @@ type Decision = {
   reply: string;
   onSent?: () => void;
   interactive?: CustomerReplyInteractive;
+  location?: unknown;
 };
 const buttons = (decision: Decision) =>
   decision.interactive?.type === 'buttons' ? decision.interactive.buttons : [];
@@ -226,6 +227,32 @@ describe('S2 reorder: presenting the last order', () => {
       { id: 'reorder_change', title: '✏️ Cambiar algo' },
     ]);
     expect(await h.lines()).toEqual([]);
+  });
+
+  it('T2-fix-2 K5: getStoreInfo in the same run → the offer, then the store block; buttons kept; the text sent without the buttons carries it', async () => {
+    // The fake backend's branch (EvalFakeApi default), usted.
+    const store =
+      'Nos encuentra en *Tienda de mascotas HoundFe — Sucursal Centro*\n' +
+      'Av. Insurgentes Sur 1000, Del Valle, Benito Juárez, Ciudad de México, 03100\n' +
+      '*Horario:* Lunes a sábado: 09:00–19:00. Domingo: 10:00–14:00.';
+    const text = 'Quiero lo mismo de la vez pasada, ¿y dónde están?';
+    const base = await harness().turn(text, REORDER);
+    const decision = await harness().turn(text, [
+      call('getStoreInfo'),
+      call('getLastOrder'),
+      say('Aquí está su pedido.'),
+    ]);
+    expect(decision.reply).toBe(`${base.reply}\n\n${store}`);
+    expect(buttons(decision).map((button) => button.title)).toEqual(
+      buttons(base).map((button) => button.title),
+    );
+    expect(decision.interactive?.prompt).toBe(base.interactive?.prompt);
+    // A failed interactive send falls back to textFallback, else the reply.
+    const fallback = decision.interactive?.textFallback ?? decision.reply;
+    expect(fallback.endsWith(`\n\n${store}`)).toBe(true);
+    expect(decision.location).toEqual(
+      expect.objectContaining({ latitude: 19.3907, longitude: -99.1716 }),
+    );
   });
 
   it('says "Precio de hoy" without the change notice when no price changed', async () => {

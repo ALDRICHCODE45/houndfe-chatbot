@@ -140,7 +140,7 @@ async function setup(options: { branch?: true } = {}) {
       updatedAt: '2026-10-01T00:00:00.000Z',
     })),
   };
-  // T2-fix J4: the branch read (getStoreInfo) next to the checkout.
+  // T2-fix-2 K1: the branch read (getStoreInfo) next to the checkout.
   if (options.branch === true)
     Object.assign(api, {
       getBranch: jest.fn(async () => ({
@@ -363,47 +363,90 @@ describe('S2 (N17) store pickup dismisses a pending delivery-data confirmation',
 });
 
 /**
- * T2-fix J4: while a checkout step is pending (delivery-data summary, order
- * summary, the delivery-or-pickup question), «paso a recoger» is a pickup
- * choice: getStoreInfo and its instruction are not offered, so the pickup
- * is selected exactly as before and no store block or pin is added.
+ * T2-fix-2 K1 (replaces the T2-fix J4 gate): getStoreInfo and its
+ * instruction are offered on every turn again, a checkout step pending or
+ * not; the instruction says «paso a recoger» while choosing delivery or
+ * pickup chooses pickup (chooseStorePickup), so the pickup is selected
+ * exactly as before. A run calling both gets the pickup reply, then the
+ * store block.
  */
-describe('T2-fix J4: «paso a recoger» during checkout selects pickup', () => {
-  const pickupAfterDelivery = async (branch: boolean) => {
+describe('T2-fix-2 K1: getStoreInfo offered during checkout; «paso a recoger» selects pickup', () => {
+  // The branch fixture above: no address, hours «9 a 7», coordinates.
+  const STORE = 'Nos encuentra en *Sucursal Centro*\n*Horario:* 9 a 7';
+  const atFulfilmentQuestion = async (branch: boolean) => {
     const h = await setup(branch ? { branch: true } : {});
-    await h.presentDelivery();
-    const pickup = await h.send('paso a recoger', [
-      call('chooseStorePickup'),
-      say(),
-    ]);
-    return { h, pickup };
+    const asked = await h.send('quiero comprar');
+    expect(asked.interactive).toBeDefined();
+    return h;
   };
 
-  it('pending delivery-data summary: pickup selected as before, no store tool, block or pin', async () => {
+  it('pending delivery-data summary: tool offered; «paso a recoger» selects pickup byte-identical to base', async () => {
+    const pickupAfterDelivery = async (branch: boolean) => {
+      const h = await setup(branch ? { branch: true } : {});
+      await h.presentDelivery();
+      const pickup = await h.send('paso a recoger', [
+        call('chooseStorePickup'),
+        say(),
+      ]);
+      return { h, pickup };
+    };
     const before = await pickupAfterDelivery(false);
     const after = await pickupAfterDelivery(true);
     expect(after.h.lastTools()).toContain('chooseStorePickup');
-    expect(after.h.lastTools()).not.toContain('getStoreInfo');
+    expect(after.h.lastTools()).toContain('getStoreInfo');
     expect(after.pickup.reply).toBe(before.pickup.reply);
     expect(after.pickup.reply).toContain(
       '*Envío:* recoge en tienda — sin costo',
     );
-    expect(after.pickup.reply).not.toContain('Sucursal Centro');
     expect(after.pickup).not.toHaveProperty('location');
   });
 
-  it('pending order summary: no store tool', async () => {
-    const { h } = await pickupAfterDelivery(true);
+  it('pending pickup order summary: tool offered', async () => {
+    const h = await setup({ branch: true });
+    await h.presentDelivery();
+    await h.send('paso a recoger', [call('chooseStorePickup'), say()]);
     await h.send('¿dónde están?', [say()]);
-    expect(h.lastTools()).not.toContain('getStoreInfo');
+    expect(h.lastTools()).toContain('getStoreInfo');
   });
 
-  it('after the delivery-or-pickup question: no store tool', async () => {
+  it('abandoned draft (delivery data stored, nothing pending): tool offered', async () => {
     const h = await setup({ branch: true });
-    const asked = await h.send('quiero comprar');
-    expect(asked.interactive).toBeDefined();
-    await h.send('paso a recoger', [call('chooseStorePickup'), say()]);
-    expect(h.lastTools()).not.toContain('getStoreInfo');
+    await h.presentDelivery();
+    h.checkout.dismissPendingConfirmation(SENDER);
+    await expect(h.checkout.hasDraft(SENDER)).resolves.toBe(true);
+    await h.send('hola', [say()]);
+    expect(h.lastTools()).toContain('getStoreInfo');
+  });
+
+  it('at the delivery-or-pickup question: tool offered; «paso a recoger» selects pickup byte-identical to base', async () => {
+    const before = await atFulfilmentQuestion(false);
+    const after = await atFulfilmentQuestion(true);
+    const steps = () => [call('chooseStorePickup'), say()];
+    const base = await before.send('paso a recoger', steps());
+    const pickup = await after.send('paso a recoger', steps());
+    expect(after.lastTools()).toContain('getStoreInfo');
+    expect(pickup.reply).toBe(base.reply);
+    expect(pickup.reply).toContain('*Envío:* recoge en tienda — sin costo');
+    expect(pickup).not.toHaveProperty('location');
+  });
+
+  it('a run calling chooseStorePickup and getStoreInfo → the pickup reply, then the store block and the pin', async () => {
+    const before = await atFulfilmentQuestion(false);
+    const after = await atFulfilmentQuestion(true);
+    const text = 'paso a recoger, ¿a qué hora abren?';
+    const base = await before.send(text, [call('chooseStorePickup'), say()]);
+    const pickup = await after.send(text, [
+      call('chooseStorePickup'),
+      call('getStoreInfo'),
+      say(),
+    ]);
+    expect(base.reply).toContain('*Envío:* recoge en tienda — sin costo');
+    expect(pickup.reply).toBe(`${base.reply}\n\n${STORE}`);
+    expect(pickup.location).toEqual({
+      latitude: 19.4,
+      longitude: -99.1,
+      name: 'Sucursal Centro',
+    });
   });
 
   it('nothing pending: the store tool is offered', async () => {

@@ -86,7 +86,12 @@ export function itemDetail(text: string): string {
   return `${ITEM_DETAIL_INDENT}${text}`;
 }
 
-/** T3-fix E8: `text` within `max` characters, cut between words with «…». */
+/**
+ * T3-fix E8: `text` unchanged when it has at most `max` characters; else
+ * cut between words to at most `max` characters, plus «…» (so at most
+ * `max + 1` characters in all). A caller with a hard cap that includes the
+ * ellipsis passes `cap - 1` (see `capLabel`).
+ */
 export function truncateOnWord(text: string, max: number): string {
   const chars = Array.from(text);
   if (chars.length <= max) return text;
@@ -104,7 +109,8 @@ export function truncateOnWord(text: string, max: number): string {
 export const STORE_PIN_NAME_MAX_CHARS = 100;
 export const STORE_PIN_ADDRESS_MAX_CHARS = 250;
 
-/** T2-fix J8: `text` in at most `max` characters, the «…» included. */
+/** T2-fix J8: `text` in at most `max` characters, the «…» included
+ * (`truncateOnWord` adds it after its `max - 1`). */
 const capLabel = (text: string, max: number): string =>
   Array.from(text).length <= max ? text : truncateOnWord(text, max - 1);
 
