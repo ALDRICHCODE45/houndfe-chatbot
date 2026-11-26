@@ -206,13 +206,13 @@ describe('eval scenario expectations (T7 live eval)', () => {
     },
   );
 
-  it('pets-which-pet: the «(para Max)» check is on the «sí, agrégala» turn, after the add question', () => {
+  it('pets-which-pet: the «(para Max)» check is on the «sí, por favor» turn (register-neutral: «agrégala» is a tú imperative and switches the bot to tú), after the add question', () => {
     const turns = scenario('pets-which-pet');
     expect(turns.map((turn) => turn.text)).toEqual([
       'Hola, busco croquetas para mi perro',
       'para Max',
       'Quiero una bolsa de las croquetas de salmón y camote de 18 kg',
-      'sí, agrégala',
+      'sí, por favor',
     ]);
     expect(turns[2].requireReply).toBeUndefined();
     expect(String(turns[3].requireReply)).toBe(String(/\(para Max\)/));

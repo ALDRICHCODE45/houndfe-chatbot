@@ -366,7 +366,7 @@ export const SCENARIOS: Scenario[] = [
       // before adding; the cart line is checked after the customer agrees.
       'Quiero una bolsa de las croquetas de salmón y camote de 18 kg',
       {
-        text: 'sí, agrégala',
+        text: 'sí, por favor',
         requireReply: /\(para Max\)/,
       },
     ],
