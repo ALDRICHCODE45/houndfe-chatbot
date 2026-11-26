@@ -1048,13 +1048,17 @@ export class WebhookDispatcherService {
       );
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => resolve('timeout'), REPLY_LOCATION_TIMEOUT_MS);
+      timer = setTimeout(() => {
+        // Set here, not after the race: a send resolving in the microtask
+        // window right after the timer still logs as late.
+        timedOut = true;
+        resolve('timeout');
+      }, REPLY_LOCATION_TIMEOUT_MS);
       timer.unref?.();
     });
     const outcome = await Promise.race([sent, timeout]);
     clearTimeout(timer);
-    timedOut = outcome === 'timeout';
-    if (timedOut)
+    if (outcome === 'timeout')
       this.logger.warn(
         `reply location timed out after ${REPLY_LOCATION_TIMEOUT_MS} ms for ${maskConversationRef(to)}; the text was sent`,
       );

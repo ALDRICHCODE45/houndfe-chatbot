@@ -55,18 +55,24 @@ export interface OutboundDocument extends OutboundOriginOption {
 }
 
 /**
+ * T2-fix J1: how long the dispatcher waits for the optional store pin after
+ * the text was sent and the message marked seen.
+ */
+export const REPLY_LOCATION_TIMEOUT_MS = 5_000;
+
+/**
+ * T2-fix-2 K4: the pin HTTP request's own timeout in the Meta sender, so a
+ * hung request ends. Longer than REPLY_LOCATION_TIMEOUT_MS on purpose: a pin
+ * Meta accepts after the dispatcher stopped waiting still resolves, its id is
+ * remembered and the late send is logged (review R3/R4 of review-cad2b687).
+ */
+export const REPLY_LOCATION_REQUEST_TIMEOUT_MS = 15_000;
+
+/**
  * T2 H3: native location message (Graph API `type: 'location'`), the store
  * pin. Latitude in [-90, 90], longitude in [-180, 180]; `name` and `address`
  * are optional labels shown on the pin.
  */
-/**
- * T2-fix J1 / T2-fix-2 K4: the longest wait for the optional store pin: the
- * dispatcher's bound after the text was sent and the message marked seen,
- * and the pin HTTP request's own timeout in the Meta sender (so a hung
- * request ends instead of landing after the next reply).
- */
-export const REPLY_LOCATION_TIMEOUT_MS = 5_000;
-
 export interface OutboundLocation extends OutboundOriginOption {
   to: string;
   latitude: number;

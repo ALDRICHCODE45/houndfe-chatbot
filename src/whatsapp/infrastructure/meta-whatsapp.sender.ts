@@ -26,7 +26,7 @@ import {
   OutboundOrigin,
   OutboundTemplate,
   OutboundText,
-  REPLY_LOCATION_TIMEOUT_MS,
+  REPLY_LOCATION_REQUEST_TIMEOUT_MS,
   SendResult,
   UnsupportedOutboundError,
   WhatsappSenderPort,
@@ -171,7 +171,7 @@ export class MetaWhatsappSender implements WhatsappSenderPort {
         },
       },
       // T2-fix-2 K4: a hung pin request ends (the dispatcher's same bound).
-      { origin: message.origin, timeoutMs: REPLY_LOCATION_TIMEOUT_MS },
+      { origin: message.origin, timeoutMs: REPLY_LOCATION_REQUEST_TIMEOUT_MS },
     );
   }
 
