@@ -65,6 +65,37 @@ describe('CustomerProfileService', () => {
     await expect(service.forget(SENDER)).resolves.toBe(false);
   });
 
+  it('T3-fix E1: pauseSuggestions persists the pause; suggestionsPaused reads it across a restart', async () => {
+    const store = new InMemoryCustomerProfileStore();
+    const service = new CustomerProfileService(store, clock);
+    await service.load(SENDER);
+    const until = NOW.getTime() + 30 * 24 * 60 * 60_000;
+    expect(service.suggestionsPaused(SENDER)).toBe(false);
+    await service.pauseSuggestions(SENDER, until);
+    expect(service.suggestionsPaused(SENDER)).toBe(true);
+    await expect(store.read(SENDER)).resolves.toMatchObject({
+      suggestionsPausedUntil: new Date(until).toISOString(),
+    });
+    const restarted = new CustomerProfileService(store, clock);
+    await restarted.load(SENDER);
+    expect(restarted.suggestionsPaused(SENDER)).toBe(true);
+    expect(restarted.suggestionsPaused(SENDER, until - 1)).toBe(true);
+    expect(restarted.suggestionsPaused(SENDER, until)).toBe(false);
+  });
+
+  it('T3-fix E2: a failed pause write still pauses in this process and never throws', async () => {
+    const store = new InMemoryCustomerProfileStore();
+    jest.spyOn(store, 'upsert').mockRejectedValue(new Error('db down'));
+    const service = new CustomerProfileService(store, clock);
+    await service.load(SENDER);
+    const until = NOW.getTime() + 24 * 60 * 60_000;
+    const pending = service.pauseSuggestions(SENDER, until);
+    // In-process pause BEFORE the durable write settles.
+    expect(service.suggestionsPaused(SENDER)).toBe(true);
+    await expect(pending).resolves.toBeUndefined();
+    expect(service.suggestionsPaused(SENDER)).toBe(true);
+  });
+
   it('styleFor reads the stored style, null when there is no profile', async () => {
     const store = new InMemoryCustomerProfileStore();
     const service = new CustomerProfileService(store, clock);

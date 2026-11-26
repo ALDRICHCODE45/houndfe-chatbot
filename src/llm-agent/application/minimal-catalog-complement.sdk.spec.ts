@@ -62,10 +62,10 @@ const call = (toolName: string, input: unknown = {}) =>
 const say = (text = 'Texto del modelo con su propia oferta.') =>
   step([{ type: 'text', text }], 'stop');
 const search = (q: string) => call('searchCatalog', { q });
-const add = (p: number, text = 'una') =>
+const add = (p: number, text = 'una', quantity = 1) =>
   call('setCartItem', {
     selectionRef: ref(p),
-    quantity: 1,
+    quantity,
     quantityText: text,
     continuation: false,
   });
@@ -73,13 +73,19 @@ const suggest = (p: number | string) =>
   call('suggestComplement', {
     productId: typeof p === 'number' ? product(p) : p,
   });
-/** Add Whiskas, then suggest `p` (both read by searchCatalog first). */
-const addAndSuggest = (p: number | string = SILICE) => [
+/** Set Whiskas to `quantity` units, then suggest `p` (all read by
+ *  searchCatalog first). T3-fix E6: only a set that raises the units is an
+ *  add, so a later turn passes a higher quantity. */
+const addAndSuggest = (
+  p: number | string = SILICE,
+  quantity = 1,
+  text = 'una',
+) => [
   [
     search('whiskas'),
     search('arena sílice'),
     search('dog chow cachorro'),
-    add(WHISKAS),
+    add(WHISKAS, text, quantity),
     suggest(p),
     say(),
   ],
@@ -88,15 +94,28 @@ const addAndSuggest = (p: number | string = SILICE) => [
 type ToolOutput = { toolName: string; output: unknown };
 
 function world(
-  options: { profiles?: false; unpaidOrder?: true; pendingSummary?: true } = {},
+  options: {
+    profiles?: false;
+    unpaidOrder?: true;
+    pendingSummary?: true;
+    /** E2: every profile write fails (reads still work). */
+    failingWrites?: true;
+    /** E7: patch the fake backend (prices, stock reads). */
+    patchApi?: (api: EvalFakeApi) => void;
+  } = {},
 ) {
   const profileStore = new InMemoryCustomerProfileStore();
+  if (options.failingWrites === true)
+    jest
+      .spyOn(profileStore, 'upsert')
+      .mockRejectedValue(new Error('profile db down'));
   const conversations = new InMemoryConversationStore();
   const clock = { now: new Date('2026-11-26T12:00:00.000Z') };
   const outputs: ToolOutput[] = [];
   const systems: string[] = [];
   const boot = () => {
     const api = new EvalFakeApi({ kind: 'new' });
+    options.patchApi?.(api);
     const config = {
       get: (key: string) =>
         key === 'chatbotApi.cashierUserId'
@@ -162,7 +181,9 @@ function world(
     outputs
       .filter((o) => o.toolName === 'suggestComplement')
       .map((o) => o.output);
-  return { boot, clock, suggestOutputs, systems };
+  const toolOutputs = (name: string) =>
+    outputs.filter((o) => o.toolName === name).map((o) => o.output);
+  return { boot, clock, suggestOutputs, toolOutputs, systems, profileStore };
 }
 
 describe('T3: complementary suggestion after a cart add (S4-S6)', () => {
@@ -214,14 +235,22 @@ describe('T3: complementary suggestion after a cart add (S4-S6)', () => {
     const w = world();
     const h = w.boot();
     await h.turn('quiero una whiskas y arena', addAndSuggest());
-    const second = await h.turn('quiero una whiskas', addAndSuggest());
+    const second = await h.turn(
+      'mejor que sean dos whiskas',
+      addAndSuggest(SILICE, 2, 'dos'),
+    );
     expect(second.reply).not.toContain('Por si le sirve');
     const restarted = await w
       .boot()
-      .turn('quiero una whiskas', addAndSuggest());
+      .turn('mejor que sean tres whiskas', addAndSuggest(SILICE, 3, 'tres'));
     expect(restarted.reply).not.toContain('Por si le sirve');
     w.clock.now = new Date('2026-11-27T12:00:01.000Z');
-    const later = await w.boot().turn('quiero una whiskas', addAndSuggest());
+    const later = await w
+      .boot()
+      .turn(
+        'mejor que sean cuatro whiskas',
+        addAndSuggest(SILICE, 4, 'cuatro'),
+      );
     expect(later.reply).toContain(LINE_USTED);
   });
 
@@ -290,5 +319,304 @@ describe('T3: complementary suggestion after a cart add (S4-S6)', () => {
       true,
     );
     expect(withFeature.interactive).toEqual(without.interactive);
+  });
+  describe('T3-fix (S5-S7)', () => {
+    const DAY = 24 * 60 * 60_000;
+    const T0 = Date.parse('2026-11-26T12:00:00.000Z');
+    const decline = () => call('declineSuggestions', {});
+    const LITTER = 8; // Arena aglomerante: two presentations.
+
+    it('E1/S7: a decline after a shown suggestion pauses 30 days; the model reply stands', async () => {
+      const w = world();
+      const h = w.boot();
+      await h.turn('quiero una whiskas y arena', addAndSuggest());
+      const declined = await h.turn('no gracias, no me ofrezca nada más', [
+        [decline(), say('Claro, con gusto.')],
+      ]);
+      expect(declined.reply).toBe('Claro, con gusto.');
+      expect(w.toolOutputs('declineSuggestions')).toEqual([{ ok: true }]);
+      // Offered after the shown suggestion, while suggestComplement is not.
+      expect(w.systems[1]).toContain('Herramienta declineSuggestions');
+      expect(w.systems[1]).not.toContain('Herramienta suggestComplement');
+      await expect(w.profileStore.read(SENDER)).resolves.toMatchObject({
+        suggestionsPausedUntil: new Date(
+          w.clock.now.getTime() + 30 * DAY,
+        ).toISOString(),
+      });
+      w.clock.now = new Date(w.clock.now.getTime() + 2 * DAY);
+      const later = await w
+        .boot()
+        .turn('mejor que sean dos whiskas', addAndSuggest(SILICE, 2, 'dos'));
+      expect(later.reply).not.toContain('Por si le sirve');
+      expect(w.suggestOutputs()).toHaveLength(1);
+      w.clock.now = new Date(Date.parse('2026-11-26T12:00:00.000Z') + 30 * DAY);
+      const after = await w
+        .boot()
+        .turn('mejor que sean tres whiskas', addAndSuggest(SILICE, 3, 'tres'));
+      expect(after.reply).toContain(LINE_USTED);
+    });
+
+    it('E1: declineSuggestions only with a suggestion context, once per turn', async () => {
+      const none = world({ unpaidOrder: true });
+      await none.boot().turn('no me ofrezca nada', [[say('Claro.')]]);
+      expect(none.systems[0]).not.toContain('Herramienta declineSuggestions');
+      const w = world();
+      await w
+        .boot()
+        .turn('no me ofrezca otros productos', [
+          [decline(), decline(), say('Claro.')],
+        ]);
+      expect(w.systems[0]).toContain('Herramienta declineSuggestions');
+      expect(w.toolOutputs('declineSuggestions')).toEqual([
+        { ok: true },
+        { ok: false, error: 'already_declined' },
+      ]);
+    });
+
+    it('E1: a decline in the add turn → no line', async () => {
+      const w = world();
+      const decision = await w
+        .boot()
+        .turn('quiero una whiskas, y no me ofrezca nada más', [
+          [
+            search('whiskas'),
+            search('arena sílice'),
+            add(WHISKAS),
+            decline(),
+            suggest(SILICE),
+            say(),
+          ],
+        ]);
+      expect(decision.reply).not.toContain('Por si le sirve');
+      expect(w.suggestOutputs()).toEqual([{ ok: false, error: 'declined' }]);
+    });
+
+    it('E2: a failing profile store never drops the reply nor repeats the suggestion in-process', async () => {
+      const w = world({ failingWrites: true });
+      const h = w.boot();
+      const first = await h.turn('quiero una whiskas y arena', addAndSuggest());
+      expect(first.reply).toContain(LINE_USTED);
+      expect(first.interactive?.type).toBe('buttons');
+      const second = await h.turn('quiero una whiskas', addAndSuggest());
+      expect(second.reply).not.toContain('Por si le sirve');
+      expect(w.suggestOutputs()).toHaveLength(1);
+    });
+
+    it.each([
+      [
+        'an earlier day',
+        25 * 60 * 60_000,
+        { ok: false, error: 'stale_product' },
+      ],
+      ['the same day', 23 * 60 * 60_000, expect.objectContaining({ ok: true })],
+    ])(
+      'E3/E7: a product whose price was read %s',
+      async (_case, elapsed, expected) => {
+        const now = jest.spyOn(Date, 'now').mockReturnValue(T0);
+        const w = world();
+        const h = w.boot();
+        await h.turn('quiero una whiskas y busco arena', [
+          [search('whiskas'), search('arena sílice'), add(WHISKAS), say()],
+        ]);
+        now.mockReturnValue(T0 + elapsed);
+        w.clock.now = new Date(T0 + elapsed);
+        await h.turn('mejor que sean dos whiskas', [
+          [add(WHISKAS, 'dos', 2), suggest(SILICE), say()],
+        ]);
+        expect(w.suggestOutputs()).toEqual([expected]);
+      },
+    );
+
+    it('E4: a product the same turn added after the suggestion → no line, no pause', async () => {
+      const w = world();
+      const decision = await w
+        .boot()
+        .turn('quiero una whiskas y una arena', [
+          [
+            search('whiskas'),
+            search('arena sílice'),
+            add(WHISKAS),
+            suggest(SILICE),
+            add(SILICE),
+            say(),
+          ],
+        ]);
+      expect(w.suggestOutputs()).toEqual([
+        expect.objectContaining({ ok: true }),
+      ]);
+      expect(decision.reply).not.toContain('Por si le sirve');
+      const stored = await w.profileStore.read(SENDER);
+      expect(stored?.suggestionsPausedUntil).toBeUndefined();
+    });
+
+    it('E5: two parallel calls → one ok, the other already_suggested', async () => {
+      const w = world();
+      await w.boot().turn('quiero una whiskas y arena', [
+        [
+          search('whiskas'),
+          search('arena sílice'),
+          add(WHISKAS),
+          step([
+            {
+              type: 'tool-call',
+              toolCallId: 'p1',
+              toolName: 'suggestComplement',
+              input: JSON.stringify({ productId: product(SILICE) }),
+            },
+            {
+              type: 'tool-call',
+              toolCallId: 'p2',
+              toolName: 'suggestComplement',
+              input: JSON.stringify({ productId: product(SILICE) }),
+            },
+          ]),
+          say(),
+        ],
+      ]);
+      const outputs = w.suggestOutputs();
+      expect(outputs).toHaveLength(2);
+      expect(outputs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ ok: true }),
+          { ok: false, error: 'already_suggested' },
+        ]),
+      );
+    });
+
+    it('E6: a set that keeps the quantity is not an add', async () => {
+      const w = world({ pendingSummary: undefined });
+      const h = w.boot();
+      await h.turn('quiero una whiskas', [
+        [search('whiskas'), search('arena sílice'), add(WHISKAS), say()],
+      ]);
+      await h.turn('mejor déjela en una whiskas', [
+        [add(WHISKAS), suggest(SILICE), say()],
+      ]);
+      expect(w.suggestOutputs()).toEqual([{ ok: false, error: 'no_cart_add' }]);
+    });
+
+    it.each([
+      [
+        'unknown_price',
+        SILICE,
+        undefined,
+        (api: EvalFakeApi) => {
+          const original = api.searchCatalog.bind(api);
+          api.searchCatalog = async (q, limit) =>
+            (await original(q, limit)).map((item) =>
+              item.productId === product(SILICE)
+                ? { ...item, price: { ...item.price, priceCents: null } }
+                : item,
+            );
+        },
+      ],
+      [
+        'unverified',
+        SILICE,
+        undefined,
+        (api: EvalFakeApi) => {
+          const original = api.getStock.bind(api);
+          api.getStock = (id) =>
+            id === product(SILICE)
+              ? Promise.reject(new Error('backend down'))
+              : original(id);
+        },
+      ],
+      ['variant_required', LITTER, undefined, undefined],
+      [
+        'unknown_product',
+        LITTER,
+        'b0000000-0000-4000-8000-000000000899',
+        undefined,
+      ],
+    ])(
+      'E7: %s → no line and no pause',
+      async (code, suggested, variantId, patchApi) => {
+        const w = world(patchApi === undefined ? {} : { patchApi });
+        const decision = await w.boot().turn('quiero una whiskas y arena', [
+          [
+            search('whiskas'),
+            search('arena'),
+            add(WHISKAS),
+            call('suggestComplement', {
+              productId: product(suggested),
+              ...(variantId === undefined ? {} : { variantId }),
+            }),
+            say(),
+          ],
+        ]);
+        expect(decision.reply).not.toContain('Por si le sirve');
+        expect(w.suggestOutputs()).toEqual([{ ok: false, error: code }]);
+        const stored = await w.profileStore.read(SENDER);
+        expect(stored?.suggestionsPausedUntil).toBeUndefined();
+      },
+    );
+
+    it('E7: a second call after an ok → already_suggested, one line', async () => {
+      const w = world();
+      const decision = await w
+        .boot()
+        .turn('quiero una whiskas y arena', [
+          [
+            search('whiskas'),
+            search('arena sílice'),
+            add(WHISKAS),
+            suggest(SILICE),
+            suggest(SILICE),
+            say(),
+          ],
+        ]);
+      expect(w.suggestOutputs()).toEqual([
+        expect.objectContaining({ ok: true }),
+        { ok: false, error: 'already_suggested' },
+      ]);
+      expect(decision.reply.split('Por si le sirve')).toHaveLength(2);
+    });
+
+    it('E7: an ok suggestion with a non-inviting cart reply → no line, no pause', async () => {
+      const w = world();
+      const decision = await w
+        .boot()
+        .turn('quiero una whiskas y un dog chow', [
+          [
+            search('whiskas'),
+            search('arena sílice'),
+            search('dog chow cachorro'),
+            add(WHISKAS),
+            suggest(SILICE),
+            add(DOG_CHOW, 'un'),
+            say(),
+          ],
+        ]);
+      expect(w.suggestOutputs()).toEqual([
+        expect.objectContaining({ ok: true }),
+      ]);
+      expect(decision.reply).not.toContain('Por si le sirve');
+      expect(decision.reply.endsWith(MINIMAL_CART_NEXT_STEP_QUESTION)).toBe(
+        false,
+      );
+      const stored = await w.profileStore.read(SENDER);
+      expect(stored?.suggestionsPausedUntil).toBeUndefined();
+    });
+
+    it('E8: a long name is cut on a word boundary with «…»', async () => {
+      const long =
+        'Arena para Gato de Sílice Premium Control de Olores Extra Fuerte Larga Duración 3.8 L';
+      const w = world({
+        patchApi: (api) => {
+          const original = api.getStock.bind(api);
+          api.getStock = async (id) => {
+            const stock = await original(id);
+            return id === product(SILICE) ? { ...stock, name: long } : stock;
+          };
+        },
+      });
+      const decision = await w
+        .boot()
+        .turn('quiero una whiskas y arena', addAndSuggest());
+      expect(decision.reply).toContain(
+        'Por si le sirve: *Arena para Gato de Sílice Premium Control de Olores Extra Fuerte Larga Duración…* ($179.00)',
+      );
+    });
   });
 });

@@ -102,6 +102,25 @@ export const REQUIRED_MIGRATIONS = [
   '4400000000000_backend_outbox_lanes.js',
   // Feed ledger retention index and the LOCAL_FAILURE (poison item) decision.
   '4500000000000_human_request_feed_retention.js',
+  // Every later migration too: the running bot reads all of them, and the
+  // list is meant to be complete (the spec pins it to the files on disk).
+  '4600000000000_human_request_feed_overdue_decisions.js',
+  '4700000000000_human_request_feed_request_closed_decision.js',
+  '4800000000000_mirror_media_cache.js',
+  '4900000000000_human_request_feed_live_conversation.js',
+  '5000000000000_human_request_feed_scheduling.js',
+  '5100000000000_llm_cost_guard.js',
+  '5200000000000_human_request_feed_pay_in_store.js',
+  '5300000000000_human_request_feed_pay_in_store_templates.js',
+  '5400000000000_conversation_gate_payment_offer.js',
+  '5500000000000_conversation_gate_backorder_offer.js',
+  '5600000000000_feed_backorder_outcomes.js',
+  // Customer pets (T4b), the pet-choice gate, the legacy pet drop (T6d) and
+  // the suggestions pause (T3-fix).
+  '5700000000000_customer_profile_pets.js',
+  '5800000000000_conversation_gate_pet_choice.js',
+  '5900000000000_customer_profile_drop_legacy_pet.js',
+  '5950000000000_customer_profile_last_suggestion.js',
 ] as const;
 
 export const CLIENT_ROUTES: readonly (readonly [string, string, string])[] = [

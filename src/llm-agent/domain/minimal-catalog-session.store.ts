@@ -59,6 +59,14 @@ export type MinimalCatalogTurn = {
   productImages?: ProductImageContext;
   interactiveChoice?: InteractiveChoiceContext;
   catalogPrices?: Record<string, number>;
+  /**
+   * T3-fix E3: when each `catalogPrices` entry was read (epoch ms, same
+   * keys); carried forward with the prices. A complementary suggestion
+   * needs a price read within 24 h.
+   */
+  catalogPricesAt?: Record<string, number>;
+  /** T3-fix E1: THIS turn showed a complementary suggestion (never inherited). */
+  complementShown?: true;
   reorderOffer?: ReorderOfferContext;
   /** The payment offer THIS turn made (never inherited, like `reorderOffer`). */
   paymentOffer?: { saleId: string };

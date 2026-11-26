@@ -137,9 +137,27 @@ The button ids are `cart_continue:<ref>` and `cart_add:<ref>`, where `<ref>` is 
 | `Agregar algo más`, cart unchanged | `Claro, ¿qué producto desea agregar?` (tú: `…quieres agregar?`), without a model call and without touching the cart. |
 | Either button, cart changed since it was sent | `Ese botón ya no está vigente.` followed by the current cart and fresh buttons; nothing starts. |
 
-### Complementary suggestion (T3)
+### Complementary suggestion (T3, T3-fix)
 
-In a model turn that added a product, the model may call `suggestComplement({productId, variantId?})` once with a product it read by `searchCatalog` in this chat. The application refuses (`no_cart_add`, `unknown_product`, `same_product`, `in_cart`, `unknown_price`, `variant_required`, `out_of_stock`, `unverified`) or appends ONE server-owned line right before the next-step question: `Por si le sirve: *{nombre}* ({precio}) suele ir bien con lo que eligió.` (tú: `Por si te sirve: … con lo que elegiste.`; `💡 ` first only for a customer who uses emojis). The model's own text never carries it. The tool is offered only with a loaded customer profile, no suggestion to this sender in the last 24 h (`customer_profiles.last_suggestion_at`, migration 5950, survives restarts) and no order summary, checkout confirmation or payment step pending; the prompt forbids it after the customer declined a suggestion or asked for none in this chat. Every other turn's reply is unchanged.
+In a model turn that added a product (an add, or a set that raises the line's units), the model may call `suggestComplement({productId, variantId?})` once with a product it read by `searchCatalog` in this chat whose price was read within the last 24 h. The application refuses with one of these codes, or appends ONE server-owned line right before the next-step question: `Por si le sirve: *{nombre}* ({precio}) suele ir bien con lo que eligió.` (tú: `Por si te sirve: … con lo que elegiste.`; `💡 ` first only for a customer who uses emojis; a name over 80 characters is cut between words with `…`). The model's own text never carries it.
+
+| Code | Meaning |
+| --- | --- |
+| `already_suggested` | This run already has (or is checking) its one suggestion; also a second parallel call. |
+| `declined` | The customer declined suggestions in this run (`declineSuggestions`). |
+| `no_cart_add` | No add in this run (a set that lowers or keeps the quantity is not an add). |
+| `unknown_product` | Not read in this chat, or a `variantId` the product does not have. |
+| `same_product` | The product this run added. |
+| `in_cart` | Already in the cart. |
+| `stale_product` | Its price was read more than 24 h ago (an earlier day's read). |
+| `unverified` | The live stock read failed, disagreed or is unknown. |
+| `variant_required` | The product has presentations and none was given. |
+| `out_of_stock` | Agotado. |
+| `unknown_price` | No catalog price read for that product/presentation. |
+
+At reply time the line is dropped (and nothing is recorded) when the cart reply does not end with the next-step question, or the run put the suggested product in the cart after the check. A shown line pauses suggestions for this sender 24 h; `declineSuggestions({})` — which the model calls when the customer rejects a suggestion or asks for none — pauses them 30 days (S7) and has no customer copy of its own (the model answers normally). Both write `customer_profiles.suggestions_paused_until` (migration 5950, survives restarts; latest write wins); the pause is set in-process before the durable write, so a profile-store outage never repeats a suggestion in that process nor drops the reply. `suggestComplement` is offered only with a loaded customer profile, no active pause and no order summary, checkout confirmation or payment step pending; `declineSuggestions` is offered whenever `suggestComplement` is, and for the two turns after a shown suggestion. Every other turn's reply is unchanged.
+
+Deploy migration 5950 before this bot; roll back the bot first, then 5950 down.
 
 ### Bounded context
 

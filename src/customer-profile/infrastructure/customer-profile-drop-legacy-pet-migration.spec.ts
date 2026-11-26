@@ -152,9 +152,11 @@ ddescribe('customer_profiles.pet drop migration 5900 (real PostgreSQL)', () => {
       new Date('2026-11-25T12:00:00.000Z'),
     );
     await rollbackFrom5900();
-    // The rollback also undid 5950 (T3); this store reads its column.
+    // Hand-emulated 5950 (T3-fix E8): the rollback also undid 5950, whose
+    // column this current store selects, so the test re-adds exactly what
+    // 5950 up adds (and drops it again before the next `migrate('up')`).
     await pool.query(
-      'ALTER TABLE customer_profiles ADD COLUMN last_suggestion_at timestamptz',
+      'ALTER TABLE customer_profiles ADD COLUMN suggestions_paused_until timestamptz',
     );
     await expect(petColumn()).resolves.toEqual([
       { column_name: 'pet', data_type: 'jsonb', is_nullable: 'YES' },
@@ -208,8 +210,9 @@ ddescribe('customer_profiles.pet drop migration 5900 (real PostgreSQL)', () => {
     );
     expect(applied.rowCount).toBe(0);
     await pool.query('UPDATE customer_profiles SET pet = NULL');
+    // Undo the hand-emulated 5950 column so `migrate('up')` re-runs 5950.
     await pool.query(
-      'ALTER TABLE customer_profiles DROP COLUMN last_suggestion_at',
+      'ALTER TABLE customer_profiles DROP COLUMN suggestions_paused_until',
     );
     migrate('up');
     await expect(petColumn()).resolves.toEqual([]);

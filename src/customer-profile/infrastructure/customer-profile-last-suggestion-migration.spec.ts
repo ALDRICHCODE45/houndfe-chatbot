@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Pool } from 'pg';
 import {
@@ -32,22 +33,31 @@ function run(direction: 'up' | 'down') {
 
 const TIMEOUT = ['sql', "SET LOCAL lock_timeout = '5s';"];
 
-describe('customer_profiles.last_suggestion_at migration (5950, T3)', () => {
+describe('customer_profiles.suggestions_paused_until migration (5950, T3-fix E1)', () => {
   it('up adds a nullable timestamptz column', () => {
     expect(run('up')).toEqual([
       TIMEOUT,
       [
         'addColumn',
         'customer_profiles',
-        { last_suggestion_at: { type: 'timestamptz' } },
+        { suggestions_paused_until: { type: 'timestamptz' } },
       ],
     ]);
+  });
+
+  it('E9: the header states the strict deploy and rollback order', () => {
+    const source = readFileSync(
+      join(__dirname, '../../../migrations', `${MIGRATION}.js`),
+      'utf8',
+    );
+    expect(source).toContain('Deploy: this migration BEFORE the T3 bot');
+    expect(source).toContain('Rollback: the bot FIRST, then down');
   });
 
   it('down drops it', () => {
     expect(run('down')).toEqual([
       TIMEOUT,
-      ['dropColumn', 'customer_profiles', 'last_suggestion_at'],
+      ['dropColumn', 'customer_profiles', 'suggestions_paused_until'],
     ]);
   });
 });
@@ -60,7 +70,7 @@ const SENDER = '5215550001111';
 const AT = '2026-11-26T12:00:00.000Z';
 
 ddescribe(
-  'customer_profiles.last_suggestion_at migration 5950 (real PostgreSQL)',
+  'customer_profiles.suggestions_paused_until migration 5950 (real PostgreSQL)',
   () => {
     jest.setTimeout(180_000);
     let container: StartedPostgreSqlContainer | undefined;
@@ -89,7 +99,7 @@ ddescribe(
       (
         await pool.query<{ data_type: string; is_nullable: string }>(
           `SELECT data_type, is_nullable FROM information_schema.columns
-          WHERE table_name = 'customer_profiles' AND column_name = 'last_suggestion_at'`,
+          WHERE table_name = 'customer_profiles' AND column_name = 'suggestions_paused_until'`,
         )
       ).rows;
 
@@ -105,16 +115,16 @@ ddescribe(
       await container?.stop();
     });
 
-    it('up: the store round-trips the marker merge-only', async () => {
+    it('up: the store round-trips the pause merge-only', async () => {
       await expect(column()).resolves.toEqual([
         { data_type: 'timestamp with time zone', is_nullable: 'YES' },
       ]);
       const store = new PostgresCustomerProfileStore(pool);
-      await store.upsert(SENDER, { lastSuggestionAt: AT }, new Date(AT));
+      await store.upsert(SENDER, { suggestionsPausedUntil: AT }, new Date(AT));
       await store.upsert(SENDER, { register: 'tu' }, new Date());
       await expect(store.read(SENDER)).resolves.toMatchObject({
         register: 'tu',
-        lastSuggestionAt: AT,
+        suggestionsPausedUntil: AT,
       });
     });
 
@@ -132,7 +142,7 @@ ddescribe(
       expect(rows.rows).toEqual([{ register: 'tu' }]);
       migrate('up');
       const read = await new PostgresCustomerProfileStore(pool).read(SENDER);
-      expect(read).not.toHaveProperty('lastSuggestionAt');
+      expect(read).not.toHaveProperty('suggestionsPausedUntil');
     });
   },
 );

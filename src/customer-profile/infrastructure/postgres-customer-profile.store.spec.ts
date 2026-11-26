@@ -77,9 +77,9 @@ describe('PostgresCustomerProfileStore SQL (no database)', () => {
       null,
       null,
       null,
-      '2026-11-07T00:00:00.000Z',
-      // T3: no suggestion marker in this patch.
+      // T3-fix E8: params follow COLUMNS; no suggestions pause here.
       null,
+      '2026-11-07T00:00:00.000Z',
     ]);
   });
 
@@ -199,14 +199,14 @@ ddescribe('customer_profiles migration 3700 + store (real PostgreSQL)', () => {
       'last_order_confirmed_at',
       'last_order_folio',
       'last_order_total_cents',
-      // T3 (migration 5950): the 24 h suggestion marker.
-      'last_suggestion_at',
       // T4b (migration 5700): the prospect's local pet list. T6d
       // (migration 5900): the legacy `pet` column is dropped.
       'pets',
       'preferred_name',
       'register',
       'sender_id',
+      // T3-fix E1 (migration 5950): until when no suggestion is shown.
+      'suggestions_paused_until',
       'tone',
       'updated_at',
     ]);

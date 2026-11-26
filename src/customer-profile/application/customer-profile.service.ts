@@ -31,6 +31,8 @@ export class CustomerProfileService {
   private readonly logger = new Logger(CustomerProfileService.name);
   private readonly cache = new Map<string, CustomerProfile | null>();
   private readonly forgotten = new Set<string>();
+  /** T3-fix E2: in-process suggestion pauses (ms), kept on write failure. */
+  private readonly pauses = new Map<string, number>();
   private readonly now: () => Date;
 
   constructor(
@@ -107,22 +109,51 @@ export class CustomerProfileService {
     });
   }
 
-  /** T3 (S6): a complementary suggestion was shown now (persisted). */
-  async recordSuggestion(senderId: string): Promise<void> {
+  /**
+   * T3-fix (S6, S7): no complementary suggestion to this sender before
+   * `untilMs` (24 h after a shown one, 30 days after a decline). The
+   * in-process pause is set BEFORE the durable write, so a failed or slow
+   * write never lets this process suggest again (E2); never throws.
+   */
+  async pauseSuggestions(senderId: string, untilMs: number): Promise<void> {
+    this.pauses.delete(senderId);
+    this.pauses.set(senderId, untilMs);
+    if (this.pauses.size > CACHE_MAX)
+      for (const oldest of this.pauses.keys()) {
+        this.pauses.delete(oldest);
+        break;
+      }
     await this.record(senderId, {
-      lastSuggestionAt: this.now().toISOString(),
+      suggestionsPausedUntil: new Date(untilMs).toISOString(),
     });
   }
 
-  /** T3 (S6): the cached profile shows a suggestion less than `ms` ago. */
-  suggestedWithin(senderId: string, ms: number): boolean {
-    const at = this.cached(senderId)?.lastSuggestionAt;
-    return at !== undefined && this.now().getTime() - Date.parse(at) < ms;
+  /** T3-fix: `pauseSuggestions` for `durationMs` from this service's clock. */
+  async pauseSuggestionsFor(
+    senderId: string,
+    durationMs: number,
+  ): Promise<void> {
+    await this.pauseSuggestions(senderId, this.now().getTime() + durationMs);
+  }
+
+  /** T3-fix (S6, S7): suggestions are paused for this sender at `nowMs`. */
+  suggestionsPaused(
+    senderId: string,
+    nowMs: number = this.now().getTime(),
+  ): boolean {
+    const stored = this.cached(senderId)?.suggestionsPausedUntil;
+    const storedMs = stored === undefined ? NaN : Date.parse(stored);
+    const local = this.pauses.get(senderId);
+    return (
+      (!Number.isNaN(storedMs) && nowMs < storedMs) ||
+      (local !== undefined && nowMs < local)
+    );
   }
 
   /** Deletes the profile; later writes in this process are skipped. */
   async forget(senderId: string): Promise<boolean> {
     this.forgotten.add(senderId);
+    this.pauses.delete(senderId);
     this.remember(senderId, null);
     try {
       await this.store.delete(senderId);
