@@ -9,32 +9,26 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Logger } from '@nestjs/common';
-import type { ConfigService } from '@nestjs/config';
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
-import { InMemoryConversationStore } from '../../src/conversation/infrastructure/in-memory-conversation.store';
-import { CostGuardService } from '../../src/llm-agent/application/cost-guard.service';
-import { MinimalCartService } from '../../src/llm-agent/application/minimal-cart.service';
-import { MinimalCatalogAgentService } from '../../src/llm-agent/application/minimal-catalog-agent.service';
-import { MinimalCheckoutService } from '../../src/llm-agent/application/minimal-checkout.service';
-import { MinimalOrderService } from '../../src/llm-agent/application/minimal-order.service';
-import { MinimalPaymentService } from '../../src/llm-agent/application/minimal-payment.service';
-import { MinimalShippingService } from '../../src/llm-agent/application/minimal-shipping.service';
 import type { GenerateTextFn } from '../../src/llm-agent/infrastructure/generate-text.provider';
-import type { CustomerReplyInteractive } from '../../src/llm-agent/domain/customer-reply';
-import { InMemoryMinimalCatalogSessionStore } from '../../src/llm-agent/infrastructure/in-memory-minimal-catalog-session.store';
-import { CustomerProfileService } from '../../src/customer-profile/application/customer-profile.service';
-import type { CustomerProfileStore } from '../../src/customer-profile/domain/customer-profile';
-import { InMemoryCustomerProfileStore } from '../../src/customer-profile/infrastructure/in-memory-customer-profile.store';
 import {
   checkExpectedReply,
   checkOrders,
   checkReply,
+  checkTurnEvidence,
   nextRegister,
   type CheckResult,
   type Register,
 } from './checks';
-import { EvalFakeApi } from './fixtures/fake-api';
+import {
+  EVAL_SENDER,
+  buildEvalHarness,
+  createEvalWorld,
+  describeInteractive,
+  settleBackground,
+  type EvalWorld,
+} from './harness';
 import { SCENARIOS, type Scenario, type ScenarioTurn } from './scenarios';
 
 /**
@@ -55,8 +49,7 @@ const PRICES: Record<
 /** Pessimistic per-turn size used to decide whether the next turn fits. */
 const INITIAL_TURN_ESTIMATE = { input: 40_000, output: 1_000 };
 
-const SENDER = '5215550001111';
-const CASHIER = '99999999-9999-4999-8999-999999999999';
+const SENDER = EVAL_SENDER;
 
 interface Usage {
   input: number;
@@ -206,82 +199,19 @@ function meteredGenerate(meter: Meter): GenerateTextFn {
 }
 
 /**
- * One bot process. S1: `profiles` is the scenario's customer-profile store
- * (the database); a restart builds a new harness with the same store and
- * backend fake, so only the in-memory session is lost.
+ * One bot process. S1/T7: `world` holds the scenario's durable stores and
+ * backend fake (profiles, gates, pets); a restart builds a new harness over
+ * the same world, so only the in-memory session is lost.
  */
-function buildHarness(
-  scenario: Scenario,
-  meter: Meter,
-  profiles: CustomerProfileStore,
-  api = new EvalFakeApi(scenario.customer),
-) {
-  const profileService = new CustomerProfileService(profiles);
-  const store = new InMemoryConversationStore();
-  const values: Record<string, unknown> = {
-    'chatbotApi.cashierUserId': CASHIER,
-    llm: {
-      model,
-      maxSteps: Number(process.env.LLM_MAX_STEPS ?? '4'),
-      historyTurns: Number(process.env.LLM_HISTORY_TURNS ?? '12'),
-    },
-  };
-  // SAFETY: the services only call config.get with the keys in `values`.
-  const config = {
-    get: (key: string) => values[key],
-  } as unknown as ConfigService;
-  const cart = new MinimalCartService(api, store);
-  const checkout = new MinimalCheckoutService(api, store);
-  const shipping = new MinimalShippingService(store, cart, checkout, api, {
-    register: (request) => {
-      api.events.push(`deliveryZoneIntake(zip ${request.zipCode ?? '?'})`);
-      return Promise.resolve();
-    },
+function buildHarness(world: EvalWorld, meter: Meter) {
+  return buildEvalHarness(world, meteredGenerate(meter), {
+    model,
+    maxSteps: Number(process.env.LLM_MAX_STEPS ?? '4'),
+    historyTurns: Number(process.env.LLM_HISTORY_TURNS ?? '12'),
   });
-  const order = new MinimalOrderService(
-    api,
-    store,
-    cart,
-    checkout,
-    config,
-    shipping,
-    undefined,
-    profileService,
-  );
-  const agent = new MinimalCatalogAgentService(
-    api,
-    meteredGenerate(meter),
-    new CostGuardService(10_000_000),
-    config,
-    new InMemoryMinimalCatalogSessionStore(),
-    undefined,
-    undefined,
-    cart,
-    checkout,
-    order,
-    shipping,
-    profileService,
-    undefined,
-    undefined,
-    // The payment step after an order (bank details from the fake backend).
-    new MinimalPaymentService(api, store),
-  );
-  return { api, agent };
 }
 
 /** Labels server-owned (deterministic) replies so gate behavior is visible. */
-/** S4: "🔘 Botones: [a] [b]" / "📋 Lista (Ver opciones): a · b", or null. */
-function describeInteractive(
-  interactive: CustomerReplyInteractive | undefined,
-): string | null {
-  if (interactive === undefined) return null;
-  return interactive.type === 'buttons'
-    ? `🔘 Botones: ${interactive.buttons.map((b) => `[${b.title}]`).join(' ')}`
-    : `📋 Lista (${interactive.buttonText}): ${interactive.rows
-        .map((r) => r.title)
-        .join(' · ')}`;
-}
-
 function gateLabel(reply: string, llmCalls: number): string | null {
   const labels: string[] = [];
   if (llmCalls === 0) labels.push('deterministic gate (no LLM call)');
@@ -303,8 +233,9 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     tools: [],
     usage: { input: 0, cached: 0, output: 0 },
   };
-  const profiles = new InMemoryCustomerProfileStore();
-  let { api, agent } = buildHarness(scenario, meter, profiles);
+  const world = createEvalWorld(scenario.customer);
+  const { api } = world;
+  let { agent } = buildHarness(world, meter);
   const record: ScenarioRecord = {
     scenario,
     turns: [],
@@ -333,7 +264,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     if (turn.restartBefore === true) {
       // S1: same profile store and backend, new process and session. The
       // expected register carries over (remembered); emojis restart.
-      ({ api, agent } = buildHarness(scenario, meter, profiles, api));
+      ({ agent } = buildHarness(world, meter));
       customerTexts.length = 0;
     }
     register = nextRegister(register, turn.text);
@@ -365,6 +296,8 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
       interactive = describeInteractive(decision.interactive);
       // The reply reached WhatsApp: arm any pending confirmation.
       decision.onSent?.();
+      // T7: background pet writes belong to this turn's backend activity.
+      await settleBackground();
     } catch (err) {
       if (err instanceof BudgetStop) record.stopped = true;
       error = err instanceof Error ? err.message : String(err);
@@ -377,6 +310,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
     spentUsd += turnUsd;
     record.usd += turnUsd;
     maxTurnUsd = Math.max(maxTurnUsd, turnUsd);
+    const backend = api.drainEvents();
     record.turns.push({
       customer:
         turn.restartBefore === true
@@ -388,7 +322,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
       tools: [...meter.tools],
       llmCalls: meter.calls,
       gate: gateLabel(reply, meter.calls),
-      backend: api.drainEvents(),
+      backend,
       checks:
         error === undefined
           ? [
@@ -401,6 +335,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
                 expectPersona: turn.expectPersona ?? false,
               }),
               ...checkExpectedReply(reply, turn.expectReply),
+              ...checkTurnEvidence({ reply, interactive, backend }, turn),
             ]
           : [{ check: 'error', severity: 'fail', detail: error }],
       usd: turnUsd,
@@ -412,6 +347,16 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRecord> {
   if (!record.stopped)
     record.final.push(checkOrders(scenario.expectOrders, record.orders));
   return record;
+}
+
+function describeCustomer(scenario: Scenario): string {
+  const customer = scenario.customer;
+  if (customer.kind === 'new') return 'new (not found)';
+  const pets = (customer.pets ?? []).map((pet) => pet.name);
+  return (
+    `existing, saved address ZIP ${customer.zip}` +
+    (pets.length === 0 ? '' : `, backend pets ${pets.join(', ')}`)
+  );
 }
 
 const icon = (s: CheckResult['severity']) =>
@@ -430,7 +375,7 @@ function transcript(records: ScenarioRecord[], startedAt: string): string {
   for (const r of records) {
     lines.push(`## ${r.scenario.id} — ${r.scenario.title}`, '');
     lines.push(
-      `Customer fixture: ${r.scenario.customer.kind === 'new' ? 'new (not found)' : `existing, saved address ZIP ${r.scenario.customer.zip}`} · cost $${r.usd.toFixed(4)}`,
+      `Customer fixture: ${describeCustomer(r.scenario)} · cost $${r.usd.toFixed(4)}`,
       '',
     );
     r.turns.forEach((t, i) => {

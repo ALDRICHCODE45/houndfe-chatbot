@@ -1,4 +1,5 @@
-import { checkReply } from '../../../scripts/eval/checks';
+import { checkExpectedReply, checkReply } from '../../../scripts/eval/checks';
+import { SCENARIOS, type ScenarioTurn } from '../../../scripts/eval/scenarios';
 
 /** The eval's duplicate-line heuristic (scripts/eval/checks.ts). */
 const duplicate = (reply: string) =>
@@ -137,5 +138,83 @@ describe('eval emoji check (same rule as limitCustomerEmojis)', () => {
     ],
   ])('%s', (_name, reply, severity) => {
     expect(emoji(noEmojiCustomer, reply)?.severity).toBe(severity);
+  });
+});
+
+describe('eval register check (T7: a pet\u2019s «su/sus» is not usted)', () => {
+  const register = (reply: string, expected: 'tu' | 'usted' = 'tu') =>
+    checkReply({
+      customerText: 'Y Bruno ya no está, falleció la semana pasada',
+      reply,
+      expected,
+      refusal: 'forbidden',
+      expectPersona: false,
+    }).find((result) => result.check === 'register');
+
+  it.each([
+    [
+      'live eval: «sus datos» of the pet in a tú reply passes',
+      'Lamento mucho lo de Bruno, te acompaño en este momento. Ya dejé de recordar sus datos. Aquí estoy para lo que necesites con Max o cualquier otra cosa.',
+      'pass',
+    ],
+    [
+      '«su alimento» of the pet in a tú reply passes',
+      'Para Max te recomiendo cuidar su alimento.',
+      'pass',
+    ],
+    [
+      'a real usted marker next to tú is still mixed',
+      '¿Le agrego una bolsa a tu carrito?',
+      'warn',
+    ],
+    [
+      'only usted markers (su included) to a tú customer still fails',
+      'Con gusto, ¿qué busca para su perro?',
+      'fail',
+    ],
+  ])('%s', (_name, reply, severity) => {
+    expect(register(reply)?.severity).toBe(severity);
+  });
+});
+
+describe('eval scenario expectations (T7 live eval)', () => {
+  const scenario = (id: string) => {
+    const found = SCENARIOS.find((candidate) => candidate.id === id);
+    if (found === undefined) throw new Error(id);
+    return found.turns.map(
+      (raw): ScenarioTurn => (typeof raw === 'string' ? { text: raw } : raw),
+    );
+  };
+
+  it.each([
+    ['¡Hola! ¿Qué producto o información estás buscando?', true],
+    ['¡Hola! ¿Qué quieres para Luna?', true],
+    ['Hola, ¿buscas algo en especial?', true],
+    ['Hola, ¿qué necesitas hoy?', true],
+    ['¡Hola, Mariana!', true],
+    ['¡Hola! ¿Qué producto está buscando?', false],
+    ['Buenas tardes, ¿en qué le ayudo?', false],
+  ])(
+    'returning-customer after the restart: %j matches the tú expectation → %s',
+    (reply, matches) => {
+      const turn = scenario('returning-customer').find(
+        (candidate) => candidate.restartBefore === true,
+      );
+      expect(checkExpectedReply(reply, turn?.expectReply)).toHaveLength(
+        matches ? 0 : 1,
+      );
+    },
+  );
+
+  it('pets-which-pet: the «(para Max)» check is on the «sí, por favor» turn (register-neutral: «agrégala» is a tú imperative and switches the bot to tú), after the add question', () => {
+    const turns = scenario('pets-which-pet');
+    expect(turns.map((turn) => turn.text)).toEqual([
+      'Hola, busco croquetas para mi perro',
+      'para Max',
+      'Quiero una bolsa de las croquetas de salmón y camote de 18 kg',
+      'sí, por favor',
+    ]);
+    expect(turns[2].requireReply).toBeUndefined();
+    expect(String(turns[3].requireReply)).toBe(String(/\(para Max\)/));
   });
 });

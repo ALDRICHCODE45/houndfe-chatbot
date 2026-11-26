@@ -373,7 +373,8 @@ const PET_MEMORY_INSTRUCTIONS =
 
 const REMEMBER_PET_DESCRIPTION =
   'Guarda datos que el cliente dijo explícitamente sobre SU mascota para recordarlos en otras conversaciones. ' +
-  'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, alergias, notas); omita lo demás. Nunca invente ni deduzca.';
+  'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, alergias, notas); omita los campos que no dijo, sin rellenarlos. ' +
+  'allergies: solo el alérgeno, por ejemplo "pollo". Nunca invente ni deduzca.';
 
 // T4c-1 G2: «Bruno ya no está» / «olvida a Bruno» (archive, never delete).
 const FORGET_PET_DESCRIPTION =

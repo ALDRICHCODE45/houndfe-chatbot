@@ -2031,6 +2031,63 @@ describe('CustomerPetsService (T4c-1)', () => {
       ]);
     });
 
+    it.each([
+      ['alérgico al pollo', 'pollo'],
+      ['es alérgica a la res y al cerdo', 'res y al cerdo'],
+      ['Alérgicos a los lácteos', 'lácteos'],
+      ['alergica a las fresas', 'fresas'],
+      ['pollo', 'pollo'],
+    ])(
+      'T7: a stated allergy %j is stored as the allergen only (%j)',
+      async (stated, sent) => {
+        const h = harness(found([max()]));
+        patched(h, max({ allergies: sent, version: 4 }));
+        await h.service.prepare(SENDER);
+        await h.service.capture(SENDER, { name: 'Max', allergies: stated });
+        expect(h.client.patchPet.mock.calls).toEqual([
+          [CUSTOMER_ID, uuid(50), { version: 3, allergies: sent }],
+        ]);
+      },
+    );
+
+    it.each(['.', '-', '…', ' . ', '¿?', '—'])(
+      'T7: a fact value with no letter or digit (%j) is treated as absent',
+      async (junk) => {
+        const h = harness(found([max()]));
+        patched(h, max({ allergies: 'pollo', version: 4 }));
+        await h.service.prepare(SENDER);
+        await h.service.capture(SENDER, {
+          name: 'Max',
+          allergies: 'alérgico al pollo',
+          notes: junk,
+          breed: junk,
+        });
+        expect(h.client.patchPet.mock.calls).toEqual([
+          [CUSTOMER_ID, uuid(50), { version: 3, allergies: 'pollo' }],
+        ]);
+      },
+    );
+
+    it('T7: only junk facts write nothing (no local entry, no PATCH)', async () => {
+      const h = harness(found([max()]));
+      await h.service.prepare(SENDER);
+      await h.service.capture(SENDER, {
+        name: '.',
+        notes: '.',
+        allergies: '-',
+      });
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+      expect(h.client.createPet).not.toHaveBeenCalled();
+      await expect(h.local()).resolves.toEqual([]);
+    });
+
+    it('T7: «alérgico a» with nothing after it is treated as absent', async () => {
+      const h = harness(found([max()]));
+      await h.service.prepare(SENDER);
+      await h.service.capture(SENDER, { name: 'Max', allergies: 'alérgico a' });
+      expect(h.client.patchPet).not.toHaveBeenCalled();
+    });
+
     describe('captureAllergy (deterministic «<Nombre> es alérgico a X»)', () => {
       it('goes to the known pet with that name', async () => {
         const h = harness(found([backend(), max()]));

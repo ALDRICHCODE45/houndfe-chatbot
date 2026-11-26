@@ -1,4 +1,5 @@
 import type { FixtureCustomer } from './fixtures/fake-api';
+import { EVAL_PET_BRUNO, EVAL_PET_MAX } from './fixtures/fake-pets-client';
 
 /**
  * Whether the literal refusal phrase ("esa función aún no está disponible")
@@ -25,6 +26,13 @@ export interface ScenarioTurn {
   restartBefore?: boolean;
   /** A heuristic the reply should match (a warning when it does not). */
   expectReply?: RegExp;
+  /** T7: the reply must match (a fail when it does not). */
+  requireReply?: RegExp;
+  /** T7: the buttons/list line must exist and match, e.g. «🔘 Botones: [Bruno …] [Max …]». */
+  expectInteractive?: RegExp;
+  /** T7: each pattern must match one of the turn's backend calls (pet store
+   *  writes, order-history reads; the transcript's «Backend:» line). */
+  expectBackend?: RegExp[];
 }
 
 export interface Scenario {
@@ -76,6 +84,18 @@ const existing = (zip: '03100' | '04000' | '12000'): FixtureCustomer => ({
   zip,
 });
 
+/** T7: an existing customer whose backend record has Max and Bruno (S1-S3). */
+const withPets = (): FixtureCustomer => ({
+  kind: 'existing',
+  firstName: 'Mariana',
+  zip: '03100',
+  pets: [EVAL_PET_MAX, EVAL_PET_BRUNO],
+});
+
+/** The order-history read for one pet (contract §6 `?petId=`). */
+const historyFor = (petId: string) =>
+  new RegExp(`^getOrderHistory\\(.* petId=${petId}\\)`);
+
 export const SCENARIOS: Scenario[] = [
   {
     id: 'returning-customer',
@@ -85,13 +105,19 @@ export const SCENARIOS: Scenario[] = [
     profileName: 'Mariana',
     turns: [
       'Holaaa 😄 oye, ¿tienes croquetas para perro? 🐶',
-      'mi perrita Luna es una labrador de 3 años 🐾',
+      {
+        text: 'mi perrita Luna es una labrador de 3 años 🐾',
+        // T7: the customer exists, so Luna goes straight to the backend.
+        expectBackend: [/^createPet\(name "Luna"/],
+      },
       'va, luego te escribo, gracias!! 🙌',
       {
         text: 'hola',
         restartBefore: true,
         // tú after the restart (the register check) and, optionally, the name.
-        expectReply: /\b(tú|te|tu|ti)\b|Mariana|Luna/i,
+        // T7 live eval: a tú verb alone («¿Qué estás buscando?») counts.
+        expectReply:
+          /(?<![\p{L}])(?:tú|te|tu|ti|estás|quieres|buscas|necesitas|tienes|puedes|deseas|prefieres)(?![\p{L}])|Mariana|Luna/iu,
       },
       {
         text: 'busco croquetas para ella',
@@ -318,6 +344,61 @@ export const SCENARIOS: Scenario[] = [
         ['Felix atún 1 kg', 'croquetas Felix', 'croquetas gato atún'],
       ),
       'ok y cuál me recomiendas? 🐱',
+    ],
+  },
+  {
+    id: 'pets-which-pet',
+    title:
+      'Two pets: «¿Para quién es?» buttons, «para Max» continues, the cart line says «(para Max)» (S3, S16, S17)',
+    customer: withPets(),
+    turns: [
+      {
+        text: 'Hola, busco croquetas para mi perro',
+        requireReply: /¿Para quién es\?/,
+        expectInteractive: /^🔘 Botones:(?=.*\[Max)(?=.*\[Bruno)/,
+      },
+      {
+        // The typed answer to the question: the request continues for Max.
+        text: 'para Max',
+        expectBackend: [/^searchCatalog\(/],
+      },
+      // T7 live eval: the model may ask «¿Le agrego una bolsa al carrito?»
+      // before adding; the cart line is checked after the customer agrees.
+      'Quiero una bolsa de las croquetas de salmón y camote de 18 kg',
+      {
+        text: 'sí, por favor',
+        requireReply: /\(para Max\)/,
+      },
+    ],
+  },
+  {
+    id: 'pets-allergy-forget',
+    title:
+      'Allergy stored on the pet (PATCH) and a pet that passed away archived with tact (S5, S7)',
+    customer: withPets(),
+    turns: [
+      {
+        text: 'Hola, te cuento que Max es alérgico al pollo',
+        expectBackend: [/^patchPet\(Max v\d+ .*allergies "[^"]*pollo/i],
+      },
+      {
+        text: 'Y Bruno ya no está, falleció la semana pasada',
+        expectBackend: [/^archivePet\(Bruno v\d+ .*→ ARCHIVED/],
+      },
+    ],
+  },
+  {
+    id: 'pets-reorder',
+    title:
+      '«Lo mismo de siempre para Max»: his last order, only his lines (S4, S14, S15)',
+    customer: withPets(),
+    turns: [
+      {
+        text: 'Hola, quiero lo mismo de siempre para Max',
+        expectBackend: [historyFor(EVAL_PET_MAX.id)],
+        // Max's line (Nupec 18 kg), not Bruno's Royal Canin Mini.
+        expectReply: /para Max/i,
+      },
     ],
   },
 ];

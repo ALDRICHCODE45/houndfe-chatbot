@@ -7,7 +7,7 @@ import {
   speciesGroupsNamedIn,
 } from '../../src/llm-agent/domain/minimal-catalog-options';
 import { TITLE_EMOJI_LINE } from '../../src/llm-agent/domain/whatsapp-format';
-import type { RefusalExpectation } from './scenarios';
+import type { RefusalExpectation, ScenarioTurn } from './scenarios';
 
 /** Deterministic reply heuristics; no LLM judge. */
 export type Severity = 'pass' | 'warn' | 'fail';
@@ -124,6 +124,9 @@ const BOT_USTED = words([
   'darle',
 ]);
 
+/** «su/sus»: usted or the third person (the pet); see the register check. */
+const THIRD_PERSON_POSSESSIVE = words(['su', 'sus']);
+
 const SLANG = words([
   'vos',
   'tenés',
@@ -213,6 +216,58 @@ export function checkExpectedReply(
   ];
 }
 
+/**
+ * Multi-pet T7: what a turn must show, read from the reply, its buttons/list
+ * line and its backend activity (pet store writes, order-history reads).
+ * Deterministic: a regular expression each, a fail when it does not match.
+ */
+export function checkTurnEvidence(
+  evidence: {
+    reply: string;
+    /** `describeInteractive` line, or null without buttons/list. */
+    interactive: string | null;
+    backend: readonly string[];
+  },
+  expect: Pick<
+    ScenarioTurn,
+    'requireReply' | 'expectInteractive' | 'expectBackend'
+  >,
+): CheckResult[] {
+  const out: CheckResult[] = [];
+  if (expect.requireReply !== undefined)
+    out.push(
+      expect.requireReply.test(evidence.reply)
+        ? { check: 'reply', severity: 'pass' }
+        : {
+            check: 'reply',
+            severity: 'fail',
+            detail: `reply does not match ${String(expect.requireReply)}`,
+          },
+    );
+  if (expect.expectInteractive !== undefined)
+    out.push(
+      evidence.interactive !== null &&
+        expect.expectInteractive.test(evidence.interactive)
+        ? { check: 'interactive', severity: 'pass' }
+        : {
+            check: 'interactive',
+            severity: 'fail',
+            detail: `${evidence.interactive ?? 'no buttons/list'} does not match ${String(expect.expectInteractive)}`,
+          },
+    );
+  for (const wanted of expect.expectBackend ?? [])
+    out.push(
+      evidence.backend.some((event) => wanted.test(event))
+        ? { check: 'backend', severity: 'pass' }
+        : {
+            check: 'backend',
+            severity: 'fail',
+            detail: `no backend call matches ${String(wanted)}`,
+          },
+    );
+  return out;
+}
+
 const SPECIES_EMOJI: ReadonlyArray<readonly [RegExp, string]> = [
   [/[\u{1F431}\u{1F408}]/u, 'gato'],
   [/[\u{1F436}\u{1F415}\u{1F429}]/u, 'perro'],
@@ -293,6 +348,10 @@ export function checkReply(input: {
 
   const tu = count(BOT_TU, reply);
   const usted = count(BOT_USTED, reply);
+  // T7: next to tú markers, «su/sus» is the third person (a pet: «ya dejé
+  // de recordar sus datos»); a tú reply says «tu/tus» for the customer.
+  // Only the mixed warning skips them; alone they still mean usted.
+  const ustedNotPossessive = usted - count(THIRD_PERSON_POSSESSIVE, reply);
   if (expected === 'tu' && usted > 0 && tu === 0)
     out.push({
       check: 'register',
@@ -305,7 +364,7 @@ export function checkReply(input: {
       severity: 'fail',
       detail: 'tú to an usted customer',
     });
-  else if (tu > 0 && usted > 0)
+  else if (tu > 0 && ustedNotPossessive > 0)
     out.push({
       check: 'register',
       severity: 'warn',

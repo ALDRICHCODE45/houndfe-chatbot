@@ -9,7 +9,10 @@ import type {
   CheckoutStatus,
   CreateCheckoutInput,
 } from '../../../src/chatbot-api/domain/dtos/checkout.dto';
-import type { OrderHistoryResponse } from '../../../src/chatbot-api/domain/dtos/sales.dto';
+import type {
+  OrderHistoryQuery,
+  OrderHistoryResponse,
+} from '../../../src/chatbot-api/domain/dtos/sales.dto';
 import type {
   CreateShippingQuoteInput,
   ShippingQuoteResponse,
@@ -21,13 +24,23 @@ import {
   toStockCheck,
   unitPrice,
 } from './catalog';
+import type { EvalPetSeed } from './fake-pets-client';
 
 /** Who the WhatsApp sender is in the backend for a scenario. */
 export type FixtureCustomer =
   | { kind: 'new' }
-  | { kind: 'existing'; firstName: string; zip: keyof typeof ADDRESSES };
+  | {
+      kind: 'existing';
+      firstName: string;
+      zip: keyof typeof ADDRESSES;
+      /** Multi-pet T7: pets staff already entered in the backend (POS). */
+      pets?: readonly EvalPetSeed[];
+    };
 
 const CUSTOMER_ID = 'c0000000-0000-4000-8000-000000000001';
+/** The backend Customer of every existing fixture customer (and of a
+ *  customer a checkout creates). */
+export const EVAL_CUSTOMER_ID = CUSTOMER_ID;
 const ADDRESS_ID = 'd0000000-0000-4000-8000-000000000001';
 const ADDRESS_VERSION = '2026-10-01T00:00:00.000Z';
 const SALE_ID = (n: number) =>
@@ -92,6 +105,62 @@ export const PREVIOUS_ORDER: OrderHistoryResponse = {
   shippingAddress: { street: 'Av. Coyoacán', zipCode: '03100' },
 };
 
+/**
+ * Multi-pet T7 (S4, S14): with backend pets, a newer order whose lines are
+ * for them: Nupec 18 kg for the first pet, Royal Canin Mini 2 kg for the
+ * second (when there is one).
+ */
+export function petOrder(pets: readonly EvalPetSeed[]): OrderHistoryResponse {
+  const pet = (seed: EvalPetSeed | undefined) =>
+    seed === undefined
+      ? null
+      : {
+          id: seed.id,
+          name: seed.name,
+          species: seed.species,
+          status: 'ACTIVE' as const,
+        };
+  const items: OrderHistoryResponse['items'] = [
+    {
+      productId: 'a0000000-0000-4000-8000-000000000001',
+      variantId: null,
+      productName: 'Croquetas Nupec Salmón 18 kg',
+      variantName: null,
+      quantity: 1,
+      unitPriceCents: 159900,
+      pet: pet(pets[0]),
+    },
+  ];
+  if (pets[1] !== undefined)
+    items.push({
+      productId: 'a0000000-0000-4000-8000-000000000003',
+      variantId: 'b0000000-0000-4000-8000-000000000301',
+      productName: 'Croquetas Royal Canin Mini',
+      variantName: '2 kg',
+      quantity: 1,
+      unitPriceCents: 52900,
+      pet: pet(pets[1]),
+    });
+  const total = items.reduce(
+    (sum, item) => sum + item.quantity * item.unitPriceCents,
+    0,
+  );
+  return {
+    saleId: SALE_ID(98),
+    folio: 'EV-0098',
+    confirmedAt: '2026-11-05T18:00:00.000Z',
+    channel: 'ONLINE',
+    deliveryStatus: 'DELIVERED',
+    paymentStatus: 'PAID',
+    totalCents: total,
+    paidCents: total,
+    debtCents: 0,
+    items,
+    payments: [{ method: 'TRANSFER', amountCents: total, reference: null }],
+    shippingAddress: { street: 'Av. Coyoacán', zipCode: '03100' },
+  };
+}
+
 const notFound = (method: string) =>
   Promise.reject(new Error(`eval fake: ${method} is not part of the eval`));
 
@@ -109,12 +178,19 @@ export class EvalFakeApi implements ChatbotApiClient {
   readonly orders = new Map<string, CheckoutResponse>();
   private readonly quotes = new Map<string, number>();
   private quoteSeq = 0;
-  /** Order history (latest first); one previous order for an existing customer. */
+  /** Order history (latest first); one previous order for an existing
+   *  customer, preceded by an order for its pets when it has any (T7). */
   history: OrderHistoryResponse[];
 
   constructor(private readonly customer: FixtureCustomer) {
+    const pets = customer.kind === 'existing' ? (customer.pets ?? []) : [];
     this.history =
-      customer.kind === 'existing' ? [structuredClone(PREVIOUS_ORDER)] : [];
+      customer.kind === 'existing'
+        ? [
+            ...(pets.length > 0 ? [petOrder(pets)] : []),
+            structuredClone(PREVIOUS_ORDER),
+          ]
+        : [];
   }
 
   drainEvents(): ApiEvent[] {
@@ -407,11 +483,25 @@ export class EvalFakeApi implements ChatbotApiClient {
   updateDelivery() {
     return notFound('updateDelivery');
   }
-  getOrderHistory(phone: string, phoneCountryCode: string) {
+  /** Contract §6: `?petId` keeps the orders with a line for that pet (all
+   *  their lines); a pet with no orders (e.g. one created during the eval)
+   *  answers `[]`. */
+  getOrderHistory(
+    phone: string,
+    phoneCountryCode: string,
+    options?: OrderHistoryQuery,
+  ) {
+    const petId = options?.petId;
+    const orders =
+      petId === undefined
+        ? this.history
+        : this.history.filter((order) =>
+            order.items.some((item) => item.pet?.id === petId),
+          );
     this.events.push(
-      `getOrderHistory(${phoneCountryCode} ${phone}) → ${this.history.length} order(s)`,
+      `getOrderHistory(${phoneCountryCode} ${phone}${petId === undefined ? '' : ` petId=${petId}`}) → ${orders.length} order(s)`,
     );
-    return Promise.resolve(structuredClone(this.history));
+    return Promise.resolve(structuredClone(orders));
   }
   submitRestockIntake() {
     return notFound('submitRestockIntake');

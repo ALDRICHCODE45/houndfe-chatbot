@@ -79,10 +79,12 @@ const PET_MEMORY_INSTRUCTIONS_T4C1 =
   'Si forgetPet responde ok false, no se guardó nada: dígalo con amabilidad y pregunte de cuál mascota se trata. ' +
   'Si forgetPet responde pending true, todavía se está guardando: no diga que ya la olvidó; responda con tacto sin confirmarlo.';
 
-/** T4c-1: the exact tool descriptions (pinned). */
+/** T4c-1: the exact tool descriptions (pinned). T7: allergies is the
+ *  allergen only and unsaid fields are omitted (live eval sent notes «.»). */
 const REMEMBER_PET_DESCRIPTION =
   'Guarda datos que el cliente dijo explícitamente sobre SU mascota para recordarlos en otras conversaciones. ' +
-  'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, alergias, notas); omita lo demás. Nunca invente ni deduzca.';
+  'Incluya solo lo que el cliente escribió (nombre, especie, raza, tamaño, edad, alergias, notas); omita los campos que no dijo, sin rellenarlos. ' +
+  'allergies: solo el alérgeno, por ejemplo "pollo". Nunca invente ni deduzca.';
 const FORGET_PET_DESCRIPTION =
   'Deja de recordar una mascota del cliente que ya no está o que pidió olvidar («Bruno ya no está», «olvida a Bruno»): la archiva, sin borrar sus pedidos. ' +
   'name: el nombre que dio el cliente. reason: el motivo en sus palabras, solo si lo dijo. Si responde ok false, no se guardó nada. ' +
@@ -1154,6 +1156,34 @@ describe('T4c-1: allergies, forget one pet, forget my data (S5, S7)', () => {
     expect(h.toolOutputs).toEqual([{ ok: true, remembered: true }]);
     expect(pets.patchPet.mock.calls).toEqual([
       [CUSTOMER_ID, MAX_ID, { version: 3, allergies: 'Res; pollo' }],
+    ]);
+  });
+
+  it('T7 (live eval): rememberPetDetails({allergies: «alérgico al pollo», notes: «.»}) PATCHes the allergen only and no notes', async () => {
+    const pets = client();
+    pets.patchPet.mockResolvedValue({
+      kind: 'ok',
+      pet: maxPet({ allergies: 'pollo', version: 4 }),
+      warnings: [],
+    });
+    const h = harness(new InMemoryCustomerProfileStore(), {
+      lookup: customer([pet({}), maxPet()]),
+      client: pets,
+    });
+    await h.turn('a Max le cae mal el pollo', [
+      [
+        call('rememberPetDetails', {
+          name: 'Max',
+          allergies: 'alérgico al pollo',
+          notes: '.',
+        }),
+        say('Gracias por avisarme.'),
+      ],
+    ]);
+    await flush();
+    expect(h.toolOutputs).toEqual([{ ok: true, remembered: true }]);
+    expect(pets.patchPet.mock.calls).toEqual([
+      [CUSTOMER_ID, MAX_ID, { version: 3, allergies: 'pollo' }],
     ]);
   });
 
