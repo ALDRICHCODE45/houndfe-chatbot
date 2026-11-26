@@ -245,7 +245,7 @@ ddescribe(
       await container?.stop();
     });
 
-    it('adds a nullable jsonb array column with its checks (T6d: the legacy pet column is gone)', async () => {
+    it('adds a nullable jsonb array column with its checks; the legacy pet column stays', async () => {
       const columns = await pool.query<{
         column_name: string;
         data_type: string;
@@ -255,6 +255,7 @@ ddescribe(
         ORDER BY column_name`,
       );
       expect(columns.rows).toEqual([
+        { column_name: 'pet', data_type: 'jsonb' },
         { column_name: 'pets', data_type: 'jsonb' },
       ]);
       const insert = (sender: string, pets: string) =>
@@ -296,7 +297,7 @@ ddescribe(
         WHERE table_name = 'customer_profiles' AND column_name = 'pets'`,
       );
       expect(gone.rows).toEqual([]);
-      // The profile row survives the rollback.
+      // The profile row and the legacy pet column survive the rollback.
       await expect(
         new PostgresCustomerProfileStore(pool).read(SENDER),
       ).resolves.toMatchObject({ senderId: SENDER });
