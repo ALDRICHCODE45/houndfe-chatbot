@@ -136,9 +136,15 @@ describe('eval harness wired to the pet store (T7)', () => {
     const { played } = await play('pets-which-pet', [
       [[call('askWhichPet'), say('¿Para cuál?')]],
       [[call('searchCatalog', { q: 'croquetas perro adulto' }), say('Aquí.')]],
+      // T7 live eval: the model asks before adding; «sí, agrégala» adds.
       [
         [
           call('searchCatalog', { q: 'salmón camote 18 kg' }),
+          say('¿Te agrego una bolsa al carrito?'),
+        ],
+      ],
+      [
+        [
           call('setCartItem', {
             selectionRef: nupecRef(),
             quantity: 1,
@@ -153,7 +159,9 @@ describe('eval harness wired to the pet store (T7)', () => {
     expect(played[0].interactive).toMatch(
       /^🔘 Botones: \[Bruno.*\] \[Max.*\]$/,
     );
-    expect(played[2].reply).toContain('(para Max)');
+    expect(played).toHaveLength(4);
+    expect(played[2].reply).not.toContain('(para Max)');
+    expect(played[3].reply).toContain('(para Max)');
     expectEvidence(played);
   });
 

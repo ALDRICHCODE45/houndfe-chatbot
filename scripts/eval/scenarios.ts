@@ -115,7 +115,9 @@ export const SCENARIOS: Scenario[] = [
         text: 'hola',
         restartBefore: true,
         // tú after the restart (the register check) and, optionally, the name.
-        expectReply: /\b(tú|te|tu|ti)\b|Mariana|Luna/i,
+        // T7 live eval: a tú verb alone («¿Qué estás buscando?») counts.
+        expectReply:
+          /(?<![\p{L}])(?:tú|te|tu|ti|estás|quieres|buscas|necesitas|tienes|puedes|deseas|prefieres)(?![\p{L}])|Mariana|Luna/iu,
       },
       {
         text: 'busco croquetas para ella',
@@ -360,8 +362,11 @@ export const SCENARIOS: Scenario[] = [
         text: 'para Max',
         expectBackend: [/^searchCatalog\(/],
       },
+      // T7 live eval: the model may ask «¿Le agrego una bolsa al carrito?»
+      // before adding; the cart line is checked after the customer agrees.
+      'Quiero una bolsa de las croquetas de salmón y camote de 18 kg',
       {
-        text: 'Quiero una bolsa de las croquetas de salmón y camote de 18 kg',
+        text: 'sí, agrégala',
         requireReply: /\(para Max\)/,
       },
     ],

@@ -124,6 +124,9 @@ const BOT_USTED = words([
   'darle',
 ]);
 
+/** «su/sus»: usted or the third person (the pet); see the register check. */
+const THIRD_PERSON_POSSESSIVE = words(['su', 'sus']);
+
 const SLANG = words([
   'vos',
   'tenés',
@@ -345,6 +348,10 @@ export function checkReply(input: {
 
   const tu = count(BOT_TU, reply);
   const usted = count(BOT_USTED, reply);
+  // T7: next to tú markers, «su/sus» is the third person (a pet: «ya dejé
+  // de recordar sus datos»); a tú reply says «tu/tus» for the customer.
+  // Only the mixed warning skips them; alone they still mean usted.
+  const ustedNotPossessive = usted - count(THIRD_PERSON_POSSESSIVE, reply);
   if (expected === 'tu' && usted > 0 && tu === 0)
     out.push({
       check: 'register',
@@ -357,7 +364,7 @@ export function checkReply(input: {
       severity: 'fail',
       detail: 'tú to an usted customer',
     });
-  else if (tu > 0 && usted > 0)
+  else if (tu > 0 && ustedNotPossessive > 0)
     out.push({
       check: 'register',
       severity: 'warn',
