@@ -35,6 +35,8 @@ exports.up = (pgm) => {
 };
 
 exports.down = (pgm) => {
+  // The rollback path fails fast on a held lock too (review R4).
+  pgm.sql("SET LOCAL lock_timeout = '5s';");
   pgm.addColumn(TABLE, { pet: { type: 'jsonb' } });
   for (const [name, definition] of CHECKS)
     pgm.addConstraint(TABLE, `${TABLE}_${name}_check`, `CHECK (${definition})`);
