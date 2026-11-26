@@ -70,7 +70,10 @@ describe('customer_profiles.pet drop migration (5900, T6d)', () => {
   });
 
   it('down re-adds the nullable jsonb column (empty) with the 3700 CHECKs', () => {
+    // Review R4 (review-0c338d7498fac62a): the rollback path fails fast on a
+    // held lock too, instead of queueing every profile read and write.
     expect(run('down')).toEqual([
+      ['sql', "SET LOCAL lock_timeout = '5s';"],
       ['addColumn', 'customer_profiles', { pet: { type: 'jsonb' } }],
       ...PET_CHECKS,
     ]);
