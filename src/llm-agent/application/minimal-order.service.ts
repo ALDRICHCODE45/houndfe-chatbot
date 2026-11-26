@@ -85,6 +85,7 @@ import {
 import {
   backorderRescheduleButtons,
   paymentMethodButtons,
+  type CustomerReplyLocation,
 } from '../domain/customer-reply';
 import { backorderLineDecision } from './minimal-backorder-checkout';
 import { sourceDecisionOf } from './minimal-backorder-confirm.service';
@@ -100,6 +101,7 @@ import {
   money,
   sectionTitle,
   storeLines,
+  storePin,
 } from '../domain/whatsapp-format';
 
 export { minimalPaymentInstructions } from './minimal-payment.service';
@@ -323,6 +325,8 @@ interface OrderPlaced {
   saleId: string;
   /** Pay in store S3: a pickup order with PAY_IN_STORE_ENABLED. */
   payInStore: boolean;
+  /** T2 H4: the store pin of a pickup order whose branch has coordinates. */
+  location?: CustomerReplyLocation;
 }
 
 /** Restock backorder T5b: the checkout refused a backorder line; nothing was created. */
@@ -341,6 +345,7 @@ function orderReply(value: string | OrderPlaced): MinimalCheckoutReply {
       paymentMethodsFor({ payInStore: value.payInStore }),
     ),
     paymentOffer: { saleId: value.saleId },
+    ...(value.location === undefined ? {} : { location: value.location }),
   };
 }
 
@@ -1380,10 +1385,16 @@ export class MinimalOrderService {
     // never delays the order-created reply and a failure is only logged.
     this.uploadPetsInBackground(senderId);
     // Bank details are fetched when the customer chooses how to pay.
+    // T2 H4: the pin rides next to the text, which stays byte-identical.
+    const location =
+      pickupLocation === null || pickupLocation === undefined
+        ? undefined
+        : storePin(pickupLocation);
     return {
       reply: `${minimalOrderCreatedReply(sale, shipping, pickupLocation)}\n\n${MINIMAL_PAYMENT_QUESTION}`,
       saleId: sale.saleId,
       payInStore,
+      ...(location === undefined ? {} : { location }),
     };
   }
 

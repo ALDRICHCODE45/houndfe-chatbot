@@ -232,7 +232,10 @@ import {
   money,
   plain,
   sectionTitle,
+  storeLines,
+  storePin,
 } from '../domain/whatsapp-format';
+import type { BranchInfo } from '../../chatbot-api/domain/dtos/branch.dto';
 import {
   searchWithBroadening,
   type BroadenedSearchInfo,
@@ -638,6 +641,25 @@ const ASK_TEAM_INSTRUCTIONS_FRAGMENT =
   'el resultado: nunca afirmes que el equipo ya respondió. Mientras el ' +
   'cliente espera, sigue ayudando con lo demás.';
 
+// T2 H5: store location and hours come from the backend branch read; the
+// application answers (never an address or hours from the model's memory).
+const STORE_INFO_INSTRUCTIONS_FRAGMENT =
+  '\n\nHerramienta getStoreInfo: si el cliente pregunta dónde está la tienda, ' +
+  'la dirección, el horario, si abren hoy o algún día, o si puede pasar a ' +
+  'recoger, llame getStoreInfo sin argumentos; la aplicación responde con la ' +
+  'dirección, el horario y la ubicación. Nunca escriba una dirección ni un ' +
+  'horario de memoria. Si responde store_info_unavailable, diga que por ahora ' +
+  'no puede confirmarlo';
+const STORE_INFO_ASK_TEAM_TAIL =
+  ' y ofrezca consultarlo con el equipo (askTeam).';
+
+/** T2 H2: the store block's lead («Nos encuentra en *<sucursal>*»). */
+function storeInfoReply(branch: BranchInfo, style: CustomerStyle): string {
+  const lead =
+    style.register === 'tu' ? 'Nos encuentras en ' : 'Nos encuentra en ';
+  return storeLines(lead, branch).join('\n');
+}
+
 // T3 (S4-S6): one complementary product after a cart add, validated and
 // presented by the application (never in the model's text).
 const COMPLEMENT_INSTRUCTIONS_FRAGMENT =
@@ -806,6 +828,8 @@ type RestockRun = {
 
 type ExpirationReply = { attempted: boolean; value: string | null };
 type PaymentRun = { attempted: boolean; value: MinimalPaymentReply | null };
+/** T2 H2: one branch read per run; `value` is the read the reply shows. */
+type StoreInfoRun = { attempted: boolean; value: BranchInfo | null };
 /**
  * T3: the one validated complementary suggestion of a run. `claimed` is
  * taken synchronously before any await (E5); `declined` is set by
@@ -1719,6 +1743,10 @@ export class MinimalCatalogAgentService {
                     style,
                   ),
                 }),
+            // T2 H4: the pickup order's store pin, sent after the text.
+            ...(answered.location === undefined
+              ? {}
+              : { location: answered.location }),
           };
         }
       }
@@ -1878,6 +1906,7 @@ export class MinimalCatalogAgentService {
       ...(result.interactive === undefined
         ? {}
         : { interactive: result.interactive }),
+      ...(result.location === undefined ? {} : { location: result.location }),
       ...(result.onSent === undefined ? {} : { onSent: result.onSent }),
       ...(result.silent === true ? { silent: true as const } : {}),
     };
@@ -2414,6 +2443,7 @@ export class MinimalCatalogAgentService {
         ...(result.interactive === undefined
           ? {}
           : { interactive: styleInteractivePrompt(result.interactive, style) }),
+        ...(result.location === undefined ? {} : { location: result.location }),
       };
     };
     const pendingSummary =
@@ -3359,6 +3389,11 @@ export class MinimalCatalogAgentService {
       placed !== null && placed.paid !== true
         ? { attempted: false, value: null }
         : null;
+    // T2 H2: offered whenever the client can read the branch.
+    const storeInfoRun: StoreInfoRun | null =
+      typeof this.chatbotApi.getBranch === 'function'
+        ? { attempted: false, value: null }
+        : null;
     // T4c-2a P2: asked only with 2+ known pets, pets loaded this turn, and
     // no pet already chosen for this request.
     const petChoiceRun: PetChoiceRun | null =
@@ -3504,6 +3539,10 @@ export class MinimalCatalogAgentService {
         cartInstructions +
         (askTeamRun === null ? '' : ASK_TEAM_INSTRUCTIONS_FRAGMENT) +
         (paymentRun === null ? '' : PAYMENT_INSTRUCTIONS_FRAGMENT) +
+        (storeInfoRun === null
+          ? ''
+          : STORE_INFO_INSTRUCTIONS_FRAGMENT +
+            (askTeamRun === null ? '.' : STORE_INFO_ASK_TEAM_TAIL)) +
         (paidOrder ? PAID_ORDER_INSTRUCTIONS_FRAGMENT : '') +
         (paidOrderNewCart ? PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT : '') +
         (complementRun === null ? '' : COMPLEMENT_INSTRUCTIONS_FRAGMENT) +
@@ -3546,6 +3585,7 @@ export class MinimalCatalogAgentService {
         ...this.petChoiceTools(input, petChoiceRun, memoryRun, styled, traceId),
         ...this.askTeamTools(input, askTeamRun, traceId),
         ...this.paymentTools(input, paymentRun, traceId),
+        ...this.storeInfoTools(storeInfoRun, traceId),
         ...this.complementTools(
           complementRun,
           allowedIds,
@@ -3926,6 +3966,26 @@ export class MinimalCatalogAgentService {
         persistedImages(),
       );
       return { reply };
+    }
+    const branch = storeInfoRun?.value ?? null;
+    if (branch !== null) {
+      // T2 H2/H3: the server-owned store block from the backend branch (the
+      // model's text never carries an address or hours), plus the pin when
+      // the branch has coordinates. Cart, checkout and other server replies
+      // above keep priority; a catalog listing of the same run is not shown.
+      const reply = styled(storeInfoReply(branch, style));
+      const location = storePin(branch);
+      recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+        persistedImages(),
+      );
+      return location === undefined ? { reply } : { reply, location };
     }
     // S3: exactly one product presented by this run's catalog reads (the
     // only hit, or the only one the text names) carries its photo.
@@ -4588,6 +4648,47 @@ export class MinimalCatalogAgentService {
           traceLog(
             this.logger,
             `minimal_catalog tool getPaymentDetails trace=${traceId}`,
+          );
+          return { ok: true as const, presentedByApplication: true as const };
+        },
+      }),
+    };
+  }
+
+  /**
+   * T2 H2: one store-info answer per run (pattern of getPaymentDetails):
+   * the application owns the reply. Unavailable — a failed or drifted read,
+   * or a branch with neither address nor hours — is a tool error the model
+   * answers without inventing data.
+   */
+  private storeInfoTools(run: StoreInfoRun | null, traceId: string): ToolSet {
+    const getBranch = this.chatbotApi.getBranch?.bind(this.chatbotApi);
+    if (getBranch === undefined || run === null) return {};
+    return {
+      getStoreInfo: tool({
+        description:
+          'Dirección, horario y ubicación de la tienda (sucursal). ' +
+          'Llámela cuando pregunte dónde están, a qué hora abren o cierran, ' +
+          'si abren un día o si puede pasar a recoger. La aplicación responde al cliente.',
+        inputSchema: z.strictObject({}),
+        execute: async () => {
+          if (run.attempted) return toolError('store_info_settled');
+          run.attempted = true;
+          let branch: BranchInfo;
+          try {
+            branch = await getBranch();
+          } catch (error) {
+            this.logger.warn(
+              `minimal_catalog tool getStoreInfo read failed trace=${traceId}: ${error instanceof Error ? error.name : 'unknown'}`,
+            );
+            return toolError('store_info_unavailable');
+          }
+          if (branch.address === null && branch.hours === null)
+            return toolError('store_info_unavailable');
+          run.value = branch;
+          traceLog(
+            this.logger,
+            `minimal_catalog tool getStoreInfo pin=${branch.location !== null} trace=${traceId}`,
           );
           return { ok: true as const, presentedByApplication: true as const };
         },

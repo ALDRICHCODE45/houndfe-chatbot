@@ -44,6 +44,8 @@ export interface Scenario {
   expectOrders?: number;
   /** WhatsApp contact profile name sent with every turn (S1). */
   profileName?: string;
+  /** T2 H6: the branch the fake backend reads; default with its pin. */
+  branch?: 'with_location' | 'without_location';
 }
 
 /**
@@ -400,6 +402,33 @@ export const SCENARIOS: Scenario[] = [
       },
       // At most one suggestion per 24 h: this add carries no line.
       'Agregue otra bolsa de Whiskas',
+    ],
+  },
+  {
+    id: 'store-location-hours',
+    title:
+      '«¿Dónde están y a qué hora abren?»: the backend branch, the store block and the pin (T2)',
+    customer: existing('03100'),
+    turns: [
+      {
+        text: 'Buenas tardes, ¿dónde están y a qué hora abren?',
+        expectBackend: [/^getBranch → with pin$/],
+        requireReply: /Insurgentes Sur 1000[\s\S]*\*Horario:\*/,
+      },
+    ],
+  },
+  {
+    id: 'store-location-no-pin',
+    title:
+      'Same question before staff set the coordinates: the store block, no pin (T2)',
+    customer: existing('03100'),
+    branch: 'without_location',
+    turns: [
+      {
+        text: '¿Dónde queda la tienda? ¿Abren el domingo?',
+        expectBackend: [/^getBranch → no pin$/],
+        requireReply: /Insurgentes Sur 1000/,
+      },
     ],
   },
   {

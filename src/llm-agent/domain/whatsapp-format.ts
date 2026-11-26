@@ -84,6 +84,42 @@ export function itemDetail(text: string): string {
   return `${ITEM_DETAIL_INDENT}${text}`;
 }
 
+/** T2 H3/H4: the branch as the store pin needs it (any source). */
+export interface StorePinSource {
+  name: string;
+  address: { formatted: string } | null;
+  location?: { latitude: number; longitude: number } | null;
+}
+
+/**
+ * T2 H3/H4: the WhatsApp location message for a branch: its coordinates,
+ * labelled with the plain name and address (final dots dropped, as in
+ * `storeLines`; an empty label is left out). `undefined` without
+ * coordinates (missing or null): no pin is ever invented.
+ */
+export function storePin(source: StorePinSource):
+  | {
+      latitude: number;
+      longitude: number;
+      name?: string;
+      address?: string;
+    }
+  | undefined {
+  const location = source.location;
+  if (location === null || location === undefined) return undefined;
+  const name = withoutFinalDot(plain(source.name));
+  const address =
+    source.address === null
+      ? ''
+      : withoutFinalDot(plain(source.address.formatted));
+  return {
+    latitude: location.latitude,
+    longitude: location.longitude,
+    ...(name === '' ? {} : { name }),
+    ...(address === '' ? {} : { address }),
+  };
+}
+
 /** The pickup branch as the store block needs it (structural, any source). */
 export interface StoreLinesLocation {
   name: string;
