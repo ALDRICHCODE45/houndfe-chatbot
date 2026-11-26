@@ -51,10 +51,13 @@ const PET_CHECKS = [
 ];
 
 describe('customer_profiles.pet drop migration (5900, T6d)', () => {
-  it('up locks the table, refuses while any legacy pet exists, then drops the column', () => {
+  it('up locks the table (failing fast on a held lock), refuses while any legacy pet exists, then drops the column', () => {
     const calls = run('up');
-    expect(calls).toHaveLength(3);
-    const [lock, guard, drop] = calls;
+    expect(calls).toHaveLength(4);
+    const [timeout, lock, guard, drop] = calls;
+    // Review R4: a held lock fails the deploy fast instead of queueing every
+    // profile read and write of the live bot behind it.
+    expect(timeout).toEqual(['sql', "SET LOCAL lock_timeout = '5s';"]);
     expect(lock).toEqual([
       'sql',
       'LOCK TABLE customer_profiles IN ACCESS EXCLUSIVE MODE;',

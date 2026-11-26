@@ -18,6 +18,9 @@ const CHECKS = [
 ];
 
 exports.up = (pgm) => {
+  // Fail fast if a long transaction holds the table: the deploy stops
+  // instead of queueing every live profile read and write behind the lock.
+  pgm.sql("SET LOCAL lock_timeout = '5s';");
   pgm.sql(`LOCK TABLE ${TABLE} IN ACCESS EXCLUSIVE MODE;`);
   pgm.sql(
     `DO $guard$ BEGIN
