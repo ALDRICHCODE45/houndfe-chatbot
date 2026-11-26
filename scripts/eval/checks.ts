@@ -7,7 +7,7 @@ import {
   speciesGroupsNamedIn,
 } from '../../src/llm-agent/domain/minimal-catalog-options';
 import { TITLE_EMOJI_LINE } from '../../src/llm-agent/domain/whatsapp-format';
-import type { RefusalExpectation } from './scenarios';
+import type { RefusalExpectation, ScenarioTurn } from './scenarios';
 
 /** Deterministic reply heuristics; no LLM judge. */
 export type Severity = 'pass' | 'warn' | 'fail';
@@ -211,6 +211,58 @@ export function checkExpectedReply(
       detail: `reply does not match ${String(expected)}`,
     },
   ];
+}
+
+/**
+ * Multi-pet T7: what a turn must show, read from the reply, its buttons/list
+ * line and its backend activity (pet store writes, order-history reads).
+ * Deterministic: a regular expression each, a fail when it does not match.
+ */
+export function checkTurnEvidence(
+  evidence: {
+    reply: string;
+    /** `describeInteractive` line, or null without buttons/list. */
+    interactive: string | null;
+    backend: readonly string[];
+  },
+  expect: Pick<
+    ScenarioTurn,
+    'requireReply' | 'expectInteractive' | 'expectBackend'
+  >,
+): CheckResult[] {
+  const out: CheckResult[] = [];
+  if (expect.requireReply !== undefined)
+    out.push(
+      expect.requireReply.test(evidence.reply)
+        ? { check: 'reply', severity: 'pass' }
+        : {
+            check: 'reply',
+            severity: 'fail',
+            detail: `reply does not match ${String(expect.requireReply)}`,
+          },
+    );
+  if (expect.expectInteractive !== undefined)
+    out.push(
+      evidence.interactive !== null &&
+        expect.expectInteractive.test(evidence.interactive)
+        ? { check: 'interactive', severity: 'pass' }
+        : {
+            check: 'interactive',
+            severity: 'fail',
+            detail: `${evidence.interactive ?? 'no buttons/list'} does not match ${String(expect.expectInteractive)}`,
+          },
+    );
+  for (const wanted of expect.expectBackend ?? [])
+    out.push(
+      evidence.backend.some((event) => wanted.test(event))
+        ? { check: 'backend', severity: 'pass' }
+        : {
+            check: 'backend',
+            severity: 'fail',
+            detail: `no backend call matches ${String(wanted)}`,
+          },
+    );
+  return out;
 }
 
 const SPECIES_EMOJI: ReadonlyArray<readonly [RegExp, string]> = [

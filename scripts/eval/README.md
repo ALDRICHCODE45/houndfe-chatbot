@@ -1,6 +1,6 @@
 # Conversation eval
 
-A live harness that measures conversation quality on the real customer route, `MinimalCatalogAgentService`. It uses the same system prompt, tools, deterministic confirmation gates, cart, checkout, shipping and order services as production. Only the backend is replaced: an in-memory pet-store fake (`fixtures/`) stands in for the `chatbot-api`. Run it before and after a change to compare.
+A live harness that measures conversation quality on the real customer route, `MinimalCatalogAgentService`. It uses the same system prompt, tools, deterministic confirmation gates, cart, checkout, shipping and order services as production. Only the backend is replaced: an in-memory pet-store fake (`fixtures/`) stands in for the `chatbot-api`, including the customer-pets routes. Run it before and after a change to compare. The agent is built in `harness.ts`; the SDK spec `src/llm-agent/application/eval-harness-pets.sdk.spec.ts` builds the same agent with a scripted model.
 
 ## Run
 
@@ -14,6 +14,9 @@ EVAL_MODEL=gpt-4.1-mini EVAL_MAX_USD=1.00 pnpm eval:conversation
 
 # Only some scenarios
 EVAL_SCENARIOS=buy-free-zone,decline pnpm eval:conversation
+
+# Multi-pet scenarios only (11 turns)
+EVAL_SCENARIOS=returning-customer,pets-which-pet,pets-allergy-forget,pets-reorder pnpm eval:conversation
 ```
 
 | Env var | Default | Meaning |
@@ -51,10 +54,21 @@ The checks are deterministic heuristics; there is no LLM judge. Treat them as fl
 | `species` | The customer asked about one species (their latest message naming one: a word, 🐱/🐶, or the species of a product photo) and the reply names only other species (e.g. dog food offered for a cat request, including the turn after). | — |
 | `orders` | At the end, the number of distinct checkout idempotency keys ≠ `expectOrders`. Confirm scenarios expect exactly 1; decline and denied-zone scenarios expect 0. | — |
 | `expect` | — | The reply does not match the turn's `expectReply` heuristic (e.g. `returning-customer`: tú after the restart, adult large-breed food for Luna). |
+| `reply` | The reply does not match the turn's `requireReply` (e.g. `«¿Para quién es?»`, `«(para Max)»`). | — |
+| `interactive` | The turn sent no buttons/list, or its transcript line does not match `expectInteractive`. | — |
+| `backend` | None of the turn's backend calls matches one of the turn's `expectBackend` patterns (pet store writes, order-history reads). | — |
 
-## Customer memory (S1)
+## Customer memory (S1) and pets
 
-Each scenario gets its own in-memory customer-profile store, shared by the agent and the order service like the production `customer_profiles` table. A turn with `restartBefore: true` builds a new agent and session (a bot restart) over the same profile store and backend fake; the transcript marks it `🔄 (bot restart)`. The expected register carries over the restart, the emoji rule restarts with the new session. `returning-customer` uses this: session 1 is casual tú with emojis and mentions Luna; session 2 starts with "hola".
+Each scenario gets its own world (`createEvalWorld` in `harness.ts`): an in-memory customer-profile store (shared by the agent, the order service and the prospects' local pet list, like the production `customer_profiles` table), an in-memory conversation-gate store (the durable gates, including `pet_choice`; one `ConversationGates` shared by the agent and the order service, as in production), the backend fake and its pets. A turn with `restartBefore: true` builds a new agent and session (a bot restart) over the same world; the transcript marks it `🔄 (bot restart)`.
+
+Pets go through the real `CustomerPetsService` (multi-pet T4–T6b): backend pets for a customer, a local list for a prospect uploaded after the checkout creates the Customer. The backend writes (`createPet`, `patchPet`, `archivePet`, …) appear on the turn's `Backend:` line; the harness lets the reply path's background pet capture finish before reading it. The expected register carries over the restart, the emoji rule restarts with the new session. `returning-customer` uses this: session 1 is casual tú with emojis and mentions Luna (created in the backend: the customer exists); session 2 starts with "hola" and reads Luna back from the by-phone lookup.
+
+Multi-pet scenarios (customer with Max, labrador ~3 años, and Bruno, chihuahua ~10 meses):
+
+- `pets-which-pet`: «busco croquetas para mi perro» → «¿Para quién es?» with buttons for both pets; «para Max» continues the request (a catalog search); the next cart line shows «(para Max)».
+- `pets-allergy-forget`: «Max es alérgico al pollo» → `patchPet` with the allergy; «Bruno ya no está…» → `archivePet`.
+- `pets-reorder`: «lo mismo de siempre para Max» → order history read with `?petId=` of Max.
 
 ## Fixtures
 
@@ -63,10 +77,12 @@ Each scenario gets its own in-memory customer-profile store, shared by the agent
   - Search is token overlap.
   - `evaluateCart` charges list prices.
   - Customer lookup returns either a new customer (`not_found`) or an existing customer with one saved address.
+  - An existing customer may have backend pets (`pets` in the fixture customer); its order history then starts with an order whose lines are for them (Nupec 18 kg for the first pet, Royal Canin Mini 2 kg for the second). `getOrderHistory` with `petId` keeps the orders with a line for that pet.
   - Shipping by ZIP: `03100` FREE, `04000` SURCHARGE $69, `12000` DENIED, anything else CARRIER_ONLY with the $120 credit rule.
   - Checkout is idempotent and returns folio `EV-000n`.
   - Payment details are fixed.
   - Calls outside the eval reject, so they show up in the transcript.
+- `fixtures/fake-pets-client.ts`: the customer-pets routes in memory (docs/contracts/customer-pets-bot-contract.md): list (ACTIVE by name, ARCHIVED, ALL), idempotent create (replay / `IDEMPOTENCY_KEY_CONFLICT`), PATCH / archive / restore / delete with `version` +1 per write, `PET_VERSION_CONFLICT`, `PET_ARCHIVED`, `PET_NOT_ARCHIVED`, `PET_NOT_FOUND`, `CUSTOMER_NOT_FOUND`, the 20-active limit and the `PET_NAME_DUPLICATE` warning. `evalCustomerLookup` is the by-phone lookup the pet store reads (a new customer is found once a checkout of the scenario created it). Spec: `src/llm-agent/application/eval-pets-client.spec.ts`.
 - Image turns use the T4 text format (`imageTurn` in `scenarios.ts`). If `buildProductImageTurnText` changes, update `imageTurn` to match.
 
 ## Limits
