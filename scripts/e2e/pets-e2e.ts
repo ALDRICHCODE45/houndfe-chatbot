@@ -597,10 +597,10 @@ async function step7Checkout(
   });
 
   // Same product on two lines with different pets: nothing may be created.
-  const doubled = await priceLines(ctx, '7b.samePetConflict', [
-    withPet,
-    withPet,
-  ]);
+  // evaluate-cart itself refuses duplicate lines (DUPLICATE_CART_LINE): price
+  // the product once and use that price on both lines.
+  const [priced] = await priceLines(ctx, '7b.samePetConflict', [withPet]);
+  const doubled = [priced, priced];
   try {
     const wrong = await ctx.bot.createCheckout(
       {
@@ -631,15 +631,19 @@ async function step7Checkout(
   } catch (error) {
     if (error instanceof StepFailure) throw error;
     const described = describeError(error);
-    if (described.http !== 400 || described.code !== 'INVALID_CHECKOUT_REQUEST')
+    // The backend rejects two lines of the same product before looking at
+    // their pets (live: DUPLICATE_CART_LINE); either rejection is the rule
+    // (the bot never sends them: S9 merges them into one pet-less line).
+    const rejected = ['INVALID_CHECKOUT_REQUEST', 'DUPLICATE_CART_LINE'];
+    if (described.http !== 400 || !rejected.includes(described.code ?? ''))
       runner.fail(
         '7b.samePetConflict',
-        'expected 400 INVALID_CHECKOUT_REQUEST from the backend',
+        'expected a 400 rejection (INVALID_CHECKOUT_REQUEST or DUPLICATE_CART_LINE)',
         { error: described.error },
         described.http,
         described.code,
       );
-    runner.passCode('7b.samePetConflict', 400, 'INVALID_CHECKOUT_REQUEST');
+    runner.passCode('7b.samePetConflict', 400, described.code ?? '');
   }
   return {
     saleId: checkout.sale.saleId,

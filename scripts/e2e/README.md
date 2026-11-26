@@ -253,7 +253,7 @@ Steps (each prints PASS, SKIP or FAIL with the HTTP status and the error code; t
 4. `4` create Bruno (DOG, Chihuahua, SMALL, MONTH precision → stored on the 1st) → `ageLabel` and `ageMonths` present.
 5. `5` by-phone `customer.pets` lists both, ACTIVE.
 6. `6a` PATCH Max allergies «pollo» with the version → version + 1; `6b` the stale version → `409 PET_VERSION_CONFLICT` with `currentVersion`.
-7. `7a` pickup checkout for the test customer with two different products (picked by catalog search: no variants, price, stock ≥ 2; prices from evaluate-cart), one line `petId` = Max and one without pet → 201; `7b` the same product on two lines with Max and Bruno → `400 INVALID_CHECKOUT_REQUEST`. Both SKIP when fewer than 2 products are found.
+7. `7a` pickup checkout for the test customer with two different products (picked by catalog search: no variants, price, stock ≥ 2; prices from evaluate-cart), one line `petId` = Max and one without pet → 201; `7b` the same product on two lines with Max and Bruno → rejected with `400` (`DUPLICATE_CART_LINE` on the live backend, which checks duplicate lines before pets; `INVALID_CHECKOUT_REQUEST` also accepted). Both SKIP when fewer than 2 products are found.
 8. `8a` order history `?petId=Max` contains the sale, the Max line has `pet {id, name}` and the other line `pet: null` (SKIP without a checkout); `8b` `?petId=Bruno` → `200 []`; `8c` unknown `petId` → `404 PET_NOT_FOUND`.
 9. `9a` archive Bruno with a reason → ARCHIVED; `9b` by-phone lists Max and not Bruno; `9c` restore → ACTIVE; `9d` archive again.
 10. `10a` delete Bruno with the version → 204; `10b` again → `404 PET_NOT_FOUND`.
