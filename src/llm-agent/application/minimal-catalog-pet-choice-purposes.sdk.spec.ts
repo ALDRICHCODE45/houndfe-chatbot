@@ -1407,6 +1407,7 @@ describe('T4c-2b-fix-2 (S3, S10): pet facts never dropped silently nor confirmed
 
   describe('M3: an answer that wrote nothing does not block rememberPetDetails', () => {
     it('pin: pets unavailable on a row with the message → the message continues and rememberPetDetails «Brunito» is recorded (not silenced)', async () => {
+      const log = jest.spyOn(Logger.prototype, 'log');
       const lookup: Parameters<typeof world>[0] = {
         current: customer([pet(), max()]),
       };
@@ -1428,11 +1429,13 @@ describe('T4c-2b-fix-2 (S3, S10): pet facts never dropped silently nor confirmed
       await flush();
       expect(decision.reply).toBe('Le recomiendo croquetas de adulto.');
       expect(h.lastUser()).toBe(message);
-      expect(h.toolOutputs).not.toContainEqual({
-        ok: true,
-        remembered: false,
-      });
-      expect(h.toolOutputs).toEqual([{ ok: true, remembered: true }]);
+      // Not silenced: the capture is attempted (pets read-only this turn,
+      // logged) and, since nothing could be stored, the tool says so
+      // honestly (T6b review R4) instead of claiming a save.
+      expect(JSON.stringify(log.mock.calls)).toContain(
+        'pet facts not stored: pets unavailable',
+      );
+      expect(h.toolOutputs).toEqual([{ ok: true, remembered: false }]);
     });
 
     it('still holding (K4): after a successful «es Bruno» the continued turn does not write Brunito again', async () => {

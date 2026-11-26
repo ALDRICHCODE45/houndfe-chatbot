@@ -5137,7 +5137,7 @@ export class MinimalCatalogAgentService {
           const capture = (async () => pets.capture(senderId, pet))();
           const outcome = await this.withinPetBudget(
             capture.then(
-              () => ({ failed: false as const }),
+              (stored) => ({ failed: false as const, stored }),
               (error: unknown) => ({ failed: true as const, error }),
             ),
           );
@@ -5153,6 +5153,9 @@ export class MinimalCatalogAgentService {
             };
           }
           if (outcome.failed) throw outcome.error;
+          // T6b review R4: the pet store could not keep it this turn.
+          if (outcome.stored === 'not_stored')
+            return { ok: true as const, remembered: false as const };
           return { ok: true as const, remembered: true as const };
         },
       }),

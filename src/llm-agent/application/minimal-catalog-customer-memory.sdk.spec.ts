@@ -1016,6 +1016,42 @@ describe('T4b-fix A2-A4: the pet store never holds the reply', () => {
   });
 });
 
+describe('T6b review R4: rememberPetDetails never claims a capture the store did not keep', () => {
+  it('a capture the pet store reports as not stored → remembered false', async () => {
+    const stub = {
+      prepare: jest.fn(() => Promise.resolve()),
+      capture: jest.fn(() => Promise.resolve('not_stored' as const)),
+      promptLines: jest.fn(() => null),
+      afterCheckout: jest.fn(() => Promise.resolve()),
+    };
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, stub);
+    await h.turn('mi perrita Luna es labrador', [
+      [
+        call('rememberPetDetails', { name: 'Luna', breed: 'labrador' }),
+        say('Gracias.'),
+      ],
+    ]);
+    expect(h.toolOutputs).toEqual([{ ok: true, remembered: false }]);
+  });
+
+  it('a stored capture still answers remembered true', async () => {
+    const stub = {
+      prepare: jest.fn(() => Promise.resolve()),
+      capture: jest.fn(() => Promise.resolve()),
+      promptLines: jest.fn(() => null),
+      afterCheckout: jest.fn(() => Promise.resolve()),
+    };
+    const h = harness(new InMemoryCustomerProfileStore(), undefined, stub);
+    await h.turn('mi perrita Luna es labrador', [
+      [
+        call('rememberPetDetails', { name: 'Luna', breed: 'labrador' }),
+        say('¡Qué linda!'),
+      ],
+    ]);
+    expect(h.toolOutputs).toEqual([{ ok: true, remembered: true }]);
+  });
+});
+
 describe('T4c-1: allergies, forget one pet, forget my data (S5, S7)', () => {
   const CUSTOMER_ID = '5c1e9a02-77d4-4b8a-a1f3-0e2d4c6b8a90';
   const BRUNO_ID = '8d0e0f6e-5b87-4c2c-8d3a-1f6f0c7a9b11';

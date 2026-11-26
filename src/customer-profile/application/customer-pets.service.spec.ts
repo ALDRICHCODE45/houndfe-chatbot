@@ -1378,10 +1378,13 @@ describe('CustomerPetsService (T4b-fix-2-C)', () => {
         const upsert = jest.spyOn(h.profileStore, 'upsert');
         const log = jest.spyOn(Logger.prototype, 'log');
         await h.service.prepare(SENDER);
-        await h.service.capture(
-          SENDER,
-          extractPetFacts('mi perrita Luna es labrador'),
-        );
+        // Review R4: the caller is told nothing was stored.
+        await expect(
+          h.service.capture(
+            SENDER,
+            extractPetFacts('mi perrita Luna es labrador'),
+          ),
+        ).resolves.toBe('not_stored');
         await h.service.captureAllergy(SENDER, {
           name: 'Luna',
           allergies: 'pollo',

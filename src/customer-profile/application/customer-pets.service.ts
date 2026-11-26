@@ -103,6 +103,10 @@ export interface AmbiguousPetEntry {
   candidates: KnownPet[];
 }
 
+/** T6b review R4: a capture whose facts could not be stored this turn
+ *  (pets read-only or unknown); `undefined` otherwise. */
+export type PetCaptureOutcome = 'not_stored';
+
 /**
  * G2: what `forgetPet` did. `archived` (backend), `removed` (local entry):
  * forgotten. `none` / `ambiguous`: 0 or 2+
@@ -314,11 +318,19 @@ export class CustomerPetsService {
    * to the matched pet. Serialized per sender (B5): overlapping captures
    * never lose an entry.
    */
-  async capture(senderId: string, facts: PetFacts): Promise<void> {
+  async capture(
+    senderId: string,
+    facts: PetFacts,
+  ): Promise<PetCaptureOutcome | void> {
     if (!hasPetFacts(facts) || this.profiles.isForgotten(senderId)) return;
-    await this.serialized(senderId, (fence) =>
-      this.captureNow(senderId, facts, fence, false),
-    );
+    // T6b review R4: tells the caller when nothing could be stored this
+    // turn, so rememberPetDetails never claims a save that did not happen.
+    let outcome: PetCaptureOutcome | undefined;
+    await this.serialized(senderId, async (fence) => {
+      outcome =
+        (await this.captureNow(senderId, facts, fence, false)) ?? undefined;
+    });
+    return outcome;
   }
 
   /**
@@ -335,9 +347,9 @@ export class CustomerPetsService {
       allergies: statement.allergies,
     };
     if (!hasPetFacts(facts) || this.profiles.isForgotten(senderId)) return;
-    await this.serialized(senderId, (fence) =>
-      this.captureNow(senderId, facts, fence, true),
-    );
+    await this.serialized(senderId, async (fence) => {
+      await this.captureNow(senderId, facts, fence, true);
+    });
   }
 
   /**
@@ -802,7 +814,7 @@ export class CustomerPetsService {
     facts: PetFacts,
     fence: Fence,
     knownOnly: boolean,
-  ): Promise<void> {
+  ): Promise<PetCaptureOutcome | void> {
     if (this.profiles.isForgotten(senderId)) return;
     try {
       if (!this.cache.has(senderId)) await this.load(senderId, false, fence);
@@ -818,11 +830,11 @@ export class CustomerPetsService {
         this.logger.log(
           `pet ${knownOnly ? 'allergies' : 'facts'} not stored: pets ${scope.kind}`,
         );
-        return;
+        return 'not_stored';
       }
       if (!state.localKnown) {
         this.logger.log('pet facts not stored: local pets unknown');
-        return;
+        return 'not_stored';
       }
       const candidates = this.candidates(state);
       if (knownOnly) {
