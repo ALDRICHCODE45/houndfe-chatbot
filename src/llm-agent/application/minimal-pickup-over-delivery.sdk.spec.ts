@@ -62,7 +62,7 @@ const DELIVERY_SUMMARY = /^\*Confirm[ae] (sus|tus) datos de entrega\*$/m;
 const ORDER_ENDING =
   '¿Está todo bien? Responda *SÍ* para crear el pedido, o dígame qué cambiar.';
 
-async function setup() {
+async function setup(options: { branch?: true } = {}) {
   const store = new InMemoryConversationStore();
   const api = {
     searchCatalog: jest.fn(async () => [
@@ -140,6 +140,16 @@ async function setup() {
       updatedAt: '2026-10-01T00:00:00.000Z',
     })),
   };
+  // T2-fix J4: the branch read (getStoreInfo) next to the checkout.
+  if (options.branch === true)
+    Object.assign(api, {
+      getBranch: jest.fn(async () => ({
+        name: 'Sucursal Centro',
+        address: null,
+        hours: { timeZone: 'America/Mexico_City', days: [], summary: '9 a 7' },
+        location: { latitude: 19.4, longitude: -99.1 },
+      })),
+    });
   const client = api as unknown as ChatbotApiClient;
   const config = {
     get: (key: string) =>
@@ -163,8 +173,10 @@ async function setup() {
   );
   let script: unknown[] = [];
   let calls = 0;
+  const offered: string[][] = [];
   const generate: GenerateTextFn = async (input) => {
     calls += 1;
+    offered.push(Object.keys(input.tools ?? {}));
     return generateText({
       ...input,
       model: new MockLanguageModelV4({ doGenerate: script } as never),
@@ -242,6 +254,7 @@ async function setup() {
     turn,
     presentDelivery,
     llmCalls: () => calls,
+    lastTools: () => offered.at(-1) ?? [],
   };
 }
 
@@ -346,5 +359,56 @@ describe('S2 (N17) store pickup dismisses a pending delivery-data confirmation',
       '*¡Pedido registrado!* ✅\n*Folio:* B-42\n',
     );
     expect(h.api.createCheckout).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * T2-fix J4: while a checkout step is pending (delivery-data summary, order
+ * summary, the delivery-or-pickup question), «paso a recoger» is a pickup
+ * choice: getStoreInfo and its instruction are not offered, so the pickup
+ * is selected exactly as before and no store block or pin is added.
+ */
+describe('T2-fix J4: «paso a recoger» during checkout selects pickup', () => {
+  const pickupAfterDelivery = async (branch: boolean) => {
+    const h = await setup(branch ? { branch: true } : {});
+    await h.presentDelivery();
+    const pickup = await h.send('paso a recoger', [
+      call('chooseStorePickup'),
+      say(),
+    ]);
+    return { h, pickup };
+  };
+
+  it('pending delivery-data summary: pickup selected as before, no store tool, block or pin', async () => {
+    const before = await pickupAfterDelivery(false);
+    const after = await pickupAfterDelivery(true);
+    expect(after.h.lastTools()).toContain('chooseStorePickup');
+    expect(after.h.lastTools()).not.toContain('getStoreInfo');
+    expect(after.pickup.reply).toBe(before.pickup.reply);
+    expect(after.pickup.reply).toContain(
+      '*Envío:* recoge en tienda — sin costo',
+    );
+    expect(after.pickup.reply).not.toContain('Sucursal Centro');
+    expect(after.pickup).not.toHaveProperty('location');
+  });
+
+  it('pending order summary: no store tool', async () => {
+    const { h } = await pickupAfterDelivery(true);
+    await h.send('¿dónde están?', [say()]);
+    expect(h.lastTools()).not.toContain('getStoreInfo');
+  });
+
+  it('after the delivery-or-pickup question: no store tool', async () => {
+    const h = await setup({ branch: true });
+    const asked = await h.send('quiero comprar');
+    expect(asked.interactive).toBeDefined();
+    await h.send('paso a recoger', [call('chooseStorePickup'), say()]);
+    expect(h.lastTools()).not.toContain('getStoreInfo');
+  });
+
+  it('nothing pending: the store tool is offered', async () => {
+    const h = await setup({ branch: true });
+    await h.send('hola', [say()]);
+    expect(h.lastTools()).toContain('getStoreInfo');
   });
 });

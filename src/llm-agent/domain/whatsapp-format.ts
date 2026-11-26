@@ -8,6 +8,8 @@
  * `TITLE_EMOJI_LINE`), while every other emoji follows the customer's style.
  */
 
+import type { CustomerReplyLocation } from './customer-reply';
+
 /** S3: the only emojis a server-owned title may carry. */
 export const TITLE_EMOJI = Object.freeze({
   summary: '🧾',
@@ -84,6 +86,28 @@ export function itemDetail(text: string): string {
   return `${ITEM_DETAIL_INDENT}${text}`;
 }
 
+/** T3-fix E8: `text` within `max` characters, cut between words with «…». */
+export function truncateOnWord(text: string, max: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  const head = chars.slice(0, max).join('');
+  const cut = chars[max] === ' ' ? head : head.replace(/\s+\S*$/, '');
+  return `${(cut === '' ? head : cut).trimEnd()}…`;
+}
+
+/**
+ * T2-fix J8: the store pin's labels are short captions under the map: the
+ * branch name is capped at this many characters and the address at
+ * `STORE_PIN_ADDRESS_MAX_CHARS`, cut on a word boundary with «…» (a long
+ * backend value never makes Meta refuse the pin).
+ */
+export const STORE_PIN_NAME_MAX_CHARS = 100;
+export const STORE_PIN_ADDRESS_MAX_CHARS = 250;
+
+/** T2-fix J8: `text` in at most `max` characters, the «…» included. */
+const capLabel = (text: string, max: number): string =>
+  Array.from(text).length <= max ? text : truncateOnWord(text, max - 1);
+
 /** T2 H3/H4: the branch as the store pin needs it (any source). */
 export interface StorePinSource {
   name: string;
@@ -94,24 +118,25 @@ export interface StorePinSource {
 /**
  * T2 H3/H4: the WhatsApp location message for a branch: its coordinates,
  * labelled with the plain name and address (final dots dropped, as in
- * `storeLines`; an empty label is left out). `undefined` without
- * coordinates (missing or null): no pin is ever invented.
+ * `storeLines`; capped, T2-fix J8; an empty label is left out). `undefined`
+ * without coordinates (missing or null): no pin is ever invented.
  */
-export function storePin(source: StorePinSource):
-  | {
-      latitude: number;
-      longitude: number;
-      name?: string;
-      address?: string;
-    }
-  | undefined {
+export function storePin(
+  source: StorePinSource,
+): CustomerReplyLocation | undefined {
   const location = source.location;
   if (location === null || location === undefined) return undefined;
-  const name = withoutFinalDot(plain(source.name));
+  const name = capLabel(
+    withoutFinalDot(plain(source.name)),
+    STORE_PIN_NAME_MAX_CHARS,
+  );
   const address =
     source.address === null
       ? ''
-      : withoutFinalDot(plain(source.address.formatted));
+      : capLabel(
+          withoutFinalDot(plain(source.address.formatted)),
+          STORE_PIN_ADDRESS_MAX_CHARS,
+        );
   return {
     latitude: location.latitude,
     longitude: location.longitude,

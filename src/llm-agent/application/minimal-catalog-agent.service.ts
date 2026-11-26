@@ -108,6 +108,7 @@ import {
   shortMxn,
   type CustomerReply,
   type CustomerReplyInteractive,
+  type CustomerReplyLocation,
   type CustomerReplyMedia,
   type InteractiveChoiceContext,
   type InteractiveReplyIntent,
@@ -234,8 +235,11 @@ import {
   sectionTitle,
   storeLines,
   storePin,
+  truncateOnWord,
 } from '../domain/whatsapp-format';
 import type { BranchInfo } from '../../chatbot-api/domain/dtos/branch.dto';
+import { ChatbotApiError } from '../../chatbot-api/domain/errors';
+import { sanitizeErrorText } from '../../common/log-safe';
 import {
   searchWithBroadening,
   type BroadenedSearchInfo,
@@ -641,17 +645,75 @@ const ASK_TEAM_INSTRUCTIONS_FRAGMENT =
   'el resultado: nunca afirmes que el equipo ya respondió. Mientras el ' +
   'cliente espera, sigue ayudando con lo demás.';
 
-// T2 H5: store location and hours come from the backend branch read; the
-// application answers (never an address or hours from the model's memory).
-const STORE_INFO_INSTRUCTIONS_FRAGMENT =
-  '\n\nHerramienta getStoreInfo: si el cliente pregunta dónde está la tienda, ' +
-  'la dirección, el horario, si abren hoy o algún día, o si puede pasar a ' +
-  'recoger, llame getStoreInfo sin argumentos; la aplicación responde con la ' +
-  'dirección, el horario y la ubicación. Nunca escriba una dirección ni un ' +
-  'horario de memoria. Si responde store_info_unavailable, diga que por ahora ' +
-  'no puede confirmarlo';
-const STORE_INFO_ASK_TEAM_TAIL =
-  ' y ofrezca consultarlo con el equipo (askTeam).';
+/**
+ * T2 H5 / T2-fix J2 (one helper, the whole fragment): store location and
+ * hours come from the backend branch read; the application appends the
+ * store block to the reply (the model never writes an address or hours).
+ * Offered only with the tool (see `storeInfoRunFor`).
+ */
+function storeInfoInstructions(askTeamAvailable: boolean): string {
+  return (
+    '\n\nHerramienta getStoreInfo: si el cliente pregunta dónde está la tienda, ' +
+    'la dirección, el horario, si abren hoy o algún día, o si puede pasar a ' +
+    'recoger, llame getStoreInfo sin argumentos; la aplicación agrega a su ' +
+    'mensaje la dirección, el horario y la ubicación. Nunca escriba una ' +
+    'dirección ni un horario de memoria: conteste lo demás que haya pedido y ' +
+    'deje esa parte a la aplicación. Si responde store_info_deferred, la ' +
+    'aplicación lo contestará después: no lo mencione. Si responde ' +
+    'store_info_unavailable, la aplicación avisa que por ahora no puede ' +
+    'confirmarlo' +
+    (askTeamAvailable ? ' y ofrece consultarlo con el equipo (askTeam).' : '.')
+  );
+}
+
+/**
+ * T2-fix J5: the server line when the branch cannot be read (or has
+ * neither address nor hours), in place of any model text about the store;
+ * `offerTeam` adds the askTeam offer (the route exists and was not used).
+ */
+const STORE_INFO_UNAVAILABLE_LINE =
+  'Por ahora no puedo confirmar la dirección ni el horario de la sucursal.';
+function storeInfoUnavailableLine(
+  style: CustomerStyle,
+  offerTeam: boolean,
+): string {
+  if (!offerTeam) return STORE_INFO_UNAVAILABLE_LINE;
+  const offer =
+    style.register === 'tu'
+      ? 'Si quieres, lo consulto con el equipo.'
+      : 'Si quiere, lo consulto con el equipo.';
+  return `${STORE_INFO_UNAVAILABLE_LINE} ${offer}`;
+}
+
+/** T2-fix J6: a failed branch read for the log (status and error code). */
+function describeBranchReadError(error: unknown): string {
+  if (!(error instanceof Error)) return 'unknown';
+  if (!(error instanceof ChatbotApiError)) return error.name;
+  const code =
+    error.errorCode === null
+      ? 'none'
+      : sanitizeErrorText(error.errorCode).slice(0, 64);
+  return `${error.name} status=${error.statusCode ?? 'none'} errorCode=${code}`;
+}
+
+/** T2-fix J2: tools whose call never answers the customer by itself. */
+const STORE_NEUTRAL_TOOLS: ReadonlySet<string> = new Set([
+  'getStoreInfo',
+  'declineSuggestions',
+]);
+
+/** T2-fix J2: the run called a tool that answers something besides the store. */
+function answeringToolCalled(result: {
+  steps?: ReadonlyArray<{ toolCalls?: ReadonlyArray<{ toolName?: unknown }> }>;
+}): boolean {
+  return (result.steps ?? []).some((step) =>
+    (step.toolCalls ?? []).some(
+      (call) =>
+        typeof call.toolName !== 'string' ||
+        !STORE_NEUTRAL_TOOLS.has(call.toolName),
+    ),
+  );
+}
 
 /** T2 H2: the store block's lead («Nos encuentra en *<sucursal>*»). */
 function storeInfoReply(branch: BranchInfo, style: CustomerStyle): string {
@@ -687,15 +749,6 @@ const COMPLEMENT_PRICE_MAX_AGE_MS = 24 * 60 * 60_000;
  * this many characters, cut on a word boundary with «…».
  */
 const COMPLEMENT_NAME_MAX_CHARS = 80;
-
-/** T3-fix E8: `text` within `max` characters, cut between words with «…». */
-function truncateOnWord(text: string, max: number): string {
-  const chars = Array.from(text);
-  if (chars.length <= max) return text;
-  const head = chars.slice(0, max).join('');
-  const cut = chars[max] === ' ' ? head : head.replace(/\s+\S*$/, '');
-  return `${(cut === '' ? head : cut).trimEnd()}…`;
-}
 
 /** T3 (D3): the server-owned suggestion line, in the customer's style. */
 function complementLine(
@@ -828,8 +881,18 @@ type RestockRun = {
 
 type ExpirationReply = { attempted: boolean; value: string | null };
 type PaymentRun = { attempted: boolean; value: MinimalPaymentReply | null };
-/** T2 H2: one branch read per run; `value` is the read the reply shows. */
-type StoreInfoRun = { attempted: boolean; value: BranchInfo | null };
+/**
+ * T2 H2: one branch read per run. `read` is the client's getBranch (the run
+ * exists only when the tool is offered: the single gate is
+ * `storeInfoRunFor`); `value` is the read the reply shows; `unavailable`
+ * marks a failed or unconfigured read (T2-fix J5).
+ */
+type StoreInfoRun = {
+  read: () => Promise<BranchInfo>;
+  attempted: boolean;
+  value: BranchInfo | null;
+  unavailable: boolean;
+};
 /**
  * T3: the one validated complementary suggestion of a run. `claimed` is
  * taken synchronously before any await (E5); `declined` is set by
@@ -1869,6 +1932,8 @@ export class MinimalCatalogAgentService {
       ...(result.interactive === undefined
         ? {}
         : { interactive: styleInteractivePrompt(result.interactive, style) }),
+      // T2-fix J7: the store pin of a pickup order this step reached.
+      ...(result.location === undefined ? {} : { location: result.location }),
     };
   }
 
@@ -3031,6 +3096,7 @@ export class MinimalCatalogAgentService {
       reply: string;
       onSent?: () => void;
       interactive?: CustomerReplyInteractive;
+      location?: CustomerReplyLocation;
     },
   ): MinimalCatalogAgentDecision {
     const reply = applyCustomerStyle(
@@ -3051,6 +3117,8 @@ export class MinimalCatalogAgentService {
       ...(result.interactive === undefined
         ? {}
         : { interactive: result.interactive }),
+      // T2-fix J7: forwarded like the other optional parts.
+      ...(result.location === undefined ? {} : { location: result.location }),
     });
   }
 
@@ -3389,11 +3457,13 @@ export class MinimalCatalogAgentService {
       placed !== null && placed.paid !== true
         ? { attempted: false, value: null }
         : null;
-    // T2 H2: offered whenever the client can read the branch.
-    const storeInfoRun: StoreInfoRun | null =
-      typeof this.chatbotApi.getBranch === 'function'
-        ? { attempted: false, value: null }
-        : null;
+    // T2 H2: offered whenever the client can read the branch; T2-fix J4:
+    // not while a checkout step is pending.
+    const storeInfoRun = await this.storeInfoRunFor(
+      input.senderId,
+      turns,
+      placed,
+    );
     // T4c-2a P2: asked only with 2+ known pets, pets loaded this turn, and
     // no pet already chosen for this request.
     const petChoiceRun: PetChoiceRun | null =
@@ -3541,8 +3611,7 @@ export class MinimalCatalogAgentService {
         (paymentRun === null ? '' : PAYMENT_INSTRUCTIONS_FRAGMENT) +
         (storeInfoRun === null
           ? ''
-          : STORE_INFO_INSTRUCTIONS_FRAGMENT +
-            (askTeamRun === null ? '.' : STORE_INFO_ASK_TEAM_TAIL)) +
+          : storeInfoInstructions(askTeamRun !== null)) +
         (paidOrder ? PAID_ORDER_INSTRUCTIONS_FRAGMENT : '') +
         (paidOrderNewCart ? PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT : '') +
         (complementRun === null ? '' : COMPLEMENT_INSTRUCTIONS_FRAGMENT) +
@@ -3585,7 +3654,13 @@ export class MinimalCatalogAgentService {
         ...this.petChoiceTools(input, petChoiceRun, memoryRun, styled, traceId),
         ...this.askTeamTools(input, askTeamRun, traceId),
         ...this.paymentTools(input, paymentRun, traceId),
-        ...this.storeInfoTools(storeInfoRun, traceId),
+        ...this.storeInfoTools(
+          storeInfoRun,
+          // T2-fix J3: the which-pet / memory question keeps the request
+          // and re-runs it after the answer: the store part waits for it.
+          () => petChoiceRun?.value != null || memoryRun.value !== null,
+          traceId,
+        ),
         ...this.complementTools(
           complementRun,
           allowedIds,
@@ -3648,15 +3723,40 @@ export class MinimalCatalogAgentService {
         'agent_retry',
       );
     }
+    // T2-fix J2/J3/J5: the store part of this run (the branch block and its
+    // pin, or the fixed unavailable line), appended after whichever reply
+    // wins the turn; buttons stay attached. A turn that did not call
+    // getStoreInfo (or got store_info_deferred) has none, so every reply
+    // below is then byte-identical to before.
+    const storePart = this.storeReplyPart(
+      storeInfoRun,
+      style,
+      styled,
+      askTeamRun !== null && askTeamRun.value === null,
+    );
+    const withStore = (reply: string): string =>
+      storePart === null ? reply : `${reply}\n\n${storePart.text}`;
+    const storeLocation: { location?: CustomerReplyLocation } =
+      storePart?.location === undefined ? {} : { location: storePart.location };
+    // A text fallback stands in for the reply when the controls cannot be
+    // sent, so it carries the store part too.
+    const interactiveWithStore = (
+      interactive: CustomerReplyInteractive,
+    ): CustomerReplyInteractive =>
+      storePart === null || interactive.textFallback === undefined
+        ? interactive
+        : { ...interactive, textFallback: withStore(interactive.textFallback) };
     const prepared = restockRun?.outcome ?? null;
     const expirationResult = expirationReply?.value ?? null;
     if (expirationResult !== null || prepared !== null) {
       // EXPIRATION takes priority; an unsent RESTOCK offer must not be armed.
-      const reply = styled(
-        expirationResult ??
-          (prepared?.kind === 'offer'
-            ? prepared.question
-            : RESTOCK_CAUTIOUS_REPLY),
+      const reply = withStore(
+        styled(
+          expirationResult ??
+            (prepared?.kind === 'offer'
+              ? prepared.question
+              : RESTOCK_CAUTIOUS_REPLY),
+        ),
       );
       recordTurn(
         input.senderId,
@@ -3669,14 +3769,14 @@ export class MinimalCatalogAgentService {
         persistedImages(),
       );
       return expirationResult === null && prepared?.kind === 'offer'
-        ? { reply, onSent: prepared.onSent }
-        : { reply };
+        ? { reply, onSent: prepared.onSent, ...storeLocation }
+        : { reply, ...storeLocation };
     }
     const paymentReply = paymentRun?.value ?? null;
     if (paymentReply !== null) {
       // The server-owned bank details (or the unavailable notice); model text
       // never carries them.
-      const reply = styled(paymentReply.reply);
+      const reply = withStore(styled(paymentReply.reply));
       recordTurn(
         input.senderId,
         [
@@ -3690,12 +3790,12 @@ export class MinimalCatalogAgentService {
           ? {}
           : { paymentOffer: paymentReply.paymentOffer },
       );
-      return { reply };
+      return { reply, ...storeLocation };
     }
     const teamReply = askTeamRun?.value ?? null;
     if (teamReply !== null) {
       // S6: the server-owned create outcome; model text never claims it.
-      const reply = styled(teamReply);
+      const reply = withStore(styled(teamReply));
       recordTurn(
         input.senderId,
         [
@@ -3706,7 +3806,7 @@ export class MinimalCatalogAgentService {
         persistedCartContext(),
         persistedImages(),
       );
-      return { reply };
+      return { reply, ...storeLocation };
     }
     // T4c-2b Q3: a statement naming a diminutive («mi perrito Brunito…»)
     // of a known, just-forgotten or (K3) archived pet asks before any write;
@@ -3742,7 +3842,9 @@ export class MinimalCatalogAgentService {
       // model's own text is dropped. The question and the original request
       // are kept in the durable pet_choice gate (T4c-2b: or the forget /
       // diminutive question and its data).
-      const reply = styled(petChoice.reply);
+      // T2-fix J3: a store block the run already promised (getStoreInfo
+      // before the question) rides on it; asked after, it is deferred.
+      const reply = withStore(styled(petChoice.reply));
       recordTurn(
         input.senderId,
         [
@@ -3754,13 +3856,17 @@ export class MinimalCatalogAgentService {
         persistedImages(),
         { petChoice: petChoice.choice },
       );
-      return { reply, interactive: petChoice.interactive };
+      return {
+        reply,
+        interactive: interactiveWithStore(petChoice.interactive),
+        ...storeLocation,
+      };
     }
     const reorder = reorderRun?.value ?? null;
     if (reorder !== null) {
       // S2: the server-owned reorder presentation; its buttons and its offer
       // belong to this reply only.
-      const reply = styled(reorder.reply);
+      const reply = withStore(styled(reorder.reply));
       for (const productId of reorder.productIds) currentIds.add(productId);
       recordTurn(
         input.senderId,
@@ -3773,13 +3879,14 @@ export class MinimalCatalogAgentService {
         persistedImages(),
         reorder.offer === null ? {} : { reorderOffer: reorder.offer },
       );
-      if (reorder.offer === null) return { reply };
+      if (reorder.offer === null) return { reply, ...storeLocation };
       const interactive = reorderConfirmationButtons(
         reorder.offer.reference,
         styled(REORDER_BUTTONS_PROMPT),
       );
       return {
         reply,
+        ...storeLocation,
         interactive:
           interactive.type === 'buttons'
             ? {
@@ -3815,10 +3922,12 @@ export class MinimalCatalogAgentService {
         (this.hasInvalidCartToolCall(result)
           ? CART_OPERATION_CLARIFICATION
           : null);
-      const reply = styled(
-        cartPart === null
-          ? checkoutResult.reply
-          : `${cartPart}\n\n${checkoutResult.reply}`,
+      const reply = withStore(
+        styled(
+          cartPart === null
+            ? checkoutResult.reply
+            : `${cartPart}\n\n${checkoutResult.reply}`,
+        ),
       );
       recordTurn(
         input.senderId,
@@ -3831,8 +3940,8 @@ export class MinimalCatalogAgentService {
         persistedImages(),
       );
       return checkoutResult.onSent === undefined
-        ? { reply }
-        : { reply, onSent: checkoutResult.onSent };
+        ? { reply, ...storeLocation }
+        : { reply, onSent: checkoutResult.onSent, ...storeLocation };
     }
     const continued =
       cartReply.mutated === true && priorShipping !== null
@@ -3843,7 +3952,7 @@ export class MinimalCatalogAgentService {
           )
         : null;
     if (continued !== null) {
-      const reply = styled(continued.reply);
+      const reply = withStore(styled(continued.reply));
       recordTurn(
         input.senderId,
         [
@@ -3855,8 +3964,8 @@ export class MinimalCatalogAgentService {
         persistedImages(),
       );
       return continued.onSent === undefined
-        ? { reply }
-        : { reply, onSent: continued.onSent };
+        ? { reply, ...storeLocation }
+        : { reply, onSent: continued.onSent, ...storeLocation };
     }
     if (cartReply.value !== null) {
       // S2: a cart summary closes with the next-step question and buttons.
@@ -3878,14 +3987,16 @@ export class MinimalCatalogAgentService {
       // with `line\n\n` inserted before the styled next-step question
       // (applyCustomerStyle works line by line and the question carries no
       // emoji, so styling the two parts apart equals styling them together).
-      const reply =
+      // T2-fix J3: the store part follows the whole cart reply.
+      const reply = withStore(
         line === null
           ? styled(
               invites
                 ? `${cartReply.value}\n\n${MINIMAL_CART_NEXT_STEP_QUESTION}`
                 : cartReply.value,
             )
-          : `${styled(cartReply.value)}\n\n${line}\n\n${styled(MINIMAL_CART_NEXT_STEP_QUESTION)}`;
+          : `${styled(cartReply.value)}\n\n${line}\n\n${styled(MINIMAL_CART_NEXT_STEP_QUESTION)}`,
+      );
       if (line !== null)
         await this.pauseSuggestions(input.senderId, COMPLEMENT_INTERVAL_MS);
       const nextStep = invites
@@ -3924,8 +4035,9 @@ export class MinimalCatalogAgentService {
         ...(list === null
           ? nextStep === undefined
             ? {}
-            : { interactive: nextStep }
-          : { interactive: list.interactive }),
+            : { interactive: interactiveWithStore(nextStep) }
+          : { interactive: interactiveWithStore(list.interactive) }),
+        ...storeLocation,
       };
     }
     if (this.hasInvalidCartToolCall(result)) {
@@ -3936,7 +4048,7 @@ export class MinimalCatalogAgentService {
         this.logger,
         `minimal_catalog tool cart argument rejected before execute trace=${traceId}`,
       );
-      const reply = styled(CART_OPERATION_CLARIFICATION);
+      const reply = withStore(styled(CART_OPERATION_CLARIFICATION));
       recordTurn(
         input.senderId,
         [
@@ -3947,14 +4059,14 @@ export class MinimalCatalogAgentService {
         persistedCartContext(),
         persistedImages(),
       );
-      return { reply };
+      return { reply, ...storeLocation };
     }
     if (this.hasInvalidToolCall(result, CHECKOUT_TOOL_NAMES)) {
       traceLog(
         this.logger,
         `minimal_catalog tool checkout argument rejected before execute trace=${traceId}`,
       );
-      const reply = styled(CHECKOUT_TOOL_CLARIFICATION);
+      const reply = withStore(styled(CHECKOUT_TOOL_CLARIFICATION));
       recordTurn(
         input.senderId,
         [
@@ -3965,27 +4077,7 @@ export class MinimalCatalogAgentService {
         persistedCartContext(),
         persistedImages(),
       );
-      return { reply };
-    }
-    const branch = storeInfoRun?.value ?? null;
-    if (branch !== null) {
-      // T2 H2/H3: the server-owned store block from the backend branch (the
-      // model's text never carries an address or hours), plus the pin when
-      // the branch has coordinates. Cart, checkout and other server replies
-      // above keep priority; a catalog listing of the same run is not shown.
-      const reply = styled(storeInfoReply(branch, style));
-      const location = storePin(branch);
-      recordTurn(
-        input.senderId,
-        [
-          { role: 'user', content: input.text },
-          { role: 'assistant', content: reply },
-        ],
-        [...currentIds],
-        persistedCartContext(),
-        persistedImages(),
-      );
-      return location === undefined ? { reply } : { reply, location };
+      return { reply, ...storeLocation };
     }
     // S3: exactly one product presented by this run's catalog reads (the
     // only hit, or the only one the text names) carries its photo.
@@ -4025,8 +4117,10 @@ export class MinimalCatalogAgentService {
           `minimal_catalog cart_pending armed=stated_count trace=${traceId}`,
         );
       // L31: one emoji on the closing only when the customer uses them.
-      const reply = limitCustomerEmojis(rendered.text, style);
-      const media = photoFor(reply);
+      const options = limitCustomerEmojis(rendered.text, style);
+      const media = photoFor(options);
+      // T2-fix J2: the options first, then the store part.
+      const reply = withStore(options);
       recordTurn(
         input.senderId,
         [
@@ -4045,7 +4139,31 @@ export class MinimalCatalogAgentService {
               },
             },
       );
-      return media === undefined ? { reply } : { reply, media };
+      return media === undefined
+        ? { reply, ...storeLocation }
+        : { reply, media, ...storeLocation };
+    }
+    // T2-fix J2/J5: the reply would be the model's text. The store part
+    // alone answers when the read was unavailable (the model's text about
+    // the store is never sent, J5) or when getStoreInfo was the run's only
+    // answering tool (a pure store question: the model's text has nothing
+    // else to say). Otherwise the model's text goes first.
+    if (
+      storePart !== null &&
+      (storeInfoRun?.unavailable === true || !answeringToolCalled(result))
+    ) {
+      const reply = storePart.text;
+      recordTurn(
+        input.senderId,
+        [
+          { role: 'user', content: input.text },
+          { role: 'assistant', content: reply },
+        ],
+        [...currentIds],
+        persistedCartContext(),
+        persistedImages(),
+      );
+      return { reply, ...storeLocation };
     }
     let text = result.text;
     let responseMessages: ModelMessage[] = result.responseMessages;
@@ -4079,7 +4197,7 @@ export class MinimalCatalogAgentService {
         input.senderId,
         input.inboundEvent,
       );
-      const reply = styled(real.reply);
+      const reply = withStore(styled(real.reply));
       recordTurn(
         input.senderId,
         [
@@ -4091,11 +4209,12 @@ export class MinimalCatalogAgentService {
         persistedImages(),
       );
       return real.onSent === undefined
-        ? { reply }
-        : { reply, onSent: real.onSent };
+        ? { reply, ...storeLocation }
+        : { reply, onSent: real.onSent, ...storeLocation };
     }
     if (text.trim() === '') {
-      const reply = styled(EMPTY_REPLY_FALLBACK);
+      // T2-fix J2: with a store block, it is the answer.
+      const reply = storePart?.text ?? styled(EMPTY_REPLY_FALLBACK);
       recordTurn(
         input.senderId,
         [
@@ -4106,7 +4225,7 @@ export class MinimalCatalogAgentService {
         persistedCartContext(),
         persistedImages(),
       );
-      return { reply };
+      return { reply, ...storeLocation };
     }
     // Same carry when the model wrote the offer itself (a stock check after
     // the search skips the rendered options): exactly one product presented
@@ -4122,16 +4241,26 @@ export class MinimalCatalogAgentService {
         `minimal_catalog cart_pending armed=stated_count trace=${traceId}`,
       );
     const media = photoFor(text);
+    // The prompt styles model text; only the emoji guard applies here.
+    const modelReply = limitCustomerEmojis(text, style);
+    // T2-fix J2: the model's answer, then the store part; the history keeps
+    // the full reply (unchanged without a store part).
+    const reply = withStore(modelReply);
     recordTurn(
       input.senderId,
-      [{ role: 'user', content: input.text }, ...responseMessages],
+      [
+        { role: 'user', content: input.text },
+        ...(storePart === null
+          ? responseMessages
+          : withApplicationReply(responseMessages, reply)),
+      ],
       [...currentIds],
       persistedCartContext(),
       persistedImages(),
     );
-    // The prompt styles model text; only the emoji guard applies here.
-    const reply = limitCustomerEmojis(text, style);
-    return media === undefined ? { reply } : { reply, media };
+    return media === undefined
+      ? { reply, ...storeLocation }
+      : { reply, media, ...storeLocation };
   }
 
   /**
@@ -4656,14 +4785,106 @@ export class MinimalCatalogAgentService {
   }
 
   /**
-   * T2 H2: one store-info answer per run (pattern of getPaymentDetails):
-   * the application owns the reply. Unavailable — a failed or drifted read,
-   * or a branch with neither address nor hours — is a tool error the model
-   * answers without inventing data.
+   * T2-fix J2/J3/J5: the store part a run appends to its reply: the styled
+   * store block and the pin (coordinates only) after a good read; the fixed
+   * unavailable line (with the askTeam offer when `offerTeam`) after a
+   * failed or unconfigured one; `null` when getStoreInfo was not called,
+   * was deferred or the tool was not offered.
    */
-  private storeInfoTools(run: StoreInfoRun | null, traceId: string): ToolSet {
+  private storeReplyPart(
+    run: StoreInfoRun | null,
+    style: CustomerStyle,
+    styled: (text: string) => string,
+    offerTeam: boolean,
+  ): { text: string; location?: CustomerReplyLocation } | null {
+    if (run === null) return null;
+    if (run.value !== null) {
+      const location = storePin(run.value);
+      const text = styled(storeInfoReply(run.value, style));
+      return location === undefined ? { text } : { text, location };
+    }
+    return run.unavailable
+      ? { text: storeInfoUnavailableLine(style, offerTeam) }
+      : null;
+  }
+
+  /**
+   * T2 H2 / T2-fix J4: the store-info run of this turn, or `null` when the
+   * tool and its instruction are not offered: a client without the branch
+   * read, or a checkout step pending (there «paso a recoger» chooses
+   * pickup, the checkout tools keep it). The single getBranch gate.
+   */
+  private async storeInfoRunFor(
+    senderId: string,
+    turns: readonly MinimalCatalogTurn[],
+    placed: { paid?: boolean } | null,
+  ): Promise<StoreInfoRun | null> {
     const getBranch = this.chatbotApi.getBranch?.bind(this.chatbotApi);
-    if (getBranch === undefined || run === null) return {};
+    if (getBranch === undefined) return null;
+    if (await this.checkoutStepPending(senderId, turns, placed)) return null;
+    return {
+      read: getBranch,
+      attempted: false,
+      value: null,
+      unavailable: false,
+    };
+  }
+
+  /**
+   * T2-fix J4: an order summary or a delivery-data summary waiting for its
+   * answer, the delivery-or-pickup question just asked, or delivery data
+   * being collected for an order not placed yet. A failed draft read counts
+   * as pending (the store tool is then simply not offered).
+   */
+  private async checkoutStepPending(
+    senderId: string,
+    turns: readonly MinimalCatalogTurn[],
+    placed: { paid?: boolean } | null,
+  ): Promise<boolean> {
+    if ((this.order?.offerStatus(senderId) ?? null) !== null) return true;
+    if (!this.checkoutAvailable()) return false;
+    if (this.checkout!.confirmationStatus(senderId)?.stage === 'pending')
+      return true;
+    const last = lastAssistantText(turns);
+    if (
+      last !== null &&
+      (['usted', 'tu'] as const).some(
+        (register) =>
+          last ===
+          applyCustomerRegister(MINIMAL_FULFILMENT_QUESTION, {
+            ...DEFAULT_CUSTOMER_STYLE,
+            register,
+          }),
+      )
+    )
+      return true;
+    if (placed !== null) return false;
+    try {
+      return await this.checkout!.hasDraft(senderId);
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * T2 H2: one store-info answer per run (pattern of getPaymentDetails):
+   * the application owns the store part of the reply. Results:
+   * - `{ok, presentedByApplication}`: the store block (and the pin) is
+   *   appended to whatever reply wins the turn (T2-fix J2/J3);
+   * - `store_info_settled`: a second call in the same run (nothing new);
+   * - `store_info_deferred` (T2-fix J3): the which-pet / memory question
+   *   already won the turn; it keeps the request and re-runs it after the
+   *   answer, so the store part is answered then (nothing is read now);
+   * - `store_info_unavailable`: a failed or drifted read, or a branch with
+   *   neither address nor hours; the application says so with a fixed line
+   *   (T2-fix J5) and the model never states an address or hours.
+   */
+  private storeInfoTools(
+    run: StoreInfoRun | null,
+    deferred: () => boolean,
+    traceId: string,
+  ): ToolSet {
+    if (run === null) return {};
     return {
       getStoreInfo: tool({
         description:
@@ -4674,17 +4895,32 @@ export class MinimalCatalogAgentService {
         execute: async () => {
           if (run.attempted) return toolError('store_info_settled');
           run.attempted = true;
+          if (deferred()) {
+            traceLog(
+              this.logger,
+              `minimal_catalog tool getStoreInfo deferred=pet_question trace=${traceId}`,
+            );
+            return toolError('store_info_deferred');
+          }
           let branch: BranchInfo;
           try {
-            branch = await getBranch();
+            branch = await run.read();
           } catch (error) {
+            // T2-fix J6: the upstream status and error code, never a body.
+            run.unavailable = true;
             this.logger.warn(
-              `minimal_catalog tool getStoreInfo read failed trace=${traceId}: ${error instanceof Error ? error.name : 'unknown'}`,
+              `minimal_catalog tool getStoreInfo read failed trace=${traceId}: ${describeBranchReadError(error)}`,
             );
             return toolError('store_info_unavailable');
           }
-          if (branch.address === null && branch.hours === null)
+          if (branch.address === null && branch.hours === null) {
+            // T2-fix J6: a branch staff never configured, not an outage.
+            run.unavailable = true;
+            this.logger.warn(
+              `minimal_catalog tool getStoreInfo branch_unconfigured (no address, no hours) trace=${traceId}`,
+            );
             return toolError('store_info_unavailable');
+          }
           run.value = branch;
           traceLog(
             this.logger,
@@ -6034,13 +6270,17 @@ export class MinimalCatalogAgentService {
   ): Promise<MinimalCheckoutReply> {
     const join = (...parts: Array<string | null>) =>
       parts.filter((part): part is string => part !== null).join('\n\n');
+    // T2-fix J7: a recovered pickup order keeps its store pin.
     const withLead = (
       prefix: string | null,
       prepared: MinimalCheckoutReply,
-    ): MinimalCheckoutReply =>
-      prepared.onSent === undefined
-        ? { reply: join(prefix, prepared.reply) }
-        : { reply: join(prefix, prepared.reply), onSent: prepared.onSent };
+    ): MinimalCheckoutReply => ({
+      reply: join(prefix, prepared.reply),
+      ...(prepared.onSent === undefined ? {} : { onSent: prepared.onSent }),
+      ...(prepared.location === undefined
+        ? {}
+        : { location: prepared.location }),
+    });
     const first = await this.order!.prepareOrder(senderId, inboundEvent);
     if (
       first.reply !== MINIMAL_ORDER_SHIPPING_REQUIRED_REPLY ||

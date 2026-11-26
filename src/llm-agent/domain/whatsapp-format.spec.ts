@@ -9,6 +9,7 @@ import {
   plain,
   sectionTitle,
   storeLines,
+  storePin,
 } from './whatsapp-format';
 
 describe('whatsapp-format (message formatting F2a)', () => {
@@ -119,5 +120,39 @@ describe('whatsapp-format storeLines (message formatting F3b-fix H3)', () => {
         hours: { summary: '**' },
       }),
     ).toEqual(['Recójalo en la tienda.']);
+  });
+});
+
+describe('storePin label caps (T2-fix J8)', () => {
+  const at = { latitude: 19.4, longitude: -99.1 };
+
+  it('keeps a name of exactly 100 and an address of exactly 250 characters', () => {
+    const name = 'n'.repeat(100);
+    const formatted = 'a'.repeat(250);
+    expect(storePin({ name, address: { formatted }, location: at })).toEqual({
+      ...at,
+      name,
+      address: formatted,
+    });
+  });
+
+  it('cuts longer labels between words with «…», the ellipsis within the cap', () => {
+    const name = `${'Sucursal '.repeat(11)}Centro`;
+    const formatted = `${'Calle '.repeat(42)}1`;
+    const pin = storePin({ name, address: { formatted }, location: at })!;
+    expect(Array.from(pin.name!).length).toBeLessThanOrEqual(100);
+    expect(Array.from(pin.address!).length).toBeLessThanOrEqual(250);
+    expect(pin.name).toMatch(/Sucursal…$/);
+    expect(pin.address).toMatch(/Calle…$/);
+  });
+
+  it('the pickup order pin (H4) gets the same caps', () => {
+    const pin = storePin({
+      name: 'x '.repeat(80).trim(),
+      address: null,
+      location: at,
+    })!;
+    expect(Array.from(pin.name!).length).toBeLessThanOrEqual(100);
+    expect(pin).not.toHaveProperty('address');
   });
 });

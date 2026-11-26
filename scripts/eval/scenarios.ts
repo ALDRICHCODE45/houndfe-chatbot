@@ -432,6 +432,19 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
+    id: 'store-location-with-catalog',
+    title:
+      '«¿Tienen arena para gato y dónde están?»: the catalog answer, then the store block (T2-fix J2)',
+    customer: existing('03100'),
+    turns: [
+      {
+        text: '¿Tienen arena para gato y dónde están?',
+        expectBackend: [/^getBranch → with pin$/],
+        requireReply: /Arena[\s\S]*Insurgentes Sur 1000/,
+      },
+    ],
+  },
+  {
     id: 'pets-reorder',
     title:
       '«Lo mismo de siempre para Max»: his last order, only his lines (S4, S14, S15)',

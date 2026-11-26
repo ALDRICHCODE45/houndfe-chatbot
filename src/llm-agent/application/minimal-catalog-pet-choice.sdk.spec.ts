@@ -149,13 +149,18 @@ function world(lookup: {
       messages?: Array<{ role: string; content: unknown }>;
     }> = [];
     let scripts: unknown[][] = [];
+    const outputs: Array<{ toolName: string; output: unknown }> = [];
     const generate: GenerateTextFn = async (input) => {
       seen.push(input);
       const script = scripts.shift() ?? [say()];
-      return generateText({
+      const result = await generateText({
         ...input,
         model: new MockLanguageModelV4({ doGenerate: script } as never),
       });
+      for (const s of result.steps)
+        for (const r of s.toolResults)
+          outputs.push({ toolName: r.toolName, output: r.output });
+      return result;
     };
     const profiles = new CustomerProfileService(profileStore, () => NOW);
     const gates = new ConversationGates(gateStore, () => now);
@@ -219,7 +224,9 @@ function world(lookup: {
         ?.messages?.filter((m) => m.role === 'user')
         .at(-1)?.content;
     const tools = () => Object.keys(seen.at(-1)?.tools ?? {});
-    return { agent, seen, system, lastUser, tools, turn };
+    const toolOutputs = (name: string) =>
+      outputs.filter((o) => o.toolName === name).map((o) => o.output);
+    return { agent, seen, system, lastUser, tools, turn, toolOutputs };
   };
   return {
     boot,
@@ -726,5 +733,65 @@ describe('T6b a pet_choice row from an older build with the `legacy` ref', () =>
     await h.turn('para Max', [[say('Para Max…')]]);
     expect(h.lastUser()).toBe('busco croquetas');
     expect(lineOf(h.system())).toContain('"Max"');
+  });
+
+  /**
+   * T2-fix J3: the which-pet question keeps the original request (its tap
+   * re-runs it), so a store question asked after it in the same run is
+   * deferred to that re-run; a store block the run already promised rides
+   * on the question (text and text fallback), buttons unchanged.
+   */
+  describe('T2-fix J3: which-pet question and the store block', () => {
+    // The fake backend's branch (scripts/eval EvalFakeApi default).
+    const STORE =
+      'Nos encuentra en *Tienda de mascotas HoundFe — Sucursal Centro*\n' +
+      'Av. Insurgentes Sur 1000, Del Valle, Benito Juárez, Ciudad de México, 03100\n' +
+      '*Horario:* Lunes a sábado: 09:00–19:00. Domingo: 10:00–14:00.';
+    const TEXT = 'busco croquetas, ¿y dónde están?';
+
+    it('askWhichPet first → getStoreInfo answers store_info_deferred; the question is unchanged and carries no pin', async () => {
+      const base = await world({ current: customer([pet({}), max()]) })
+        .boot()
+        .turn(TEXT, ask());
+      const h = world({ current: customer([pet({}), max()]) }).boot();
+      const decision = await h.turn(TEXT, [
+        [call('askWhichPet'), call('getStoreInfo'), say('¿Para cuál?')],
+      ]);
+      expect(h.toolOutputs('getStoreInfo')).toEqual([
+        { ok: false, error: 'store_info_deferred' },
+      ]);
+      expect(decision.reply).toBe(base.reply);
+      expect(decision.interactive).toEqual(base.interactive);
+      expect(decision).not.toHaveProperty('location');
+    });
+
+    it('getStoreInfo first → the question, then the store block (also in the text fallback) and the pin', async () => {
+      const base = await world({ current: customer([pet({}), max()]) })
+        .boot()
+        .turn(TEXT, ask());
+      const h = world({ current: customer([pet({}), max()]) }).boot();
+      const decision = await h.turn(TEXT, [
+        [call('getStoreInfo'), call('askWhichPet'), say('¿Para cuál?')],
+      ]);
+      expect(decision.reply).toBe(`${base.reply}\n\n${STORE}`);
+      const interactive = decision.interactive as {
+        buttons: unknown;
+        prompt: string;
+        textFallback: string;
+      };
+      const baseInteractive = base.interactive as typeof interactive;
+      expect(interactive.buttons).toEqual(baseInteractive.buttons);
+      expect(interactive.prompt).toBe(baseInteractive.prompt);
+      expect(interactive.textFallback).toBe(
+        `${baseInteractive.textFallback}\n\n${STORE}`,
+      );
+      expect(decision.location).toEqual({
+        latitude: 19.3907,
+        longitude: -99.1716,
+        name: 'Tienda de mascotas HoundFe — Sucursal Centro',
+        address:
+          'Av. Insurgentes Sur 1000, Del Valle, Benito Juárez, Ciudad de México, 03100',
+      });
+    });
   });
 });
