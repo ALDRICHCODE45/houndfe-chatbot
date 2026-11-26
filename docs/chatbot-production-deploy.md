@@ -12,7 +12,7 @@ Checklist for deploying `houndfe-chatbot` `main` to its VPS against the already-
 ## 2. Push and deploy
 
 1. `git push origin main` from this repo.
-2. Deploy `main` on the chatbot VPS. Chatbot migrations (3200–5100) run automatically at startup.
+2. Deploy `main` on the chatbot VPS. Chatbot migrations (3200–5950) run automatically at startup. Migration 5950 (`customer_profiles.suggestions_paused_until`) must run before the complementary-suggestion bot; to roll back, roll back the bot first, then 5950 down.
 
 ### Customer memory table (migration 3700)
 

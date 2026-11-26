@@ -92,8 +92,29 @@ describe('CustomerProfileService', () => {
     const pending = service.pauseSuggestions(SENDER, until);
     // In-process pause BEFORE the durable write settles.
     expect(service.suggestionsPaused(SENDER)).toBe(true);
-    await expect(pending).resolves.toBeUndefined();
+    // T3-fix-2 G8: the caller learns the pause is process-only.
+    await expect(pending).resolves.toBe(false);
     expect(service.suggestionsPaused(SENDER)).toBe(true);
+  });
+
+  it('T3-fix-2 G8: pauseSuggestionsFor resolves true once the pause is stored (also when unchanged)', async () => {
+    const store = new InMemoryCustomerProfileStore();
+    const service = new CustomerProfileService(store, clock);
+    await service.load(SENDER);
+    const day = 24 * 60 * 60_000;
+    await expect(service.pauseSuggestionsFor(SENDER, day)).resolves.toBe(true);
+    await expect(service.pauseSuggestionsFor(SENDER, day)).resolves.toBe(true);
+    await expect(store.read(SENDER)).resolves.toMatchObject({
+      suggestionsPausedUntil: new Date(NOW.getTime() + day).toISOString(),
+    });
+  });
+
+  it('T3-fix-2 G5: nowMs is the injected clock the pause uses', () => {
+    const service = new CustomerProfileService(
+      new InMemoryCustomerProfileStore(),
+      clock,
+    );
+    expect(service.nowMs()).toBe(NOW.getTime());
   });
 
   it('styleFor reads the stored style, null when there is no profile', async () => {

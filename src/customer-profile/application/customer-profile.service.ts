@@ -48,6 +48,11 @@ export class CustomerProfileService {
     return this.forgotten.has(senderId);
   }
 
+  /** T3-fix-2 G5: the injected clock (epoch ms), the one the pause uses. */
+  nowMs(): number {
+    return this.now().getTime();
+  }
+
   isLoaded(senderId: string): boolean {
     return this.cache.has(senderId);
   }
@@ -73,18 +78,31 @@ export class CustomerProfileService {
 
   /** Merge-only write; skipped when it would change nothing. */
   async record(senderId: string, patch: CustomerProfilePatch): Promise<void> {
-    if (this.forgotten.has(senderId)) return;
+    await this.write(senderId, patch);
+  }
+
+  /**
+   * `record`, telling whether the store holds the patch afterwards (written,
+   * or already equal); `false` when forgotten or the write failed.
+   */
+  private async write(
+    senderId: string,
+    patch: CustomerProfilePatch,
+  ): Promise<boolean> {
+    if (this.forgotten.has(senderId)) return false;
     const next = normalizeCustomerProfilePatch(patch);
     if (
       this.isLoaded(senderId) &&
       profilePatchIsNoop(this.cached(senderId), next)
     )
-      return;
+      return true;
     try {
       const saved = await this.store.upsert(senderId, next, this.now());
       if (saved !== null) this.remember(senderId, saved);
+      return true;
     } catch (error) {
       this.warn('write', error);
+      return false;
     }
   }
 
@@ -114,8 +132,10 @@ export class CustomerProfileService {
    * `untilMs` (24 h after a shown one, 30 days after a decline). The
    * in-process pause is set BEFORE the durable write, so a failed or slow
    * write never lets this process suggest again (E2); never throws.
+   * T3-fix-2 G8: resolves `false` when the pause is process-only (the
+   * durable write failed or was skipped), so the caller can log it.
    */
-  async pauseSuggestions(senderId: string, untilMs: number): Promise<void> {
+  async pauseSuggestions(senderId: string, untilMs: number): Promise<boolean> {
     this.pauses.delete(senderId);
     this.pauses.set(senderId, untilMs);
     if (this.pauses.size > CACHE_MAX)
@@ -123,24 +143,18 @@ export class CustomerProfileService {
         this.pauses.delete(oldest);
         break;
       }
-    await this.record(senderId, {
+    return this.write(senderId, {
       suggestionsPausedUntil: new Date(untilMs).toISOString(),
     });
   }
 
   /** T3-fix: `pauseSuggestions` for `durationMs` from this service's clock. */
-  async pauseSuggestionsFor(
-    senderId: string,
-    durationMs: number,
-  ): Promise<void> {
-    await this.pauseSuggestions(senderId, this.now().getTime() + durationMs);
+  pauseSuggestionsFor(senderId: string, durationMs: number): Promise<boolean> {
+    return this.pauseSuggestions(senderId, this.nowMs() + durationMs);
   }
 
   /** T3-fix (S6, S7): suggestions are paused for this sender at `nowMs`. */
-  suggestionsPaused(
-    senderId: string,
-    nowMs: number = this.now().getTime(),
-  ): boolean {
+  suggestionsPaused(senderId: string, nowMs: number = this.nowMs()): boolean {
     const stored = this.cached(senderId)?.suggestionsPausedUntil;
     const storedMs = stored === undefined ? NaN : Date.parse(stored);
     const local = this.pauses.get(senderId);

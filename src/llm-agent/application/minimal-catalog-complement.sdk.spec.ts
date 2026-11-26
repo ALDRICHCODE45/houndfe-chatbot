@@ -154,12 +154,13 @@ function world(
             dismiss: () => undefined,
           } as unknown as MinimalOrderService)
         : undefined;
+    const sessions = new InMemoryMinimalCatalogSessionStore();
     const agent = new MinimalCatalogAgentService(
       api,
       generate,
       new CostGuardService(100000),
       config,
-      new InMemoryMinimalCatalogSessionStore(),
+      sessions,
       undefined,
       undefined,
       new MinimalCartService(api, conversations),
@@ -175,7 +176,7 @@ function world(
       scripts = runs;
       return agent.tryHandle({ senderId: SENDER, text });
     };
-    return { turn };
+    return { turn, sessions, api };
   };
   const suggestOutputs = () =>
     outputs
@@ -356,8 +357,8 @@ describe('T3: complementary suggestion after a cart add (S4-S6)', () => {
       expect(after.reply).toContain(LINE_USTED);
     });
 
-    it('E1: declineSuggestions only with a suggestion context, once per turn', async () => {
-      const none = world({ unpaidOrder: true });
+    it('E1/G1: declineSuggestions needs a loaded profile, once per turn', async () => {
+      const none = world({ profiles: false });
       await none.boot().turn('no me ofrezca nada', [[say('Claro.')]]);
       expect(none.systems[0]).not.toContain('Herramienta declineSuggestions');
       const w = world();
@@ -410,15 +411,13 @@ describe('T3: complementary suggestion after a cart add (S4-S6)', () => {
       ],
       ['the same day', 23 * 60 * 60_000, expect.objectContaining({ ok: true })],
     ])(
-      'E3/E7: a product whose price was read %s',
+      'E3/E7/G5: a product whose price was read %s (injected clock only)',
       async (_case, elapsed, expected) => {
-        const now = jest.spyOn(Date, 'now').mockReturnValue(T0);
         const w = world();
         const h = w.boot();
         await h.turn('quiero una whiskas y busco arena', [
           [search('whiskas'), search('arena sílice'), add(WHISKAS), say()],
         ]);
-        now.mockReturnValue(T0 + elapsed);
         w.clock.now = new Date(T0 + elapsed);
         await h.turn('mejor que sean dos whiskas', [
           [add(WHISKAS, 'dos', 2), suggest(SILICE), say()],
@@ -617,6 +616,202 @@ describe('T3: complementary suggestion after a cart add (S4-S6)', () => {
       expect(decision.reply).toContain(
         'Por si le sirve: *Arena para Gato de Sílice Premium Control de Olores Extra Fuerte Larga Duración…* ($179.00)',
       );
+    });
+  });
+
+  describe('T3-fix-2 (S6, S7)', () => {
+    const DAY = 24 * 60 * 60_000;
+    const T0 = Date.parse('2026-11-26T12:00:00.000Z');
+    const decline = () => call('declineSuggestions', {});
+    /** The addAndSuggest run without the suggestComplement call. */
+    const addOnly = () => [
+      [
+        search('whiskas'),
+        search('arena sílice'),
+        search('dog chow cachorro'),
+        add(WHISKAS),
+        say(),
+      ],
+    ];
+
+    it.each([
+      [
+        'an order awaits payment (no suggestion tool)',
+        { unpaidOrder: true as const },
+      ],
+      ['no suggestion context at all', {}],
+    ])(
+      'G1/S7: «no me ofrezcas nada» while %s records the 30-day pause; the model reply stands',
+      async (_case, options) => {
+        const w = world(options);
+        const decision = await w
+          .boot()
+          .turn('no me ofrezcas nada', [[decline(), say('Claro.')]]);
+        expect(w.systems[0]).toContain('Herramienta declineSuggestions');
+        expect(decision.reply).toBe('Claro.');
+        expect(w.toolOutputs('declineSuggestions')).toEqual([{ ok: true }]);
+        await expect(w.profileStore.read(SENDER)).resolves.toMatchObject({
+          suggestionsPausedUntil: new Date(T0 + 30 * DAY).toISOString(),
+        });
+      },
+    );
+
+    it('G1 (verify A): three turns after a shown suggestion, inside its 24 h pause, a decline still records 30 days', async () => {
+      const w = world();
+      const h = w.boot();
+      await h.turn('quiero una whiskas y arena', addAndSuggest());
+      for (const text of ['gracias', 'ok', '¿a qué hora abren?'])
+        await h.turn(text, [[say('Con gusto.')]]);
+      await h.turn('ya no me ofrezca productos', [[decline(), say('Claro.')]]);
+      expect(w.systems[4]).toContain('Herramienta declineSuggestions');
+      expect(w.toolOutputs('declineSuggestions')).toEqual([{ ok: true }]);
+      await expect(w.profileStore.read(SENDER)).resolves.toMatchObject({
+        suggestionsPausedUntil: new Date(T0 + 30 * DAY).toISOString(),
+      });
+    });
+
+    it.each([
+      ['within 24 h', 23 * 60 * 60_000, expect.objectContaining({ ok: true })],
+      ['after 24 h', 25 * 60 * 60_000, { ok: false, error: 'stale_product' }],
+    ])(
+      'G2: a product priced in an earlier non-cart turn, then a cart add %s',
+      async (_case, elapsed, expected) => {
+        const w = world();
+        const h = w.boot();
+        await h.turn('¿tienen arena?', [[search('arena sílice'), say('Sí.')]]);
+        w.clock.now = new Date(T0 + elapsed);
+        const decision = await h.turn('quiero una whiskas', [
+          [search('whiskas'), add(WHISKAS), suggest(SILICE), say()],
+        ]);
+        expect(w.suggestOutputs()).toEqual([expected]);
+        if (elapsed < DAY) expect(decision.reply).toContain(LINE_USTED);
+      },
+    );
+
+    it('G2: a session stored without suggestion prices has nothing suggestable', async () => {
+      const w = world();
+      const h = w.boot();
+      await h.turn('quiero una whiskas y busco arena', [
+        [search('whiskas'), search('arena sílice'), add(WHISKAS), say()],
+      ]);
+      h.sessions.write(
+        SENDER,
+        h.sessions.read(SENDER).map((turn) => {
+          const legacy: Record<string, unknown> = { ...turn };
+          delete legacy.complementPrices;
+          return legacy as unknown as typeof turn;
+        }),
+      );
+      await h.turn('mejor que sean dos whiskas', [
+        [add(WHISKAS, 'dos', 2), suggest(SILICE), say()],
+      ]);
+      expect(w.suggestOutputs()).toEqual([
+        { ok: false, error: 'unknown_price' },
+      ]);
+    });
+
+    it('G2: catalogPrices (list row titles) is unchanged by a non-cart read', async () => {
+      const w = world();
+      const h = w.boot();
+      await h.turn('¿tienen arena?', [[search('arena sílice'), say('Sí.')]]);
+      expect(h.sessions.read(SENDER).at(-1)?.catalogPrices).toBeUndefined();
+    });
+
+    it.each([
+      [
+        'usted',
+        'quiero una whiskas y arena',
+        LINE_USTED,
+        MINIMAL_CART_NEXT_STEP_QUESTION,
+      ],
+      ['tú', 'quiero una whiskas, ¿tienes arena? 😊', LINE_TU, QUESTION_TU],
+    ])(
+      'G3: %s — the suggestion reply is the no-line reply with the line before the next-step question',
+      async (_case, text, line, question) => {
+        const without = await world().boot().turn(text, addOnly());
+        const withLine = await world().boot().turn(text, addAndSuggest());
+        expect(without.reply.endsWith(`\n\n${question}`)).toBe(true);
+        expect(withLine.reply).toBe(
+          `${without.reply.slice(0, -question.length)}${line}\n\n${question}`,
+        );
+        expect(withLine.interactive).toEqual(without.interactive);
+      },
+    );
+
+    it('G4: a set that lowers the quantity is not an add', async () => {
+      const w = world();
+      const h = w.boot();
+      await h.turn('quiero dos whiskas', [
+        [
+          search('whiskas'),
+          search('arena sílice'),
+          add(WHISKAS, 'dos', 2),
+          say(),
+        ],
+      ]);
+      await h.turn('mejor solo una whiskas', [
+        [add(WHISKAS, 'una', 1), suggest(SILICE), say()],
+      ]);
+      expect(w.suggestOutputs()).toEqual([{ ok: false, error: 'no_cart_add' }]);
+    });
+
+    it('G4: when the previous lines cannot be read, a set is not an add (fail closed)', async () => {
+      const w = world();
+      const h = w.boot();
+      await h.turn('quiero una whiskas', [
+        [search('whiskas'), search('arena sílice'), add(WHISKAS), say()],
+      ]);
+      jest
+        .spyOn(MinimalCartService.prototype, 'storedLines')
+        .mockResolvedValue(null);
+      await h.turn('mejor que sean dos whiskas', [
+        [add(WHISKAS, 'dos', 2), suggest(SILICE), say()],
+      ]);
+      expect(w.suggestOutputs()).toEqual([{ ok: false, error: 'no_cart_add' }]);
+    });
+
+    it('G6: a missing price refuses before claiming the slot or reading stock', async () => {
+      const stockReads: string[] = [];
+      const w = world({
+        patchApi: (api) => {
+          const search = api.searchCatalog.bind(api);
+          api.searchCatalog = async (q, limit) =>
+            (await search(q, limit)).map((item) =>
+              item.productId === product(SILICE)
+                ? { ...item, price: { ...item.price, priceCents: null } }
+                : item,
+            );
+          const stock = api.getStock.bind(api);
+          api.getStock = (id) => {
+            stockReads.push(id);
+            return stock(id);
+          };
+        },
+      });
+      await w.boot().turn('quiero una whiskas y arena', addAndSuggest());
+      expect(w.suggestOutputs()).toEqual([
+        { ok: false, error: 'unknown_price' },
+      ]);
+      expect(stockReads).not.toContain(product(SILICE));
+    });
+
+    it('G8: a failed decline write is logged without the phone; the reply stands', async () => {
+      const warn = jest.mocked(Logger.prototype.warn);
+      const w = world({ failingWrites: true });
+      const decision = await w
+        .boot()
+        .turn('no me ofrezcas nada', [[decline(), say('Claro.')]]);
+      expect(decision.reply).toBe('Claro.');
+      expect(w.toolOutputs('declineSuggestions')).toEqual([{ ok: true }]);
+      const messages = warn.mock.calls.map((args) => String(args[0]));
+      expect(messages).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(
+            /^minimal_catalog tool declineSuggestions durable_write=failed pause=process_only trace=\S+$/,
+          ),
+        ]),
+      );
+      expect(messages.join('\n')).not.toContain(SENDER);
     });
   });
 });

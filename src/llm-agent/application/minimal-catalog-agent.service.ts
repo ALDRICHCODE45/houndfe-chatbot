@@ -82,6 +82,7 @@ import {
   isForgetMyDataRequest,
 } from '../../customer-profile/domain/customer-profile-signals';
 import type {
+  ComplementPrice,
   MinimalCatalogTurn,
   ReorderOfferContext,
 } from '../domain/minimal-catalog-session.store';
@@ -646,8 +647,9 @@ const COMPLEMENT_INSTRUCTIONS_FRAGMENT =
   'Pase su productId EXACTO (y variantId si eligió una presentación). Si no hay uno claramente útil, no la llame. ' +
   'Nunca la llame si en esta conversación el cliente rechazó una sugerencia o pidió no recibir sugerencias. ' +
   'La aplicación agrega la sugerencia a su mensaje: no la mencione ni la repita en su texto.';
-// T3-fix E1 (S7): the customer said no to suggestions. Offered only with a
-// suggestion context; its result never changes the reply.
+// T3-fix E1 (S7): the customer said no to suggestions. T3-fix-2 G1: offered
+// whenever the profile can keep the pause (any turn, not only around a
+// suggestion); its result never changes the reply.
 const DECLINE_INSTRUCTIONS_FRAGMENT =
   '\n\nHerramienta declineSuggestions: llámela una vez si el cliente rechaza una sugerencia de producto o pide no recibir sugerencias. ' +
   'No cambia su respuesta: conteste al cliente con normalidad y calidez, sin anunciar que dejará de sugerir y sin prometer nada.';
@@ -657,8 +659,6 @@ export const COMPLEMENT_INTERVAL_MS = 24 * 60 * 60_000;
 export const COMPLEMENT_DECLINE_PAUSE_MS = 30 * 24 * 60 * 60_000;
 /** T3-fix E3: a suggestable product's price was read this recently. */
 const COMPLEMENT_PRICE_MAX_AGE_MS = 24 * 60 * 60_000;
-/** T3-fix E1: a decline counts this many turns after a shown suggestion. */
-const COMPLEMENT_DECLINE_TURNS = 2;
 /**
  * T3-fix E8: catalog names can be very long (brand + line + flavour +
  * size); the suggestion is one discreet line, so the name is capped at
@@ -852,23 +852,31 @@ type ProductImageRun = {
   added: Set<string>;
   /** S4: catalog prices (`priceKey` → cents) for list row titles. */
   prices: Map<string, number>;
-  /** T3-fix E3: when each price was read (`priceKey` → epoch ms). */
-  pricesAt: Map<string, number>;
+  /**
+   * T3-fix-2 G2: suggestion-only prices with their read instant, from every
+   * catalog read (any turn), most recent last; persisted on every turn.
+   */
+  complementPrices: Map<string, ComplementPrice>;
 };
 
-/** S4: remember a catalog item's prices, most recent last. */
+/**
+ * S4: remember a catalog item's prices, most recent last. T3-fix-2 G2: also
+ * the suggestion-only copy read at `readAt` (a missing price as `null`).
+ */
 function recordPrices(
   prices: Map<string, number>,
   item: CatalogItemResponse,
-  pricesAt: Map<string, number>,
+  complementPrices: Map<string, ComplementPrice>,
+  readAt: number,
 ): void {
-  const readAt = Date.now();
   const put = (key: string, cents: unknown) => {
-    if (typeof cents !== 'number' || !Number.isSafeInteger(cents) || cents < 0)
-      return;
+    const valid =
+      typeof cents === 'number' && Number.isSafeInteger(cents) && cents >= 0;
+    complementPrices.delete(key);
+    complementPrices.set(key, { priceCents: valid ? cents : null, readAt });
+    if (!valid) return;
     prices.delete(key);
     prices.set(key, cents);
-    pricesAt.set(key, readAt);
   };
   put(priceKey(item.productId), item.price?.priceCents);
   for (const variant of item.variants ?? [])
@@ -1766,7 +1774,8 @@ export class MinimalCatalogAgentService {
       this.order!.offerStatus(senderId) !== null
     )
       return null;
-    if ((await this.cart.storedLines(senderId)).length === 0) return null;
+    if (((await this.cart.storedLines(senderId)) ?? []).length === 0)
+      return null;
     if ((await this.cart.shippingMode(senderId)) !== null) return null;
     const reference = await this.cart.fingerprint(senderId);
     if (reference === null) return null;
@@ -2352,7 +2361,7 @@ export class MinimalCatalogAgentService {
   private async cartIsEmpty(senderId: string): Promise<boolean> {
     return this.cart === undefined
       ? true
-      : (await this.cart.storedLines(senderId)).length === 0;
+      : ((await this.cart.storedLines(senderId)) ?? []).length === 0;
   }
 
   /**
@@ -3233,20 +3242,40 @@ export class MinimalCatalogAgentService {
       presented: new Map(),
       added: new Set(),
       prices: new Map(Object.entries(turns.at(-1)?.catalogPrices ?? {})),
-      pricesAt: new Map(Object.entries(turns.at(-1)?.catalogPricesAt ?? {})),
+      complementPrices: new Map(
+        Object.entries(turns.at(-1)?.complementPrices ?? {}),
+      ),
     };
     const persistedPrices = (): Record<string, number> =>
       Object.fromEntries([...imageRun.prices].slice(-CATALOG_PRICES_MAX));
-    // T3-fix E3: the read instants of exactly the persisted prices.
-    const persistedPricesAt = (): Record<string, number> =>
-      Object.fromEntries(
-        [...imageRun.prices.keys()]
-          .slice(-CATALOG_PRICES_MAX)
-          .flatMap((key) => {
-            const at = imageRun.pricesAt.get(key);
-            return at === undefined ? [] : [[key, at] as const];
-          }),
+    // T3-fix-2 G2: only reads of the last 24 h (an unknown read time is
+    // dropped), the most recent CATALOG_PRICES_MAX.
+    const persistedComplementPrices = (): Record<string, ComplementPrice> => {
+      const nowMs = this.suggestionNowMs();
+      return Object.fromEntries(
+        [...imageRun.complementPrices]
+          .filter(
+            ([, entry]) => nowMs - entry.readAt < COMPLEMENT_PRICE_MAX_AGE_MS,
+          )
+          .slice(-CATALOG_PRICES_MAX),
       );
+    };
+    // T3-fix-2 G2: every turn this run records keeps the suggestion prices
+    // its catalog reads saw (a non-cart «¿tienen arena?» included).
+    const recordTurn = (
+      ...[
+        senderId,
+        messages,
+        ids,
+        cartContext,
+        images,
+        interactive,
+      ]: Parameters<MinimalCatalogAgentService['recordTurn']>
+    ): void =>
+      this.recordTurn(senderId, messages, ids, cartContext, images, {
+        ...interactive,
+        complementPrices: persistedComplementPrices(),
+      });
     const persistedImages = (): ProductImageContext =>
       boundProductImageContext({
         known: Object.fromEntries(imageRun.known),
@@ -3349,16 +3378,11 @@ export class MinimalCatalogAgentService {
     )
       ? { value: null, claimed: false, declined: false }
       : null;
-    // T3-fix E1: the decline tool rides with suggestComplement, or follows
-    // a suggestion shown in the last COMPLEMENT_DECLINE_TURNS turns.
-    const declineRun: DeclineRun | null =
-      complementRun !== null ||
-      (this.profileWritable(input.senderId) &&
-        turns
-          .slice(-COMPLEMENT_DECLINE_TURNS)
-          .some((turn) => turn.complementShown === true))
-        ? { attempted: false }
-        : null;
+    // T3-fix-2 G1: «no me ofrezcas nada» counts at any time, so the decline
+    // tool is offered whenever the profile can keep the 30-day pause.
+    const declineRun: DeclineRun | null = this.profileWritable(input.senderId)
+      ? { attempted: false }
+      : null;
     const reorderRun: ReorderRun | null = this.cart
       ? { attempted: false, value: null }
       : null;
@@ -3594,7 +3618,7 @@ export class MinimalCatalogAgentService {
             ? prepared.question
             : RESTOCK_CAUTIOUS_REPLY),
       );
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3613,7 +3637,7 @@ export class MinimalCatalogAgentService {
       // The server-owned bank details (or the unavailable notice); model text
       // never carries them.
       const reply = styled(paymentReply.reply);
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3632,7 +3656,7 @@ export class MinimalCatalogAgentService {
     if (teamReply !== null) {
       // S6: the server-owned create outcome; model text never claims it.
       const reply = styled(teamReply);
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3679,7 +3703,7 @@ export class MinimalCatalogAgentService {
       // are kept in the durable pet_choice gate (T4c-2b: or the forget /
       // diminutive question and its data).
       const reply = styled(petChoice.reply);
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3698,7 +3722,7 @@ export class MinimalCatalogAgentService {
       // belong to this reply only.
       const reply = styled(reorder.reply);
       for (const productId of reorder.productIds) currentIds.add(productId);
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3756,7 +3780,7 @@ export class MinimalCatalogAgentService {
           ? checkoutResult.reply
           : `${cartPart}\n\n${checkoutResult.reply}`,
       );
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3780,7 +3804,7 @@ export class MinimalCatalogAgentService {
         : null;
     if (continued !== null) {
       const reply = styled(continued.reply);
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3809,7 +3833,11 @@ export class MinimalCatalogAgentService {
         cartReply.cartProductIds?.has(suggestion.productId) !== true
           ? complementLine(suggestion, style)
           : null;
-      // Any turn without the line keeps the reply byte-identical.
+      // Any turn without the line keeps the reply byte-identical. T3-fix-2
+      // G3 invariant: with the line, the reply is exactly the no-line reply
+      // with `line\n\n` inserted before the styled next-step question
+      // (applyCustomerStyle works line by line and the question carries no
+      // emoji, so styling the two parts apart equals styling them together).
       const reply =
         line === null
           ? styled(
@@ -3836,7 +3864,7 @@ export class MinimalCatalogAgentService {
         imageRun.added.size === 1
           ? productImage([...imageRun.added][0])
           : undefined;
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3847,8 +3875,6 @@ export class MinimalCatalogAgentService {
         persistedImages(),
         {
           catalogPrices: persistedPrices(),
-          catalogPricesAt: persistedPricesAt(),
-          ...(line === null ? {} : { complementShown: true }),
           ...(list === null ? {} : { interactiveChoice: list.context }),
         },
       );
@@ -3871,7 +3897,7 @@ export class MinimalCatalogAgentService {
         `minimal_catalog tool cart argument rejected before execute trace=${traceId}`,
       );
       const reply = styled(CART_OPERATION_CLARIFICATION);
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3889,7 +3915,7 @@ export class MinimalCatalogAgentService {
         `minimal_catalog tool checkout argument rejected before execute trace=${traceId}`,
       );
       const reply = styled(CHECKOUT_TOOL_CLARIFICATION);
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3941,7 +3967,7 @@ export class MinimalCatalogAgentService {
       // L31: one emoji on the closing only when the customer uses them.
       const reply = limitCustomerEmojis(rendered.text, style);
       const media = photoFor(reply);
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -3994,7 +4020,7 @@ export class MinimalCatalogAgentService {
         input.inboundEvent,
       );
       const reply = styled(real.reply);
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -4010,7 +4036,7 @@ export class MinimalCatalogAgentService {
     }
     if (text.trim() === '') {
       const reply = styled(EMPTY_REPLY_FALLBACK);
-      this.recordTurn(
+      recordTurn(
         input.senderId,
         [
           { role: 'user', content: input.text },
@@ -4036,7 +4062,7 @@ export class MinimalCatalogAgentService {
         `minimal_catalog cart_pending armed=stated_count trace=${traceId}`,
       );
     const media = photoFor(text);
-    this.recordTurn(
+    recordTurn(
       input.senderId,
       [{ role: 'user', content: input.text }, ...responseMessages],
       [...currentIds],
@@ -4361,20 +4387,34 @@ export class MinimalCatalogAgentService {
   }
 
   /**
+   * T3-fix-2 G5: the one clock of the suggestion rules (price age and
+   * pause): the profile service's injected clock. Without profiles no
+   * suggestion tool is offered, so the fallback only stamps unused reads.
+   */
+  private suggestionNowMs(): number {
+    return this.profiles?.nowMs() ?? Date.now();
+  }
+
+  /**
    * T3-fix E2: pause suggestions for `durationMs`. The service pauses
    * in-process first; a failed durable write is logged, never thrown, so
-   * the reply is never dropped.
+   * the reply is never dropped. T3-fix-2 G8: `false` when the pause is
+   * process-only.
    */
   private async pauseSuggestions(
     senderId: string,
     durationMs: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
-      await this.profiles?.pauseSuggestionsFor(senderId, durationMs);
+      return (
+        (await this.profiles?.pauseSuggestionsFor(senderId, durationMs)) ??
+        false
+      );
     } catch (error) {
       this.logger.warn(
         `minimal_catalog suggestions pause failed: ${error instanceof Error ? error.name : 'unknown'}`,
       );
+      return false;
     }
   }
 
@@ -4395,7 +4435,16 @@ export class MinimalCatalogAgentService {
           if (run.attempted) return toolError('already_declined');
           run.attempted = true;
           if (complementRun !== null) complementRun.declined = true;
-          await this.pauseSuggestions(senderId, COMPLEMENT_DECLINE_PAUSE_MS);
+          const durable = await this.pauseSuggestions(
+            senderId,
+            COMPLEMENT_DECLINE_PAUSE_MS,
+          );
+          // T3-fix-2 G8 (accepted limit): the 30 days then hold only in this
+          // process; logged with the trace id, never the phone.
+          if (!durable)
+            this.logger.warn(
+              `minimal_catalog tool declineSuggestions durable_write=failed pause=process_only trace=${traceId}`,
+            );
           traceLog(
             this.logger,
             `minimal_catalog tool declineSuggestions result=ok trace=${traceId}`,
@@ -4440,15 +4489,28 @@ export class MinimalCatalogAgentService {
           if (imageRun.added.has(productId)) return refuse('same_product');
           if (cartReply.cartProductIds?.has(productId) === true)
             return refuse('in_cart');
-          // E3: only a price read within 24 h (an earlier day's read is stale).
+          // T3-fix-2 G6: the price is checked from this chat's catalog reads
+          // before the slot is claimed or stock is read.
           const key = priceKey(productId, variantId);
-          const readAt = imageRun.pricesAt.get(key);
+          const priced = imageRun.complementPrices.get(key);
+          const readVariants = [...imageRun.complementPrices.keys()].some(
+            (k) => k.startsWith(`${productId}|`) && k !== priceKey(productId),
+          );
+          if (variantId === undefined && readVariants)
+            return refuse('variant_required');
+          if (variantId !== undefined && priced === undefined && readVariants)
+            return refuse('unknown_product');
+          if (priced?.priceCents == null) return refuse('unknown_price');
+          // E3: only a price read within 24 h (an earlier day's read, or an
+          // unknown read time, is stale).
           if (
-            imageRun.prices.has(key) &&
-            (readAt === undefined ||
-              Date.now() - readAt >= COMPLEMENT_PRICE_MAX_AGE_MS)
+            !(
+              this.suggestionNowMs() - priced.readAt <
+              COMPLEMENT_PRICE_MAX_AGE_MS
+            )
           )
             return refuse('stale_product');
+          const priceCents = priced.priceCents;
           run.claimed = true;
           const release = (code: string) => {
             run.claimed = false;
@@ -4472,8 +4534,6 @@ export class MinimalCatalogAgentService {
           const status = safeStatus((variant ?? stock).stock.status);
           if (status === 'out_of_stock') return release('out_of_stock');
           if (status === 'unknown') return release('unverified');
-          const priceCents = imageRun.prices.get(key);
-          if (priceCents === undefined) return release('unknown_price');
           if (run.declined) return release('declined');
           run.value = {
             productId,
@@ -5771,8 +5831,7 @@ export class MinimalCatalogAgentService {
     productImages?: ProductImageContext,
     interactive: {
       catalogPrices?: Record<string, number>;
-      catalogPricesAt?: Record<string, number>;
-      complementShown?: boolean;
+      complementPrices?: Record<string, ComplementPrice>;
       interactiveChoice?: InteractiveChoiceContext;
       reorderOffer?: ReorderOfferContext;
       paymentOffer?: { saleId: string };
@@ -5807,9 +5866,9 @@ export class MinimalCatalogAgentService {
     const images = productImages ?? turns.at(-1)?.productImages;
     // S4: prices carry forward; a list only belongs to the turn that sent it.
     const prices = interactive.catalogPrices ?? turns.at(-1)?.catalogPrices;
-    // T3-fix E3: their read instants travel with them.
-    const pricesAt =
-      interactive.catalogPricesAt ?? turns.at(-1)?.catalogPricesAt;
+    // T3-fix-2 G2: the suggestion-only prices carry forward the same way.
+    const complementPrices =
+      interactive.complementPrices ?? turns.at(-1)?.complementPrices;
     this.sessionStore.write(senderId, [
       ...prior,
       {
@@ -5818,10 +5877,7 @@ export class MinimalCatalogAgentService {
         ...(inherited === undefined ? {} : { cartContext: inherited }),
         ...(images === undefined ? {} : { productImages: images }),
         ...(prices === undefined ? {} : { catalogPrices: prices }),
-        ...(pricesAt === undefined ? {} : { catalogPricesAt: pricesAt }),
-        ...(interactive.complementShown === true
-          ? { complementShown: true as const }
-          : {}),
+        ...(complementPrices === undefined ? {} : { complementPrices }),
         ...(interactive.interactiveChoice === undefined
           ? {}
           : { interactiveChoice: interactive.interactiveChoice }),
@@ -6140,7 +6196,12 @@ export class MinimalCatalogAgentService {
               currentIds.add(item.productId);
               imageRun?.presented.set(item.productId, item.name);
               if (imageRun !== null)
-                recordPrices(imageRun.prices, item, imageRun.pricesAt);
+                recordPrices(
+                  imageRun.prices,
+                  item,
+                  imageRun.complementPrices,
+                  this.suggestionNowMs(),
+                );
               if (
                 imageRun !== null &&
                 isSendableProductImageUrl(item.imageUrl)
@@ -6359,22 +6420,30 @@ export class MinimalCatalogAgentService {
           result.items.map((item) => item.productId),
         );
     };
-    // T3-fix E6: units of one line (product + presentation) in a cart.
+    // T3-fix E6: units of one line (product + presentation) in a cart;
+    // T3-fix-2 G4: `null` when unknown (unreadable cart or a line without
+    // a quantity).
     const lineUnits = (
       lines: ReadonlyArray<{
         productId: string;
         variantId?: string;
         quantity?: number;
-      }>,
+      }> | null,
       identity: MinimalCartSelectionIdentity,
-    ): number =>
-      lines
-        .filter(
-          (line) =>
-            line.productId === identity.productId &&
-            (line.variantId ?? '') === (identity.variantId ?? ''),
+    ): number | null => {
+      if (lines === null) return null;
+      let units = 0;
+      for (const line of lines) {
+        if (
+          line.productId !== identity.productId ||
+          (line.variantId ?? '') !== (identity.variantId ?? '')
         )
-        .reduce((sum, line) => sum + (line.quantity ?? 0), 0);
+          continue;
+        if (typeof line.quantity !== 'number') return null;
+        units += line.quantity;
+      }
+      return units;
+    };
     const applyIntent = async (
       identity: ResolvedCartSelection,
       intent: MinimalCartQuantityIntent,
@@ -6383,7 +6452,7 @@ export class MinimalCatalogAgentService {
         productId: string;
         variantId?: string;
         quantity?: number;
-      }> = [],
+      }> | null,
     ): Promise<MinimalCartResult> => {
       if (cart === undefined || conversation === null)
         return { ok: false, error: 'cart_unavailable' };
@@ -6436,11 +6505,15 @@ export class MinimalCatalogAgentService {
       cartReply.source = 'cart';
       cartReply.mutated = result.ok && result.items.length > 0;
       mutationAcknowledged = true;
-      // E6: a set adds only when it raises the line's units.
+      // E6: a set adds only when it raises the line's units; G4: unknown
+      // previous units never count as an add (fail closed).
+      const unitsBefore = lineUnits(before, identity);
+      const unitsAfter = result.ok ? lineUnits(result.items, identity) : null;
       if (
-        result.ok &&
         intent.operation === 'set' &&
-        lineUnits(result.items, identity) > lineUnits(before, identity)
+        unitsBefore !== null &&
+        unitsAfter !== null &&
+        unitsAfter > unitsBefore
       )
         imageRun?.added.add(identity.productId);
       refreshCartProductIds(result);
@@ -6476,7 +6549,8 @@ export class MinimalCatalogAgentService {
       // operation in the same run, and it never overwrites the first reply.
       if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
         return toolError('cart_line_settled');
-      const lines = (await cart?.storedLines(context.senderId)) ?? [];
+      const stored = (await cart?.storedLines(context.senderId)) ?? null;
+      const lines = stored ?? [];
       // A pet statement is never a cart write, whatever numbers it carries.
       if (conversation.isPetStatementOnly()) return misplacedCartCall(lines)!;
       const grounded = conversation.ground(identity, proposal, lines);
@@ -6503,7 +6577,7 @@ export class MinimalCatalogAgentService {
         grounded.selection,
         grounded.intent,
         grounded.defaulted,
-        lines,
+        stored,
       );
     };
     /**
@@ -6799,7 +6873,8 @@ export class MinimalCatalogAgentService {
               }
               if (keepOnlySettled || attemptedLines.has(lineKey(identity)))
                 return toolError('cart_line_settled');
-              const lines = (await cart.storedLines(context.senderId)) ?? [];
+              const stored = await cart.storedLines(context.senderId);
+              const lines = stored ?? [];
               if (conversation.isPetStatementOnly())
                 return misplacedCartCall(lines)!;
               const grounded = conversation.prepare(
@@ -6820,7 +6895,7 @@ export class MinimalCatalogAgentService {
                     grounded.selection,
                     grounded.intent,
                     grounded.defaulted,
-                    lines,
+                    stored,
                   );
                 }
                 acknowledge(

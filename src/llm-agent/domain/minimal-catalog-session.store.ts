@@ -52,6 +52,9 @@ export type ReorderOfferContext = {
  * titles. `reorderOffer` is the reorder offer THIS turn sent (never
  * inherited, so only the reply right after it can accept it).
  */
+/** T3-fix-2 G2: one suggestion-only catalog price and when it was read. */
+export type ComplementPrice = { priceCents: number | null; readAt: number };
+
 export type MinimalCatalogTurn = {
   messages: ModelMessage[];
   verifiedProductIds: string[];
@@ -60,13 +63,13 @@ export type MinimalCatalogTurn = {
   interactiveChoice?: InteractiveChoiceContext;
   catalogPrices?: Record<string, number>;
   /**
-   * T3-fix E3: when each `catalogPrices` entry was read (epoch ms, same
-   * keys); carried forward with the prices. A complementary suggestion
-   * needs a price read within 24 h.
+   * T3-fix-2 G2: suggestion-only prices (`productId|variantId` → cents, or
+   * `null` when the read had none, and the read instant in epoch ms) from
+   * every catalog read of the last 24 h, whatever the turn; carried forward.
+   * Only suggestComplement reads it (list row titles keep `catalogPrices`).
+   * Optional: a turn stored without it has no suggestable prices.
    */
-  catalogPricesAt?: Record<string, number>;
-  /** T3-fix E1: THIS turn showed a complementary suggestion (never inherited). */
-  complementShown?: true;
+  complementPrices?: Record<string, ComplementPrice>;
   reorderOffer?: ReorderOfferContext;
   /** The payment offer THIS turn made (never inherited, like `reorderOffer`). */
   paymentOffer?: { saleId: string };

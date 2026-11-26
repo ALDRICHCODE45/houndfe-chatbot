@@ -137,25 +137,27 @@ The button ids are `cart_continue:<ref>` and `cart_add:<ref>`, where `<ref>` is 
 | `Agregar algo más`, cart unchanged | `Claro, ¿qué producto desea agregar?` (tú: `…quieres agregar?`), without a model call and without touching the cart. |
 | Either button, cart changed since it was sent | `Ese botón ya no está vigente.` followed by the current cart and fresh buttons; nothing starts. |
 
-### Complementary suggestion (T3, T3-fix)
+### Complementary suggestion (T3, T3-fix, T3-fix-2)
 
-In a model turn that added a product (an add, or a set that raises the line's units), the model may call `suggestComplement({productId, variantId?})` once with a product it read by `searchCatalog` in this chat whose price was read within the last 24 h. The application refuses with one of these codes, or appends ONE server-owned line right before the next-step question: `Por si le sirve: *{nombre}* ({precio}) suele ir bien con lo que eligió.` (tú: `Por si te sirve: … con lo que elegiste.`; `💡 ` first only for a customer who uses emojis; a name over 80 characters is cut between words with `…`). The model's own text never carries it.
+In a model turn that added a product (an add, or a set that raises the line's units), the model may call `suggestComplement({productId, variantId?})` once with a product it read by `searchCatalog` in this chat whose price was read within the last 24 h — in any turn, not only a cart turn (the session keeps a suggestion-only copy of each catalog price with its read time, separate from the list row prices; reads older than 24 h are dropped whenever a turn is stored). The price is checked before the stock read. The application refuses with one of these codes, or appends ONE server-owned line right before the next-step question: `Por si le sirve: *{nombre}* ({precio}) suele ir bien con lo que eligió.` (tú: `Por si te sirve: … con lo que elegiste.`; `💡 ` first only for a customer who uses emojis; a name over 80 characters is cut between words with `…`). The model's own text never carries it.
 
 | Code | Meaning |
 | --- | --- |
 | `already_suggested` | This run already has (or is checking) its one suggestion; also a second parallel call. |
 | `declined` | The customer declined suggestions in this run (`declineSuggestions`). |
-| `no_cart_add` | No add in this run (a set that lowers or keeps the quantity is not an add). |
+| `no_cart_add` | No add in this run (a set that lowers or keeps the quantity is not an add, nor is a set when the previous cart lines cannot be read). |
 | `unknown_product` | Not read in this chat, or a `variantId` the product does not have. |
 | `same_product` | The product this run added. |
 | `in_cart` | Already in the cart. |
-| `stale_product` | Its price was read more than 24 h ago (an earlier day's read). |
+| `stale_product` | Its price was read 24 h ago or more (an earlier day's read), or its read time is unknown. After the next stored turn such a read is dropped and the product reads as `unknown_price`. |
 | `unverified` | The live stock read failed, disagreed or is unknown. |
 | `variant_required` | The product has presentations and none was given. |
 | `out_of_stock` | Agotado. |
-| `unknown_price` | No catalog price read for that product/presentation. |
+| `unknown_price` | No catalog price read for that product/presentation in the last 24 h (refused before the stock read). |
 
-At reply time the line is dropped (and nothing is recorded) when the cart reply does not end with the next-step question, or the run put the suggested product in the cart after the check. A shown line pauses suggestions for this sender 24 h; `declineSuggestions({})` — which the model calls when the customer rejects a suggestion or asks for none — pauses them 30 days (S7) and has no customer copy of its own (the model answers normally). Both write `customer_profiles.suggestions_paused_until` (migration 5950, survives restarts; latest write wins); the pause is set in-process before the durable write, so a profile-store outage never repeats a suggestion in that process nor drops the reply. `suggestComplement` is offered only with a loaded customer profile, no active pause and no order summary, checkout confirmation or payment step pending; `declineSuggestions` is offered whenever `suggestComplement` is, and for the two turns after a shown suggestion. Every other turn's reply is unchanged.
+`declineSuggestions` refuses with `already_declined` on a second call in the same run.
+
+At reply time the line is dropped (and nothing is recorded) when the cart reply does not end with the next-step question, or the run put the suggested product in the cart after the check. A shown line pauses suggestions for this sender 24 h; `declineSuggestions({})` — which the model calls when the customer rejects a suggestion or asks for none — pauses them 30 days (S7) and has no customer copy of its own (the model answers normally); if that durable write fails, the 30 days hold only in this process and the bot logs `minimal_catalog tool declineSuggestions durable_write=failed pause=process_only trace=…` (no phone; accepted limit). Both write `customer_profiles.suggestions_paused_until` (migration 5950, survives restarts; latest write wins); the pause is set in-process before the durable write, so a profile-store outage never repeats a suggestion in that process nor drops the reply. `suggestComplement` is offered only with a loaded customer profile, no active pause and no order summary, checkout confirmation or payment step pending; `declineSuggestions` is offered on every turn with a loaded, storable, not forgotten profile, so «no me ofrezcas nada» at any time records the 30-day pause. Price age and the pause read one clock (the customer profile service's). Every other turn's reply is unchanged.
 
 Deploy migration 5950 before this bot; roll back the bot first, then 5950 down.
 
