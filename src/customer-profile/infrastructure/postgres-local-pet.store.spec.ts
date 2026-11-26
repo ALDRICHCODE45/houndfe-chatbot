@@ -296,10 +296,13 @@ ddescribe(
         WHERE table_name = 'customer_profiles' AND column_name = 'pets'`,
       );
       expect(gone.rows).toEqual([]);
-      // The profile row survives the rollback.
-      await expect(
-        new PostgresCustomerProfileStore(pool).read(SENDER),
-      ).resolves.toMatchObject({ senderId: SENDER });
+      // The profile row survives the rollback (raw read: the rollback also
+      // undid 5950, whose column the current profile store selects).
+      const row = await pool.query(
+        'SELECT sender_id FROM customer_profiles WHERE sender_id = $1',
+        [SENDER],
+      );
+      expect(row.rows).toEqual([{ sender_id: SENDER }]);
       migrate('up');
       await pool.query('TRUNCATE TABLE customer_profiles');
     });

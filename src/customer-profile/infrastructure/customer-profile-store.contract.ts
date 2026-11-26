@@ -100,6 +100,19 @@ export function runCustomerProfileStoreContract(
       await expect(store.read(SENDER)).resolves.toEqual(expected);
     });
 
+    it('T3: keeps the suggestion marker merge-only; a later one wins', async () => {
+      await store.upsert(SENDER, { lastSuggestionAt: T1.toISOString() }, T1);
+      await store.upsert(SENDER, { register: 'tu' }, T2);
+      await expect(store.read(SENDER)).resolves.toMatchObject({
+        register: 'tu',
+        lastSuggestionAt: T1.toISOString(),
+      });
+      await store.upsert(SENDER, { lastSuggestionAt: T2.toISOString() }, T2);
+      await expect(store.read(SENDER)).resolves.toMatchObject({
+        lastSuggestionAt: T2.toISOString(),
+      });
+    });
+
     it('the latest explicit style and order win', async () => {
       await store.upsert(SENDER, { register: 'tu', emojis: true }, T1);
       await store.upsert(

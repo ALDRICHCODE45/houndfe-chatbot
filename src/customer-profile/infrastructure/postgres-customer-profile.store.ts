@@ -24,6 +24,7 @@ interface CustomerProfileRow {
   last_order_folio: string | null;
   last_order_confirmed_at: Date | null;
   last_order_total_cents: string | number | null;
+  last_suggestion_at: Date | null;
   updated_at: Date;
 }
 
@@ -33,7 +34,8 @@ type Queryable = Pick<Pool, 'query'>;
  *  (PostgresLocalPetStore owns it). */
 const COLUMNS =
   'sender_id, display_name, preferred_name, register, emojis, tone, ' +
-  'last_order_folio, last_order_confirmed_at, last_order_total_cents, updated_at';
+  'last_order_folio, last_order_confirmed_at, last_order_total_cents, ' +
+  'last_suggestion_at, updated_at';
 
 /**
  * Merge-only upsert in ONE statement: every column keeps the stored value
@@ -45,7 +47,7 @@ const UPSERT = `
 INSERT INTO customer_profiles (${COLUMNS}, created_at)
 VALUES ($1, $2, $3, COALESCE($4::text, 'usted'), COALESCE($5::boolean, false),
         COALESCE($6::text, 'neutral'), $7::text, $8::timestamptz,
-        $9::bigint, $10::timestamptz, $10::timestamptz)
+        $9::bigint, $11::timestamptz, $10::timestamptz, $10::timestamptz)
 ON CONFLICT (sender_id) DO UPDATE SET
   display_name = COALESCE(EXCLUDED.display_name, customer_profiles.display_name),
   preferred_name = COALESCE(EXCLUDED.preferred_name, customer_profiles.preferred_name),
@@ -57,6 +59,7 @@ ON CONFLICT (sender_id) DO UPDATE SET
     THEN customer_profiles.last_order_confirmed_at ELSE $8::timestamptz END,
   last_order_total_cents = CASE WHEN $7::text IS NULL
     THEN customer_profiles.last_order_total_cents ELSE $9::bigint END,
+  last_suggestion_at = COALESCE($11::timestamptz, customer_profiles.last_suggestion_at),
   updated_at = $10::timestamptz
 RETURNING ${COLUMNS}`;
 
@@ -81,11 +84,15 @@ function toProfile(row: CustomerProfileRow): CustomerProfile {
             totalCents: Number(row.last_order_total_cents),
           },
         }),
+    ...(row.last_suggestion_at == null
+      ? {}
+      : { lastSuggestionAt: row.last_suggestion_at.toISOString() }),
     updatedAt: row.updated_at.toISOString(),
   };
 }
 
-/** Durable CustomerProfileStore over `customer_profiles` (migration 3700). */
+/** Durable CustomerProfileStore over `customer_profiles` (migration 3700;
+ *  `last_suggestion_at` since 5950). */
 @Injectable()
 export class PostgresCustomerProfileStore implements CustomerProfileStore {
   constructor(@Inject(PG_POOL) private readonly pool: Queryable) {}
@@ -119,6 +126,7 @@ export class PostgresCustomerProfileStore implements CustomerProfileStore {
       next.lastOrder?.confirmedAt ?? null,
       next.lastOrder?.totalCents ?? null,
       now.toISOString(),
+      next.lastSuggestionAt ?? null,
     ]);
     const row = result.rows[0];
     return row === undefined ? null : toProfile(row);

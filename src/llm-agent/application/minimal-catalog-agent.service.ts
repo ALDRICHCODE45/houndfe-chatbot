@@ -73,6 +73,7 @@ import {
 } from '../../customer-profile/domain/pet-facts';
 import {
   customerStyleSeed,
+  isValidProfileSenderId,
   knownCustomerPromptLine,
   type CustomerProfilePatch,
 } from '../../customer-profile/domain/customer-profile';
@@ -331,7 +332,7 @@ const INSTRUCTIONS =
   'sustituye únicamente datos verificados por herramienta: "¡Hola! Encontré {nombre} en ' +
   'nuestro catálogo. ¿Buscaba esa presentación?" (de tú: "¿Buscabas esa presentación?"); tras out_of_stock verificado: "Por ahora, ' +
   '{nombre} está agotado." Sin cierre automático ("Si necesita...", "No dude...", ' +
-  '"estoy aquí..."), sin upsell ni aviso forzado, sin emoji al informar agotado, sin saludar ' +
+  '"estoy aquí..."), sin aviso forzado, sin ofrecer otros productos por tu cuenta (una sugerencia complementaria solo con suggestComplement, si está disponible), sin emoji al informar agotado, sin saludar ' +
   'en cada confirmación, sin contacto humano, solicitud ni promesa de fecha.';
 
 /** S3: the structured customer reply (text + optional media) of one turn. */
@@ -636,6 +637,35 @@ const ASK_TEAM_INSTRUCTIONS_FRAGMENT =
   'el resultado: nunca afirmes que el equipo ya respondió. Mientras el ' +
   'cliente espera, sigue ayudando con lo demás.';
 
+// T3 (S4-S6): one complementary product after a cart add, validated and
+// presented by the application (never in the model's text).
+const COMPLEMENT_INSTRUCTIONS_FRAGMENT =
+  '\n\nHerramienta suggestComplement: solo en un turno en que agregó un producto al carrito, y como máximo una vez, ' +
+  'puede proponer UN producto que complemente lo agregado (no lo sustituya ni sea el mismo; por ejemplo arena con alimento de gato, o premios), ' +
+  'que ya haya leído con searchCatalog en esta conversación, que no esté agotado ni en el carrito y que sea adecuado para la mascota conocida (especie, etapa, alergias; nunca para una mascota que ya no está). ' +
+  'Pase su productId EXACTO (y variantId si eligió una presentación). Si no hay uno claramente útil, no la llame. ' +
+  'Nunca la llame si en esta conversación el cliente rechazó una sugerencia o pidió no recibir sugerencias. ' +
+  'La aplicación agrega la sugerencia a su mensaje: no la mencione ni la repita en su texto.';
+/** T3 (S6): at most one suggestion per sender in this window (persisted). */
+export const COMPLEMENT_INTERVAL_MS = 24 * 60 * 60_000;
+const COMPLEMENT_NAME_MAX_CHARS = 80;
+
+/** T3 (D3): the server-owned suggestion line, in the customer's style. */
+function complementLine(
+  suggestion: { name: string; priceCents: number },
+  style: CustomerStyle,
+): string {
+  const tu = style.register === 'tu';
+  const name = Array.from(plain(suggestion.name).replace(/\s+/g, ' '))
+    .slice(0, COMPLEMENT_NAME_MAX_CHARS)
+    .join('')
+    .trim();
+  return (
+    `${style.emojis ? '💡 ' : ''}Por si ${tu ? 'te' : 'le'} sirve: ${bold(name)} ` +
+    `(${money(suggestion.priceCents)}) suele ir bien con lo que ${tu ? 'elegiste' : 'eligió'}.`
+  );
+}
+
 // Payment questions after an order: the application owns the bank details.
 const PAYMENT_INSTRUCTIONS_FRAGMENT =
   '\n\nHerramienta getPaymentDetails: el cliente ya tiene un pedido registrado. ' +
@@ -751,6 +781,8 @@ type RestockRun = {
 
 type ExpirationReply = { attempted: boolean; value: string | null };
 type PaymentRun = { attempted: boolean; value: MinimalPaymentReply | null };
+/** T3: the one validated complementary suggestion of a run. */
+type ComplementRun = { value: { name: string; priceCents: number } | null };
 // T4c-2a P2: one which-pet question per run; the application presents it.
 // T4c-2b: also the forget and diminutive questions (`reply` is the
 // unstyled question text).
@@ -816,6 +848,8 @@ type CartReply = ExpirationReply & {
   source?: 'cart' | 'read' | 'reviewCheckout';
   // A real write left a non-empty cart in this run.
   mutated?: boolean;
+  /** T3: the cart's product ids after the run's last add/set write. */
+  cartProductIds?: ReadonlySet<string>;
 };
 
 // One server-owned checkout presentation per SDK run.
@@ -3258,6 +3292,12 @@ export class MinimalCatalogAgentService {
       this.cart && this.checkoutAvailable()
         ? { attempted: false, value: null }
         : null;
+    const complementRun: ComplementRun | null = this.complementAvailable(
+      input.senderId,
+      placed !== null && placed.paid !== true,
+    )
+      ? { value: null }
+      : null;
     const reorderRun: ReorderRun | null = this.cart
       ? { attempted: false, value: null }
       : null;
@@ -3381,6 +3421,7 @@ export class MinimalCatalogAgentService {
         (paymentRun === null ? '' : PAYMENT_INSTRUCTIONS_FRAGMENT) +
         (paidOrder ? PAID_ORDER_INSTRUCTIONS_FRAGMENT : '') +
         (paidOrderNewCart ? PAID_ORDER_NEW_CART_INSTRUCTIONS_FRAGMENT : '') +
+        (complementRun === null ? '' : COMPLEMENT_INSTRUCTIONS_FRAGMENT) +
         this.memoryInstructions(input.senderId) +
         (chosenPet === undefined ? '' : `\n${chosenPet}`) +
         restockOfferContext +
@@ -3419,6 +3460,13 @@ export class MinimalCatalogAgentService {
         ...this.petChoiceTools(input, petChoiceRun, memoryRun, styled, traceId),
         ...this.askTeamTools(input, askTeamRun, traceId),
         ...this.paymentTools(input, paymentRun, traceId),
+        ...this.complementTools(
+          complementRun,
+          allowedIds,
+          imageRun,
+          cartReply,
+          traceId,
+        ),
       },
       stopWhen: stepCountIs(this.maxSteps),
       // S3 (cost protection): every production call is output-capped.
@@ -3681,11 +3729,24 @@ export class MinimalCatalogAgentService {
     if (cartReply.value !== null) {
       // S2: a cart summary closes with the next-step question and buttons.
       const invites = cartReply.value.endsWith(MINIMAL_CART_SUMMARY_TAIL);
-      const reply = styled(
+      let reply = styled(
         invites
           ? `${cartReply.value}\n\n${MINIMAL_CART_NEXT_STEP_QUESTION}`
           : cartReply.value,
       );
+      // T3 (D3): the validated suggestion goes right before the question;
+      // any other turn keeps the reply byte-identical.
+      const suggestion = complementRun?.value ?? null;
+      const question = styled(MINIMAL_CART_NEXT_STEP_QUESTION);
+      if (
+        suggestion !== null &&
+        invites &&
+        cartReply.mutated === true &&
+        reply.endsWith(`\n\n${question}`)
+      ) {
+        reply = `${reply.slice(0, -question.length)}${complementLine(suggestion, style)}\n\n${question}`;
+        await this.profiles?.recordSuggestion(input.senderId);
+      }
       const nextStep = invites
         ? await this.cartNextStepInteractive(input.senderId, style)
         : undefined;
@@ -4189,6 +4250,102 @@ export class MinimalCatalogAgentService {
                 presentedByApplication: true as const,
               }
             : { ...toolError(outcome.kind), presentedByApplication: true };
+        },
+      }),
+    };
+  }
+
+  /**
+   * T3 (D4): the suggestion tool is offered only with a cart and a loaded
+   * profile (the persisted 24 h marker), no suggestion in the window, and no
+   * order summary, checkout confirmation or payment step pending.
+   */
+  private complementAvailable(senderId: string, unpaidOrder: boolean): boolean {
+    const profiles = this.profiles;
+    return (
+      this.cart !== undefined &&
+      profiles !== undefined &&
+      // Only a storable sender keeps the 24 h marker.
+      isValidProfileSenderId(senderId) &&
+      profiles.isLoaded(senderId) &&
+      !profiles.isForgotten(senderId) &&
+      !unpaidOrder &&
+      (this.order?.offerStatus(senderId) ?? null) === null &&
+      !(
+        this.checkoutAvailable() &&
+        this.checkout!.confirmationStatus(senderId)?.stage === 'pending'
+      ) &&
+      !profiles.suggestedWithin(senderId, COMPLEMENT_INTERVAL_MS)
+    );
+  }
+
+  /** T3 (D2/D3): one checked complementary product per run. */
+  private complementTools(
+    run: ComplementRun | null,
+    allowedIds: ReadonlySet<string>,
+    imageRun: ProductImageRun,
+    cartReply: CartReply,
+    traceId: string,
+  ): ToolSet {
+    if (run === null) return {};
+    const refuse = (code: string) => {
+      traceLog(
+        this.logger,
+        `minimal_catalog tool suggestComplement result=denied code=${code} trace=${traceId}`,
+      );
+      return toolError(code);
+    };
+    return {
+      suggestComplement: tool({
+        description:
+          'Propone UN producto complementario a lo que se acaba de agregar al carrito (leído con searchCatalog en esta conversación). La aplicación lo valida y lo presenta.',
+        inputSchema: z.strictObject({
+          productId: z.uuid(),
+          variantId: z.uuid().optional(),
+        }),
+        execute: async ({ productId, variantId }) => {
+          if (run.value !== null) return refuse('already_suggested');
+          if (imageRun.added.size === 0) return refuse('no_cart_add');
+          if (!allowedIds.has(productId)) return refuse('unknown_product');
+          if (imageRun.added.has(productId)) return refuse('same_product');
+          if (cartReply.cartProductIds?.has(productId) === true)
+            return refuse('in_cart');
+          const priceCents = imageRun.prices.get(
+            priceKey(productId, variantId),
+          );
+          if (priceCents === undefined) return refuse('unknown_price');
+          let stock: Awaited<ReturnType<ChatbotApiClient['getStock']>>;
+          try {
+            stock = await this.chatbotApi.getStock(productId);
+          } catch {
+            return refuse('unverified');
+          }
+          if (stock.productId !== productId) return refuse('unverified');
+          const variant =
+            variantId === undefined
+              ? undefined
+              : stock.variants.find((v) => v.variantId === variantId);
+          if (variantId !== undefined && variant === undefined)
+            return refuse('unknown_product');
+          if (variant === undefined && stock.variants.length > 0)
+            return refuse('variant_required');
+          const status = safeStatus((variant ?? stock).stock.status);
+          if (status === 'out_of_stock') return refuse('out_of_stock');
+          if (status === 'unknown') return refuse('unverified');
+          run.value = {
+            name:
+              variant === undefined
+                ? stock.name
+                : variant.name.startsWith(stock.name)
+                  ? variant.name
+                  : `${stock.name} ${variant.name}`,
+            priceCents,
+          };
+          traceLog(
+            this.logger,
+            `minimal_catalog tool suggestComplement result=ok trace=${traceId}`,
+          );
+          return { ok: true as const, presentedByApplication: true as const };
         },
       }),
     };
@@ -6079,6 +6236,10 @@ export class MinimalCatalogAgentService {
         mutationAcknowledged = true;
         if (result.ok && intent.operation === 'add' && magnitude > 0)
           imageRun?.added.add(identity.productId);
+        if (result.ok)
+          cartReply.cartProductIds = new Set(
+            result.items.map((item) => item.productId),
+          );
         return result;
       }
       const result = await cart.setItem(
@@ -6098,6 +6259,10 @@ export class MinimalCatalogAgentService {
       mutationAcknowledged = true;
       if (result.ok && intent.operation === 'set' && (intent.quantity ?? 0) > 0)
         imageRun?.added.add(identity.productId);
+      if (result.ok)
+        cartReply.cartProductIds = new Set(
+          result.items.map((item) => item.productId),
+        );
       return result;
     };
     // F10: a cart tool on a message with no cart request at all ("Quiero

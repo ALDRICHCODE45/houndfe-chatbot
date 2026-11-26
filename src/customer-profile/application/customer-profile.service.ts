@@ -107,6 +107,19 @@ export class CustomerProfileService {
     });
   }
 
+  /** T3 (S6): a complementary suggestion was shown now (persisted). */
+  async recordSuggestion(senderId: string): Promise<void> {
+    await this.record(senderId, {
+      lastSuggestionAt: this.now().toISOString(),
+    });
+  }
+
+  /** T3 (S6): the cached profile shows a suggestion less than `ms` ago. */
+  suggestedWithin(senderId: string, ms: number): boolean {
+    const at = this.cached(senderId)?.lastSuggestionAt;
+    return at !== undefined && this.now().getTime() - Date.parse(at) < ms;
+  }
+
   /** Deletes the profile; later writes in this process are skipped. */
   async forget(senderId: string): Promise<boolean> {
     this.forgotten.add(senderId);

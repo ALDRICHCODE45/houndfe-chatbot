@@ -137,6 +137,10 @@ The button ids are `cart_continue:<ref>` and `cart_add:<ref>`, where `<ref>` is 
 | `Agregar algo más`, cart unchanged | `Claro, ¿qué producto desea agregar?` (tú: `…quieres agregar?`), without a model call and without touching the cart. |
 | Either button, cart changed since it was sent | `Ese botón ya no está vigente.` followed by the current cart and fresh buttons; nothing starts. |
 
+### Complementary suggestion (T3)
+
+In a model turn that added a product, the model may call `suggestComplement({productId, variantId?})` once with a product it read by `searchCatalog` in this chat. The application refuses (`no_cart_add`, `unknown_product`, `same_product`, `in_cart`, `unknown_price`, `variant_required`, `out_of_stock`, `unverified`) or appends ONE server-owned line right before the next-step question: `Por si le sirve: *{nombre}* ({precio}) suele ir bien con lo que eligió.` (tú: `Por si te sirve: … con lo que elegiste.`; `💡 ` first only for a customer who uses emojis). The model's own text never carries it. The tool is offered only with a loaded customer profile, no suggestion to this sender in the last 24 h (`customer_profiles.last_suggestion_at`, migration 5950, survives restarts) and no order summary, checkout confirmation or payment step pending; the prompt forbids it after the customer declined a suggestion or asked for none in this chat. Every other turn's reply is unchanged.
+
 ### Bounded context
 
 - The selection registry holds at most **50 bindings per sender**. Registration beyond that returns `null`, so an unregistered pair cannot resolve; the model is asked to re-read rather than have a pending request silently rebound to another product.

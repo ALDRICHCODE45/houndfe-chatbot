@@ -47,6 +47,8 @@ export interface CustomerProfile {
   emojis: boolean;
   tone: CustomerTone;
   lastOrder?: CustomerLastOrder;
+  /** T3 (S6): when the bot last suggested a complementary product (ISO). */
+  lastSuggestionAt?: string;
   updatedAt: string;
 }
 
@@ -58,6 +60,7 @@ export interface CustomerProfilePatch {
   emojis?: boolean | null;
   tone?: CustomerTone | null;
   lastOrder?: CustomerLastOrder | null;
+  lastSuggestionAt?: string | null;
 }
 
 /** A patch after `normalizeCustomerProfilePatch`: only values to write. */
@@ -68,6 +71,7 @@ export interface NormalizedCustomerProfilePatch {
   emojis?: boolean;
   tone?: CustomerTone;
   lastOrder?: CustomerLastOrder;
+  lastSuggestionAt?: string;
 }
 
 export interface CustomerProfileStore {
@@ -170,6 +174,12 @@ export function normalizeCustomerProfilePatch(
     out.tone = patch.tone;
   const lastOrder = normalizeLastOrder(patch.lastOrder);
   if (lastOrder !== undefined) out.lastOrder = lastOrder;
+  const suggestedMs =
+    typeof patch.lastSuggestionAt === 'string'
+      ? Date.parse(patch.lastSuggestionAt)
+      : NaN;
+  if (!Number.isNaN(suggestedMs))
+    out.lastSuggestionAt = new Date(suggestedMs).toISOString();
   return out;
 }
 
@@ -190,6 +200,7 @@ export function mergeCustomerProfile(
   const lastOrder = next.lastOrder ?? existing?.lastOrder;
   const displayName = next.displayName ?? existing?.displayName;
   const preferredName = next.preferredName ?? existing?.preferredName;
+  const lastSuggestionAt = next.lastSuggestionAt ?? existing?.lastSuggestionAt;
   return {
     senderId,
     ...(displayName === undefined ? {} : { displayName }),
@@ -198,6 +209,7 @@ export function mergeCustomerProfile(
     emojis: next.emojis ?? existing?.emojis ?? false,
     tone: next.tone ?? existing?.tone ?? 'neutral',
     ...(lastOrder === undefined ? {} : { lastOrder: { ...lastOrder } }),
+    ...(lastSuggestionAt === undefined ? {} : { lastSuggestionAt }),
     updatedAt: now.toISOString(),
   };
 }
@@ -214,6 +226,7 @@ export function profilePatchIsNoop(
     'register',
     'emojis',
     'tone',
+    'lastSuggestionAt',
   ] as const;
   for (const key of scalars)
     if (patch[key] !== undefined && patch[key] !== existing[key]) return false;

@@ -388,6 +388,21 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
+    id: 'cat-food-suggests-litter',
+    title:
+      'gato: alimento → sugiere arena una vez (T3: one server line after the add, none on the next add)',
+    customer: existing('03100'),
+    turns: [
+      'Hola, busco croquetas Whiskas para mi gato y también arena para gato',
+      {
+        text: 'Agrégueme una bolsa de las Whiskas al carrito, por favor',
+        expectReply: /Por si le sirve: \*Arena para Gato/,
+      },
+      // At most one suggestion per 24 h: this add carries no line.
+      'Agregue otra bolsa de Whiskas',
+    ],
+  },
+  {
     id: 'pets-reorder',
     title:
       '«Lo mismo de siempre para Max»: his last order, only his lines (S4, S14, S15)',
